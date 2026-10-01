@@ -60,6 +60,12 @@ champagne details lead the eye toward listening and guessing. Avoid dashboard
 cards, neon audio visualisers, bright rings, decorative pills, and crowded
 turntable controls.
 
+The record hangs in a quiet night sky: stars, a little haze, and light from
+behind the disc. The owner asked for this on 2026-10-01 in place of the floating
+notes and groove trails ("space vibes", tasteful, not annoying). It is
+atmosphere, not a second subject: nothing in it may compete with the record or
+the controls.
+
 ## Colors
 
 One constant dark theme, independent of weekday or system preference. OLED black
@@ -78,6 +84,16 @@ colors, not additional UI semantic tokens.
 Control boundaries map to `--control-border` (#666666), keeping the search field
 boundary above 3:1 against graphite and black. Decorative dividers retain the
 quieter `--border` value.
+
+The sky has its own decorative tokens, never used for text or a control
+boundary. `--sky-warm` (`216 185 131`, the accent as colour channels) is the
+light behind the record, the warm haze and the glow of the primary controls.
+`--sky-cool` (`58 86 156`, one deep blue) is the cool haze. Both are channels
+so that each use sets its own low alpha: at most 0.3 at the record's edge and
+0.17 in the haze, so the field still reads as black. `--star-cool` (#C7D2E8) is
+the few pale blue stars; the rest reuse `--paper`, `--muted` and `--accent`.
+`--accent-bright` (#E8D2A6) is a champagne control lit by hover; dark ink on it
+has more contrast than on the accent itself.
 
 ## Typography
 
@@ -111,11 +127,51 @@ The search popup alone gets a restrained dark shadow. Reflections, groove
 hairlines, bearing details, and layered metal highlights give the canvas physical
 depth; keep this realism concentrated in the record.
 
+The record hangs in a night sky. Atmosphere.svelte owns one viewport-fixed
+canvas beneath the page; `lib/starfield.ts` paints it and `lib/sky.ts` holds the
+model. There are 60 to 280 stars by viewport area, the same sky on every visit,
+at three depths: mostly tiny ivory and silver points, a few pale blue, and a
+handful of larger champagne or ivory stars with a soft halo and faint four-point
+spikes. Each star twinkles on its own 3 to 8 second cycle. The sky drifts
+westward at 0.35 to 1.3 pixels a second, slow enough to miss while reading.
+While a clip plays it eases up to five times that pace and brightens a little,
+breathing with the level of the sound, then eases back; it never jumps. Near
+stars follow page scroll slightly more than far ones.
+
+A thin champagne shooting star crosses the upper sky every 9 to 22 seconds
+(about 5 to 12 while a clip plays) and lasts 0.7 to 1.1 seconds. Stars dim to a
+fifth of their light behind anything marked `data-sky-calm` (header text, game
+column, record caption, footer), and shooting stars never cross those areas, so
+text contrast is untouched. Mark any new block of text the same way.
+
+Two hazes sit on the same layer as plain CSS gradients: warm champagne behind
+the record and deep blue in the opposite corner, drifting over 68 to 84 seconds
+on the compositor. The light behind the record (`.stage::before` in App.svelte)
+is brightest at the edge of the disc and gone within about a radius: an eclipse,
+not a ring. It is subtle at idle and a little stronger while a clip plays.
+
+Winning on this page, not reloading a won game, releases stardust from behind
+the record's edge and a brief flare over about 1.6 seconds, followed by one
+brighter shooting star. A loss adds nothing to the reveal.
+
+The page arrives once on load: sky, header, the record rising with its light,
+the game column, the footer. The current step of the clip rail takes a glint as
+it unlocks and then a slow breathing glow. Play and Guess gain a soft champagne
+glow on hover, Guess one sweep of light, and the play disc opens its glow while
+the clip sounds. Nothing bounces.
+
+The footer offers Pause motion / Resume motion, which holds the sky, the haze
+and the rail's glow. A hidden tab stops the loop. Reduced motion draws one
+static sky, skips the arrival, drift, twinkle, shooting stars and stardust, and
+hides the unnecessary pause control. Keep the field black; avoid an audio
+equaliser, saturated nebulae, and anything quick enough to notice while typing.
+
 ## Shapes
 
 Circles belong to vinyl, label, spindle, and play. Inputs and rectangular buttons
 have 6px corners. No generic rounded card containers. Use fine strokes and
-precise simple icons, with an arrow for the secondary skip action.
+precise simple icons, with an arrow for the secondary skip action. The header
+mark is a small champagne record with a four-point glint on its rim.
 
 ## Components
 
@@ -142,6 +198,8 @@ keeping game state and playback progress available.
 ## Do's and Don'ts
 
 - Keep true black and ample empty space around the record.
+- Keep the sky quieter than the record: if a star, haze or streak draws the eye
+  away from listening and guessing, turn it down.
 - Make metadata, keyboard focus, and primary actions readable.
 - Let the real object do the visual work; avoid extra ornamental widgets.
 - Keep the server authoritative and never reveal answer data while playing.

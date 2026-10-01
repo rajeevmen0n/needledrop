@@ -52,6 +52,7 @@
   <button
     type="button"
     class:playing={stoppable}
+    class:sounding={game.playing}
     onclick={press}
     disabled={game.clipLoading || game.submitting}
     aria-busy={game.clipLoading}
@@ -108,20 +109,43 @@
     border-radius: 50%;
     background: var(--accent);
     color: var(--ink);
-    transition: transform 120ms var(--ease-out);
+    /* A little of its own light on the black, as the record has behind it. */
+    box-shadow:
+      0 0 0 0 rgb(var(--sky-warm) / 0),
+      0 0 1.25rem rgb(var(--sky-warm) / 0.2);
+    transition:
+      transform 160ms var(--ease-out),
+      background-color 220ms var(--ease-out),
+      border-color 220ms var(--ease-out),
+      box-shadow 360ms var(--ease-out);
+  }
+
+  /* While the clip sounds the light opens up; it closes again as softly. */
+  button.sounding .disc {
+    box-shadow:
+      0 0 0 5px rgb(var(--sky-warm) / 0.14),
+      0 0 2.25rem rgb(var(--sky-warm) / 0.46);
+  }
+
+  button:disabled .disc {
+    box-shadow: none;
   }
 
   svg {
     fill: currentColor;
   }
 
-  button:active .disc {
-    transform: scale(0.93);
+  button:not(:disabled):active .disc {
+    transform: scale(0.95);
   }
 
   @media (hover: hover) {
-    button:hover .disc {
-      background: var(--paper);
+    button:not(:disabled):hover .disc {
+      border-color: var(--accent-bright);
+      background: var(--accent-bright);
+      box-shadow:
+        0 0 0 5px rgb(var(--sky-warm) / 0.16),
+        0 0 2rem rgb(var(--sky-warm) / 0.42);
     }
   }
 

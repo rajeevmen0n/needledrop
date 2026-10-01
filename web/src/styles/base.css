@@ -128,9 +128,30 @@ button:disabled {
 }
 
 .button.solid:not(:disabled) {
+  position: relative;
+  overflow: hidden;
   border-color: var(--accent);
   background: var(--accent);
   color: var(--ink);
+  transition:
+    background-color 220ms var(--ease-out),
+    border-color 220ms var(--ease-out),
+    box-shadow 360ms var(--ease-out);
+}
+
+/* A band of light waiting off the left edge; hovering sends it across once. */
+.button.solid:not(:disabled)::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    105deg,
+    transparent 34%,
+    rgb(255 255 255 / 0.5) 50%,
+    transparent 66%
+  );
+  transform: translateX(-110%);
+  pointer-events: none;
 }
 
 .button:disabled {
@@ -147,8 +168,22 @@ button:disabled {
   }
 
   .button.solid:not(:disabled):hover {
-    border-color: var(--paper);
-    background: var(--paper);
+    border-color: var(--accent-bright);
+    background: var(--accent-bright);
+    box-shadow: 0 0 1.75rem rgb(var(--sky-warm) / 0.34);
+  }
+
+  /* Keep the dark gap of the focus ring under the glow. */
+  .button.solid:not(:disabled):hover:focus-visible {
+    box-shadow:
+      0 0 0 3px var(--ink),
+      0 0 1.75rem rgb(var(--sky-warm) / 0.34);
+  }
+
+  /* The transition lives on the hover state only, so the band never sweeps back. */
+  .button.solid:not(:disabled):hover::after {
+    transform: translateX(110%);
+    transition: transform 720ms var(--ease-out);
   }
 }
 
@@ -215,5 +250,12 @@ button:disabled {
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
     scroll-behavior: auto !important;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* No sweep of light across a primary button. */
+  .button.solid:not(:disabled)::after {
+    display: none;
   }
 }

@@ -8,6 +8,14 @@
   --muted: #96999e;
   --border: #303030;
   --control-border: #666666;
+  /* The accent a step towards ivory: a lit primary control. */
+  --accent-bright: #e8d2a6;
+  /* The sky: decorative only, never text or a control boundary.
+     The two hazes are colour channels, so each use sets its own (low) alpha:
+     warm is the accent as light, cool is one deep blue. */
+  --sky-warm: 216 185 131;
+  --sky-cool: 58 86 156;
+  --star-cool: #c7d2e8;
   --vinyl: #101112;
   --vinyl-text: #96999e;
   --font: 'Bricolage Grotesque Variable', system-ui, sans-serif;

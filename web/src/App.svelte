@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte'
+  import Atmosphere from './lib/components/Atmosphere.svelte'
   import Attempts from './lib/components/Attempts.svelte'
   import GuessInput from './lib/components/GuessInput.svelte'
   import Play from './lib/components/Play.svelte'
@@ -7,6 +8,7 @@
   import Reveal from './lib/components/Reveal.svelte'
   import Skip from './lib/components/Skip.svelte'
   import { game } from './lib/game.svelte'
+  let motionPaused = $state(false)
   onMount(() => {
     void game.load()
     const onvisible = () => {
@@ -17,28 +19,44 @@
   })
 </script>
 
-<div class="page">
+<Atmosphere
+  playing={game.playing}
+  paused={motionPaused}
+  status={game.daily ? game.status : 'loading'}
+  analyser={() => game.player.analyser}
+/>
+<div class="page" class:still={motionPaused}>
   <header>
-    <h1>
-      <span class="brand-disc" aria-hidden="true">◎</span> Needledrop<span
-        class="brand-note">The daily listening game</span
-      >
+    <h1 data-sky-calm>
+      <!-- A record with a point of light on its rim: the stylus, or the last of an eclipse. -->
+      <svg class="brand-mark" viewBox="0 0 28 28" aria-hidden="true">
+        <circle cx="13" cy="15" r="9.25" />
+        <circle class="groove" cx="13" cy="15" r="5.2" />
+        <circle class="spindle" cx="13" cy="15" r="1.6" />
+        <path
+          class="spark"
+          d="M20.2 2.4Q20.9 7.1 25.6 7.8 20.9 8.5 20.2 13.2 19.5 8.5 14.8 7.8 19.5 7.1 20.2 2.4Z"
+        />
+      </svg>
+      Needledrop<span class="brand-note">The daily listening game</span>
     </h1>
-    <p class="number numeric">
+    <p class="number numeric" data-sky-calm>
       <span>Daily pressing</span>{game.daily
         ? `No. ${String(game.daily.number).padStart(3, '0')}`
         : 'No. —'}
     </p>
   </header>
-  <div class="stage" aria-hidden="true">
+  <div class="stage" class:playing={game.playing} aria-hidden="true">
+    <!-- Tells the sky where the record is: left/top is its centre, width its radius. -->
+    <span class="origin" data-sky-origin></span>
     <Record {game} />
-    <div class="record-caption">
+    <div class="record-caption" data-sky-calm>
       <span>One record. Seven chances.</span><span class="numeric"
         >33⅓ rpm · Stereo</span
       >
     </div>
   </div>
-  <main>
+  <main data-sky-calm>
     {#if game.daily}
       {#if game.finished}<Reveal {game} />
       {:else}
@@ -47,7 +65,7 @@
           <h2>Know it from <br /><span>the first note?</span></h2>
           <p>Listen closely. Name today's mystery song.</p>
         </div>
-      <div class="clip-steps" aria-hidden="true">
+        <div class="clip-steps" aria-hidden="true">
           {#each game.ladder as seconds, i}<div
               class:unlocked={seconds <= game.clipSeconds}
               class:current={i === game.turn - 1}
@@ -85,21 +103,79 @@
       </div>
     {:else}<p role="status">Loading today's song…</p>{/if}
   </main>
-  <footer>
+  <footer data-sky-calm>
     <span>A little sound. A familiar feeling.</span><span
       >Music previews by Deezer</span
     >
+    <button class="motion-toggle" type="button" onclick={() => (motionPaused = !motionPaused)}>
+      {motionPaused ? 'Resume motion' : 'Pause motion'}
+    </button>
   </footer>
 </div>
 
 <style>
+  .motion-toggle {
+    min-height: var(--target);
+    padding: 0 .5rem;
+    color: var(--muted);
+    border-radius: 4px;
+    font-size: .75rem;
+    white-space: nowrap;
+  }
+  .motion-toggle:hover { color: var(--paper); background: var(--surface); }
+  .motion-toggle:active { transform: translateY(1px); }
+  @media (prefers-reduced-motion: reduce) { .motion-toggle { display: none; } }
   .page {
+    position: relative;
+    z-index: 1;
     max-width: 1440px;
     margin: auto;
     min-height: var(--screen);
     padding: 0 var(--gutter);
     display: grid;
     grid-template-columns: minmax(0, 1fr);
+    /* The light behind the record is larger than its stage; it must not lengthen the page. */
+    overflow-y: clip;
+  }
+  @media (max-width: 1440px) {
+    /* The page spans the viewport here, so the same goes sideways. */
+    .page {
+      overflow-x: clip;
+    }
+  }
+
+  /* One arrival, in order: the header, the record rising with its light, the game. */
+  header {
+    animation: arrive 700ms var(--ease-out) backwards;
+  }
+  .stage {
+    animation: rise 1100ms var(--ease-out) calc(var(--reveal-step) * 2)
+      backwards;
+  }
+  main {
+    animation: settle 800ms var(--ease-out) calc(var(--reveal-step) * 6)
+      backwards;
+  }
+  footer {
+    animation: arrive 900ms var(--ease-out) calc(var(--reveal-step) * 10)
+      backwards;
+  }
+  @keyframes arrive {
+    from {
+      opacity: 0;
+    }
+  }
+  @keyframes rise {
+    from {
+      opacity: 0;
+      transform: translateY(1.25rem) scale(0.965);
+    }
+  }
+  @keyframes settle {
+    from {
+      opacity: 0;
+      transform: translateY(0.6rem);
+    }
   }
   header {
     display: flex;
@@ -118,10 +194,29 @@
     gap: 0.5rem;
     flex-wrap: wrap;
   }
-  .brand-disc {
-    font-size: 2rem;
+  .brand-mark {
+    flex: none;
+    width: 1.75rem;
+    height: 1.75rem;
     color: var(--accent);
-    line-height: 1;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.5;
+  }
+  .brand-mark .groove {
+    stroke-width: 1;
+    opacity: 0.45;
+  }
+  .brand-mark .spindle {
+    fill: currentColor;
+    stroke: none;
+  }
+  /* The dark outline lifts the point of light off the rim it sits on. */
+  .brand-mark .spark {
+    fill: currentColor;
+    stroke: var(--field);
+    stroke-width: 1.6;
+    paint-order: stroke;
   }
   .brand-note {
     font-size: 0.75rem;
@@ -144,6 +239,52 @@
     position: relative;
     height: calc(var(--record-r) * 2.45);
     margin: 0 calc(var(--gutter) * -1);
+  }
+  /* Light from behind the record, as around an eclipsed sun: brightest at the
+     edge of the disc, gone within a radius or so. The disc itself hides the rest. */
+  .stage::before {
+    content: '';
+    position: absolute;
+    z-index: -1;
+    left: calc(var(--record-x) - var(--record-r) * 2.2);
+    top: calc(var(--record-y) - var(--record-r) * 2.2);
+    width: calc(var(--record-r) * 4.4);
+    height: calc(var(--record-r) * 4.4);
+    border-radius: 50%;
+    /* closest-side: 100% is 2.2 radii, so the disc's edge is at 45.5%. */
+    background: radial-gradient(
+      closest-side,
+      transparent 40%,
+      rgb(var(--sky-warm) / 0.3) 45%,
+      rgb(var(--sky-warm) / 0.13) 51%,
+      rgb(var(--sky-warm) / 0.055) 62%,
+      rgb(var(--sky-warm) / 0.018) 80%,
+      transparent
+    );
+    opacity: 0.55;
+    pointer-events: none;
+    transition: opacity 1400ms var(--ease-out);
+    animation: bloom 2400ms var(--ease-out) calc(var(--reveal-step) * 8)
+      backwards;
+  }
+  .stage.playing::before {
+    opacity: 1;
+    transition-duration: 700ms;
+  }
+  @keyframes bloom {
+    from {
+      opacity: 0;
+      transform: scale(0.9);
+    }
+  }
+  .origin {
+    position: absolute;
+    left: var(--record-x);
+    top: var(--record-y);
+    width: var(--record-r);
+    height: 0;
+    visibility: hidden;
+    pointer-events: none;
   }
   .record-caption {
     display: none;
@@ -192,12 +333,50 @@
     font-size: 0.75rem;
   }
   .step-line {
+    position: relative;
     height: 3px;
-    background: var(--border);
+    background-color: var(--border);
     border-radius: 2px;
+    transition: background-color 420ms var(--ease-out);
   }
   .unlocked .step-line {
-    background: var(--accent);
+    background-color: var(--accent);
+  }
+  /* The step in play: a glint crosses it once as it unlocks, then it glows and slowly breathes. */
+  .current .step-line {
+    background-color: var(--accent);
+    background-image: linear-gradient(
+      100deg,
+      transparent 38%,
+      var(--paper) 50%,
+      transparent 62%
+    );
+    background-repeat: no-repeat;
+    background-size: 300% 100%;
+    /* At rest the bright band waits past the right end. */
+    background-position: 0 0;
+    animation: glint 1100ms var(--ease-out) 200ms backwards;
+  }
+  .current .step-line::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    box-shadow: 0 0 0.6rem 1px rgb(var(--sky-warm) / 0.75);
+    animation: breathe 3.2s ease-in-out infinite alternate;
+  }
+  .still .current .step-line::after {
+    animation-play-state: paused;
+  }
+  @keyframes glint {
+    from {
+      background-position: 100% 0;
+    }
+  }
+  @keyframes breathe {
+    from {
+      opacity: 0.3;
+    }
   }
   .clip-steps .current {
     color: var(--accent);
@@ -219,12 +398,25 @@
   }
   footer {
     display: flex;
+    flex-wrap: wrap;
+    align-items: center;
     justify-content: space-between;
     gap: 1rem;
     border-top: 1px solid var(--border);
     padding: 1.25rem 0 max(1.25rem, env(safe-area-inset-bottom));
     color: var(--muted);
     font-size: 0.6875rem;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    header,
+    .stage,
+    .stage::before,
+    main,
+    footer,
+    .current .step-line,
+    .current .step-line::after {
+      animation: none;
+    }
   }
   @media (max-width: 55.99rem), (max-aspect-ratio: 6/5) {
     .eyebrow {
