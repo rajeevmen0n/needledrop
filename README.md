@@ -17,8 +17,9 @@ just dev             # server with auto-reload + Vite dev server; Ctrl-C stops b
 | What | Where |
 |---|---|
 | Rust API | http://127.0.0.1:4810 (`GTS_BIND` overrides it) |
-| Vite dev server | http://127.0.0.1:4811 (proxies `/api` to the API) |
-| Public URL | https://gts.icyfire.dev (nginx on `mainframe` forwards `/` to 4811 and `/api/` to 4810) |
+| Vite dev server | http://127.0.0.1:4811 (proxies `/api` to the API) — open this one |
+
+Both bind `127.0.0.1` only. To reach the game under a public hostname, put a TLS-terminating reverse proxy in front (`/` → 4811, `/api/` → 4810); `AGENTS.md` has the details.
 
 Other recipes: `just server`, `just web`, `just test`, `just check`, `just build`, `just fmt`. Run `just` to list them.
 

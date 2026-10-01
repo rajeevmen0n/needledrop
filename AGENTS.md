@@ -10,24 +10,25 @@ Decisions already made, and why:
 
 - **The server is authoritative.** The browser never sees the answer's Deezer ID, title or preview URL until the game is over. A client-only game would leak the answer through the network tab.
 - **The server sends only the audio unlocked so far.** If the full preview reached the browser, anyone could play all 30 seconds. The server cuts the MP3 to the current clip length on every request.
-- **Game state is an encrypted, HttpOnly cookie**, not an account. There are no users or database in the MVP. Accepted limit: clearing cookies or using a private window gives a fresh game.
-- **Daily mode only**, one song per UTC day for everyone, drawn from curated Deezer playlists (`config.toml`). Curated lists keep the songs recognisable; random and genre modes come later. **Not built yet:** to get a playable UI sooner, the server currently plays one hard-coded track (`track_id` in `config.toml`) every day. The game is still keyed to the UTC date, so the cookie resets each day even though the song does not change.
+- **No accounts.** Everyone plays without logging in and each device is remembered. *Today* the whole game state is an encrypted, HttpOnly cookie and there is no database. *Planned (task 11):* the cookie holds only an anonymous player ID and the games and stats live in the server's database. Accepted limit either way: clearing cookies or using a private window gives a fresh player.
+- **Daily mode, one song per UTC day for everyone.** *Today* the server plays one hard-coded track (`track_id` in `config.toml`) every day; the game is still keyed to the UTC date, so it resets each day even though the song does not change. *Planned (tasks 10 and 12):* four daily sections — General, Pop, Rock, Hip-hop — each with its own song of the day, drawn from a curated song database. The agreed requirements are in **Roadmap** below; read it before building any of tasks 10–14.
 - **Ladder: 0.1 / 0.3 / 1 / 3 / 8 / 16 / 30 seconds — seven attempts.** The first clips are deliberately tiny; that is the game.
 - **A guess is correct when the normalized title and primary artist both match.** Remasters, live cuts and album variants of the same song have different Deezer IDs, so comparing IDs would reject right answers.
 - **Guesses must be picked from autocomplete.** The client sends a track ID, and the server looks up the title and artist itself, so a client cannot forge them.
-- **Rust server (axum), Svelte 5 + Vite client, Nix dev shell.** The machine has no global `cargo`, `rustc`, `pnpm` or `just`; the flake provides all of them.
+- **Rust server (axum), Svelte 5 + Vite client, Nix dev shell.** Nothing needs to be installed globally: the flake provides `cargo`, `rustc`, `pnpm`, `just` and the rest.
 - **TLS via rustls, no OpenSSL**, so the dev shell needs no system libraries.
 
 ## Layout and architecture
 
 ```
-browser ─▶ Cloudflare ─▶ nginx gts.icyfire.dev ─┬─ /      ─▶ Vite dev server 127.0.0.1:4811 (Svelte SPA)
-                                                └─ /api/  ─▶ axum server 127.0.0.1:4810 ─▶ api.deezer.com / preview CDN
-                                                                 │
-                                                                 └─ data/  (cached mp3 + track JSON, cookie key)
+browser ─▶ Vite dev server 127.0.0.1:4811 (Svelte SPA) ── /api ─▶ axum server 127.0.0.1:4810 ─▶ api.deezer.com / preview CDN
+                                                                      │
+                                                                      └─ data/  (cached mp3 + track JSON, cookie key)
 ```
 
-nginx terminates TLS, so both processes only ever see plain HTTP. Vite also proxies `/api` to 4810 itself, so `http://127.0.0.1:4811` works without nginx. Vite's HMR websocket is configured for `wss://gts.icyfire.dev:443`, so hot reload only works through the public URL. When the game ships as a production build, the server will serve `web/dist` and nginx will send everything to 4810.
+Both processes speak plain HTTP on loopback. Vite proxies `/api` to 4810, so `http://127.0.0.1:4811` is the whole app in development.
+
+To serve it under a public hostname, put a TLS-terminating reverse proxy in front: `/` → 4811, `/api/` → 4810, forwarding `X-Forwarded-Proto` (see the cookie notes below). `web/vite.config.ts` pins `server.allowedHosts` and the HMR websocket (`server.hmr`) to one public hostname; set them to your own hostname, or remove them when working on plain localhost, because with them in place hot reload only connects through that hostname. When the game ships as a production build, the server will serve `web/dist` and the proxy will send everything to 4810.
 
 ```
 flake.nix, flake.lock   dev shell: cargo, rustc, clippy, rustfmt, rust-analyzer, bacon, nodejs_24, pnpm, just
@@ -77,7 +78,7 @@ Errors are `{ "error": "<code>", "message": "<sentence>" }`. The messages are fi
 
 **Anti-leak rule:** while `status` is `playing`, nothing sent to the client may contain the answer's Deezer ID, title, artist, album, cover or preview URL — JSON, headers, cookie and error messages alike. `routes::tests` assert it on every playing-state response; keep those assertions when adding routes.
 
-Cookie: named `gts_daily`, holding `game::GameState` as JSON — `{"day":"2026-10-01","attempts":[{"kind":"skip"},{"kind":"wrong","title":"…","artist":"…"}],"status":"playing"}` — encrypted with axum-extra's `PrivateCookieJar`. Attributes: `HttpOnly; SameSite=Lax; Path=/; Max-Age=172800` (2 days), plus `Secure` when the request has `X-Forwarded-Proto: https`. nginx sends that header: the vhost uses `recommendedProxySettings`, which sets `X-Forwarded-Proto $scheme`. On plain HTTP (the Vite dev server on localhost) the cookie is not `Secure`, or the browser would drop it. Stored titles and artists are cut to 80 characters and 160 bytes, so the worst case (seven wrong guesses) is under 2.7 kB of JSON; a test checks that the whole `Set-Cookie` header for that case stays under 4096 bytes (axum-extra percent-encodes the base64, which adds about 6%). A cookie that is missing, does not decrypt or does not deserialize (impossible states, such as `playing` with seven attempts, are rejected too) is a fresh game, and so is one for another day (`.for_day(today)` is always applied). Unlocked clip length = `ladder[attempts.len()]`.
+Cookie: named `gts_daily`, holding `game::GameState` as JSON — `{"day":"2026-10-01","attempts":[{"kind":"skip"},{"kind":"wrong","title":"…","artist":"…"}],"status":"playing"}` — encrypted with axum-extra's `PrivateCookieJar`. Attributes: `HttpOnly; SameSite=Lax; Path=/; Max-Age=172800` (2 days), plus `Secure` when the request has `X-Forwarded-Proto: https`. A TLS-terminating reverse proxy in front must send that header (in nginx, `proxy_set_header X-Forwarded-Proto $scheme`). On plain HTTP (the Vite dev server on localhost) the cookie is not `Secure`, or the browser would drop it. Stored titles and artists are cut to 80 characters and 160 bytes, so the worst case (seven wrong guesses) is under 2.7 kB of JSON; a test checks that the whole `Set-Cookie` header for that case stays under 4096 bytes (axum-extra percent-encodes the base64, which adds about 6%). A cookie that is missing, does not decrypt or does not deserialize (impossible states, such as `playing` with seven attempts, are rejected too) is a fresh game, and so is one for another day (`.for_day(today)` is always applied). Unlocked clip length = `ladder[attempts.len()]`.
 
 Cookie key: 64 random bytes written as 128 hexadecimal characters. `GTS_SECRET` if set (`openssl rand -hex 64`), else `<data_dir>/secret.key`, generated on the first start with mode 0600 and reused after that, so cookies survive restarts. A malformed `GTS_SECRET` or key file stops the server at startup; delete the file to get a new key. A new key means every player's game for the day starts again.
 
@@ -127,21 +128,21 @@ Everything runs inside the dev shell: `nix develop`, or prefix single commands w
 All recipes run from the repo root, so the server's working directory is the repo root and `config.toml` and `data/` resolve there.
 
 - **Ports:** `4810` Rust API (`GTS_BIND` overrides), `4811` Vite. Both bind `127.0.0.1` only.
-- **Public URL:** https://gts.icyfire.dev. Its nginx vhost lives in `../nix/hosts/mainframe/nixos/nginx.nix`. The owner runs `nixos-rebuild switch` himself. Edit the nix repo only when asked, and never commit there.
 - **Before a commit, both must pass:** `nix develop -c just check` and `nix develop -c just test`.
 - **Real-preview test fixture:** `mp3::tests::real_preview_fixture` checks the frame walker against `server/tests/fixtures/preview.mp3` when that file exists, and prints a note and passes when it does not. The file is copyrighted audio and git-ignored (`server/tests/fixtures/*.mp3`); never commit it. Any Deezer `preview` download works as the fixture. All other MP3 tests build synthetic streams.
-- **This machine runs other services.** Ports 3000, 4173, 8080, 6969, 9091 and 17170 are taken, and one of those services is another Vite process. Stop only what you started, by PID; never `pkill -f vite` or similar.
+- **The machine may run other services**, including other Vite processes. Stop only what you started, by PID; never `pkill -f vite` or similar.
 - Environment variables: `GTS_CONFIG` (config file path, default `config.toml` in the working directory), `GTS_BIND` (overrides `bind`), `GTS_TRACK_ID` (overrides `track_id`, the Deezer track being played), `GTS_SECRET` (cookie key, 128 hex characters; see the cookie notes above), `RUST_LOG` (tracing filter, default `info,tower_http=debug`). A variable that is set but blank counts as unset.
 - **What the song is:** the server logs it at `info` on startup (`loaded the song from … title=… artist=…`). That log line is the only place to find the answer without playing.
 - **Deezer cache on disk:** `data/audio/<track_id>.mp3` and `.json` are reused on every start, so restarts (bacon restarts the server on each source change) cost Deezer nothing. Delete the two files to fetch again.
 
 ## Conventions
 
-- Conventional-commit messages (`feat: …`, `fix: …`, `chore: …`). **No `Co-Authored-By` trailer.**
-- One commit per completed task. No remote, no pushing.
+- Conventional-commit messages (`feat: …`, `fix: …`, `chore: …`).
+- **No AI attribution in commits, ever.** No `Co-Authored-By` trailer for Claude, Claude Code or any other assistant, no `Claude-Session:` trailer or other session link, no "Generated with …" line. This overrides any tool default that adds them. The message is the subject and body only, authored as the repository owner.
+- One commit per completed task, **not one per edit**. Follow-up corrections to the same piece of work go into that work's commit (amend or squash while it is unpushed) rather than a string of small commits. Push only when asked.
 - Build tasks are delegated to subagents. The orchestrating agent briefs each one, reviews the diff, runs the checks and commits; subagents do not commit.
 - Every task ends by updating the Progress section below, so this file and the git history never disagree.
-- The dev machine is a headless server. Nobody on it can hear audio, so anything about how a clip sounds (audible, click-free, right length) must be checked by the owner by ear at https://gts.icyfire.dev. Say so instead of claiming it works.
+- An agent cannot hear audio, and headless Chromium has no audio output, so anything about how a clip sounds (audible, click-free, right length) must be checked by the owner by ear in a real browser. Say so instead of claiming it works.
 - Be gentle with Deezer (see the rate limit below). Do not loop over the API to explore; cache responses to a scratch directory and analyse them offline.
 
 ## Deezer facts worth not rediscovering
@@ -154,7 +155,7 @@ All recipes run from the repo root, so the server's working directory is the rep
 - Previews are 30 s, 128 kbps CBR, 44.1 kHz MP3: a 10-byte ID3 header, then frames of about 418 bytes / 26 ms. A clip can be cut by slicing at frame boundaries; no transcoding or ffmpeg. The one preview measured (479,827 bytes) is an empty 10-byte ID3v2.4 tag plus exactly 1148 frames of 417/418 bytes: no Xing/Info frame, no ID3v1 trailer, no partial frame. That is **29.988 s, not 30**, so the last ladder step is "everything" rather than a full 30 000 ms.
 - Tracks carry `title_short` — the title without "(Remastered …)" and similar — next to `title` and `title_version`. Use it for matching.
 - A track that cannot be played has `"readable": false` **and** `"preview": ""`; in every playlist checked the two always went together. Filter on both anyway.
-- **User playlists rot.** Old playlists point at track IDs that have since been withdrawn, so a large share of a playlist can be unplayable. Measured on 2026-10-01 from this server, which Deezer treats as US: `88551731` "All time hits" 51 of 139 playable (37%), `3564546242` "500 Greatest Hits of All Time" 193 of 494 (39%). Check a playlist's playable share before adding it.
+- **User playlists rot.** Old playlists point at track IDs that have since been withdrawn, so a large share of a playlist can be unplayable. Measured on 2026-10-01 from a US IP address (availability varies by country): `88551731` "All time hits" 51 of 139 playable (37%), `3564546242` "500 Greatest Hits of All Time" 193 of 494 (39%). Check a playlist's playable share before adding it.
 - Playlist `title` is cut off at 50 characters by the API.
 - Each track has a `rank` (Deezer popularity, higher = better known) that could filter out obscure tracks.
 
@@ -190,30 +191,123 @@ Playback drives 33⅓ rpm rotation, smooth acceleration/coasting, stylus movemen
 
 On a fresh win/loss, the album art prints onto the rotating label, the result and song details reveal in sequence, and the disc coasts upright. Reloading a finished game shows the settled text immediately. With reduced motion, rotation, needle movement, groove response and CSS reveal motion stop; a progress arc still communicates playback. The backend, game store and audio engine are unchanged by this redesign.
 
+## Roadmap: sections, song database, players and admin
+
+Agreed with the owner on 2026-10-01. This is the specification for tasks 10–14 in Progress. Items marked *(assumed)* were not asked; they are the builder's defaults and the owner may overrule them.
+
+### Sections and the daily pick
+
+- Four sections, each a separate seven-attempt game per day: `general`, `pop`, `rock`, `hip-hop` (the slugs used in URLs, the API and the database).
+- Every song in the database is in the General pool. A song may also carry **any number of genre tags** (none, one or several of pop / rock / hip-hop) and is in the pool of each genre it is tagged with.
+- **No song is the answer in two sections on the same day.** Picks are made in a fixed order — Pop, Rock, Hip-hop, then General — and each excludes the songs already picked that day, so playing a genre section never spoils General.
+- A section does not repeat a song until its pool is used up *(assumed)*: prefer songs not picked in that section since the pool was last exhausted, and never yesterday's when there is another choice.
+- Picks are stored (day, section, track), so a restart keeps the day's songs. They are made lazily, the first time a day is asked for.
+- **The daily pick checks that the preview is available.** It runs once per section per day (and again on an admin re-roll), and it has to fetch the track and its preview to play it anyway, so the check costs nothing extra. If Deezer says the track has no preview (`readable: false` or an empty `preview`), that song is skipped for the day and another is drawn. The add endpoint stays unvalidated (see Admin), so this is the safety net for songs that were added unchecked or withdrawn later.
+- Only "this track has no preview" skips a song. Deezer being unreachable or over the request budget is not a verdict on the song: the pick fails with 502 `upstream` and is retried, as the song load is today, rather than burning through the pool *(assumed)*.
+- A skipped song stays in the database and is tried again on later days; the day it last failed is recorded and shown in the admin pool list so the owner can remove it *(assumed)*.
+- A section with no pickable song after the day's exclusions and skips answers with an error the UI shows as "No song today" *(assumed)*.
+- **Seed:** six songs, two per genre, in `server/seed.sql` together with the `songs` and `song_genres` tables (chosen on 2026-10-01; that day each was `readable` and its preview downloaded as a full 479,827-byte MP3): Pop — "Billie Jean" (Michael Jackson, `4603408`), "Toxic" (Britney Spears, `15391618`); Rock — "Bohemian Rhapsody" (Queen, `4091937401`), "Back In Black" (AC/DC, `92720046`); Hip-hop — "Lose Yourself" (Eminem, `1109731`), "Juicy" (The Notorious B.I.G., `3616616`). A test database built from that file is at `data/needledrop.db` on the machine where it was made; `data/` is git-ignored, so on a fresh clone run the file through any SQLite client (`node:sqlite` in the dev shell's Node works) until the server creates the database itself. The schema is a starting point that task 10 may extend. The seed is inserted only when the songs table is empty, so later removals stick.
+- **The database stores track IDs and display metadata only — never audio or preview URLs.** Preview URLs are signed and expire in minutes; the MP3 is downloaded when a song is picked for a day and cached under `data/audio/`, as today. With the seed alone, each genre alternates its two songs and General picks one of the three the genres did not take that day.
+- `track_id` in `config.toml`, `GTS_TRACK_ID` and the `playlists` key go away once picks come from the database.
+
+### Storage
+
+SQLite, one file under `data_dir` *(the SQLite crate is the builder's choice; it must not need a system library or a separate service)*. It holds the songs and their genres, the picks, the players, their games and the day offset. The parsed-preview disk cache in `data/audio/` stays as it is.
+
+**The database sits behind one abstraction**, so MySQL, Postgres, a document store or Firebase can replace SQLite later by writing one new implementation and nothing else (asked for by the owner on 2026-10-01):
+
+- A `Store` trait (async) in its own module is the only way the rest of the server touches persistent data. Handlers, the pick and the stats hold an `Arc<dyn Store>`; no SQL, connection type or database error type appears outside the implementation.
+- Its methods are **domain operations, not queries**: list / add / retag / remove songs; get a day's picks and the pick history of a section; save a pick; load and save a player's game; list a player's finished games in a section; delete games by day and section; get and set the day offset; wipe picks, games and players. They take and return plain domain types (`game::GameState`, track IDs, dates).
+- **Logic stays in Rust, above the trait.** Choosing the pick is a pure function over the pool and the history; stats are computed from the list of games. A backend only fetches and stores, so nothing depends on joins, aggregates or SQL dialect — which is what makes a document store possible.
+- The only atomicity a backend must provide is single-record: "save this pick unless the day and section already have one" (two requests at midnight must agree on the song), and "replace this game". No multi-table transactions.
+- Two implementations from the start: `SqliteStore`, and an in-memory one for tests. One shared test suite runs against both and is the contract a future backend has to pass.
+- The backend is chosen in `config.toml` (for example `[store] kind = "sqlite"`), defaulting to SQLite.
+- The seed songs are inserted through the trait from a backend-neutral list, so every backend is seeded the same way. `server/seed.sql` is where they are recorded for now; task 10 splits it into that list and the SQLite backend's own schema.
+
+**Stats are derived from the stored games, not kept as counters.** Re-rolling a pick or resetting the clock deletes games, and derived stats then correct themselves.
+
+### Players, streaks and stats
+
+- The cookie carries only a random anonymous player ID (HttpOnly, long-lived, refreshed on each visit); every game and stat is in the database. Reasons: four games do not fit in one 4 kB cookie (one worst-case game is 2.7 kB), and server-side streaks cannot be forged. The old `gts_daily` cookie is ignored.
+- **One streak per section.** A streak is consecutive days **won**: a loss or a missed day resets it to zero.
+- Recorded and shown per section: current streak, best streak, games played, win rate, and the guess distribution (which of the seven attempts the win came on).
+- **Clear my data:** a button on the player page, behind a confirmation. It deletes that player's games and stats, today's attempts included, and issues a new anonymous ID. The day's songs do not change.
+
+### The day clock
+
+- The effective day is the real UTC date plus a stored offset in days, **for the whole server**: every player moves together, exactly as at a real midnight. Everything that says "today" (picks, games, streaks, the day number) uses the effective day.
+- **Simulate next day** adds one to the offset.
+- **Reset to day 1** sets the effective day back to `launch_date` and deletes all picks, games and players. **The song database is kept.**
+
+### Admin
+
+`/admin` in the web app, and `/api/admin/*` on the server. **Unprotected for now** by the owner's choice; it must be protected or disabled before any public deployment, because it can show the day's answers and wipe every player's data. The anti-leak rule applies to the player routes, not to these.
+
+Admin API (route names are a proposal; the behaviour is the requirement):
+
+| Route | Behaviour |
+|---|---|
+| `GET /api/admin/state` | Real date, offset, effective day and day number, and today's pick for each section. |
+| `GET /api/admin/songs` | The whole pool: track ID, title, artist, genres, and the day its preview last failed the daily check, if it has. |
+| `POST /api/admin/songs` | `{ "trackId": 123, "genres": ["pop", "hip-hop"] }` adds the song, or replaces the genres of one already there. **It never checks that a preview exists; validation is the caller's job.** Two callers share it: the admin UI, which validates first, and a later bulk-add script or AI agent, which validates each song itself before adding it. It still looks the track up on Deezer for its title and artist, so an unknown ID is an error and callers must stay under the request budget. A song that slips through without a preview is caught by the daily pick. |
+| `DELETE /api/admin/songs/{trackId}` | Removes a song from the pool *(assumed)*. |
+| `GET /api/admin/search?q=` | The player search plus a `playable` flag per result, without the de-duplication that hides alternative releases. |
+| `POST /api/admin/reroll` | `{ "section": "pop" }`, or no section for all four. Picks again for the effective day, as a real daily refresh would, choosing a different song where the pool allows. Every player's game for that day and section is deleted. |
+| `POST /api/admin/next-day` | Simulate next day. |
+| `POST /api/admin/reset` | Reset to day 1. |
+
+Admin UI:
+
+- **Clock:** the effective day and day number, **Simulate next day**, and **Reset to day 1** behind a confirmation.
+- **Today's picks:** the song of each section, with **Re-roll** per section and **Re-roll all**. There is deliberately no way to choose a specific song for a section: the owner asked for re-roll only.
+- **Add a song:** search with the same drop-down as the game. All results are shown, playable or not. **The validation lives here, in the UI:** choosing a result whose `playable` flag (from the admin search) is false shows an error and adds nothing. For a playable one the owner ticks the genres and adds it through the unvalidated endpoint.
+- **The pool:** the list of songs with their genres, a way to change the genres, and remove *(list and remove are assumed)*.
+
+### Player UI
+
+- A row of four tabs under the header — General, Pop, Rock, Hip-hop — each showing whether today's game there is unplayed, won or lost. The record, clip rail and controls show the selected section's game. Each tab has its own URL (`/`, `/pop`, `/rock`, `/hip-hop`) using the History API; no router library *(assumed)*.
+- Stats for the section appear with the result once its game is finished, and the current streak is visible while playing *(placement is the designer's)*.
+- The Clear my data button, in the footer *(assumed)*.
+- Follow `DESIGN.md`; the admin page can be plain but uses the same tokens.
+
+### Player API changes
+
+The single-game routes become per-section. Proposal: `GET /api/daily/{section}`, `GET /api/daily/{section}/audio`, `POST /api/daily/{section}/guess`, the existing response fields unchanged with `section` and `stats` added; an overview route for the tabs (status of all four sections today); and a route for Clear my data. `GET /api/search` is unchanged.
+
 ## Progress
 
-- [x] **0. Reverse proxy** — 2026-10-01. `gts.icyfire.dev` vhost added in the nix repo and switched by the owner; `https://gts.icyfire.dev/api/health` returns 200 while the dev servers run. The nix repo change is uncommitted there, by the owner's choice.
 - [x] **1. Scaffold** — 2026-10-01. Flake dev shell, justfile, `config.toml`, compiling server skeleton with `GET /api/health`, Vite + Svelte placeholder that calls it, this file. `just check` and `just test` pass.
 - [x] **2. Server core** — 2026-10-01. `mp3.rs` (frame walker, `Mp3::prefix`) and `game.rs` (ladder, `GameState`, normalization, matching), both pure, 68 unit tests. Nothing calls them yet. `just check` and `just test` pass.
 - [x] **3. Server I/O** — 2026-10-01. `config.rs`, `deezer.rs`, `daily.rs`, `routes.rs` and `testutil.rs`, wired in `main.rs`; the API table above is what was built. Shipped with **one hard-coded track** (`track_id` in `config.toml`, `GTS_TRACK_ID`); the playlist-based daily pick is deferred to its own item below. 136 unit tests (handler tests run against a local Deezer stand-in); the curl walk-through against real Deezer passed (fresh game, seven clip sizes, wrong guess, win, loss, 409 after the end, no answer in any playing-state response). `just check` and `just test` pass.
-- [x] **4. Frontend plumbing** — 2026-10-01. API client, Web Audio clip player, runes game store, plain components (controls, timeline, autocomplete, tries, reveal), a flag-gated mock API and 11 unit tests for the pure helpers. Built in parallel with task 3, then run together: a full game (play, skip, wrong guess, reload, right guess, reveal) passes in headless Chromium through `https://gts.icyfire.dev` with no console errors, HMR websocket included. Not yet confirmed by ear.
+- [x] **4. Frontend plumbing** — 2026-10-01. API client, Web Audio clip player, runes game store, plain components (controls, timeline, autocomplete, tries, reveal), a flag-gated mock API and 11 unit tests for the pure helpers. Built in parallel with task 3, then run together: a full game (play, skip, wrong guess, reload, right guess, reveal) passes in headless Chromium with no console errors, HMR websocket included. Not yet confirmed by ear.
 - [x] **5. Design pass** — 2026-10-01. Before it started, the owner tested the plain UI of task 4 in his browser and confirmed it "works perfectly", audio included. Then: seven weekday sleeves (contrast-checked, `?sleeve=0..6`), self-hosted Bricolage Grotesque, the record canvas (`lib/record.ts`, `Record.svelte`), side and stacked layouts with the phone as a first-class target, result list placed by the visual viewport, reveal sequence, reduced-motion mode, SVG favicon. Logic files untouched. Checked in headless Chromium against the real server at 320, 360, 390 and 430 px portrait, 844×390, 768×1024, 1024×768, 1440×900 and 1920×1080: a scripted game (play, skip, keyboard-only wrong guess, reload, right guess, reveal, full clip; a lost game; a reduced-motion game) passes with no console errors or warnings and no frames requested while idle. `just check` and `pnpm --dir web test` pass. Production bundle: JS 74.4 kB (28.3 kB gzip), CSS 13.4 kB (3.7 kB gzip), font 131.5 kB (latin; latin-ext 53.6 kB and vietnamese 22.0 kB load only when needed). **Not checked on a real phone or by ear** since the restyle.
-- [x] **6. Midnight redesign + verification** — 2026-10-01. Owner approved OLED black, graphite vinyl, champagne/ivory type and a metal tonearm, replacing task 5's bright sleeves. Added `DESIGN.md`, responsive whole-record layouts, compact clip rail/history, dark autocomplete with clear/IME support, matching favicon, and global scrollbar tokens. Browser checks through `https://gts.icyfire.dev` at 320×568, 360×740, 390×844, 844×390, 768×1024, 1024×768, 1024×1366, 1440×900 and 1920×1080 passed. Isolated browser fixtures covered play/stop and animated canvas, skip, keyboard wrong guess, reload, win/loss, full clip, clear-focus, IME, no results, injected search/move/load errors and retry, loading, reduced motion, and 390×480 keyboard-height popup placement. No unexpected browser errors; expected injected 502s were recorded. Real API smoke also passed. `just check`, `just test` (136), frontend tests (14), strict design audit and official DESIGN lint passed; independent review found no blocking issues. Bundle: JS 77.28 kB (29.30 gzip), CSS 17.10 kB (4.45 gzip). Browser evidence: `/tmp/needledrop-midnight/verified/`; original ports retained (4810 API, 4811 Vite). **Not checked by ear or on a physical phone/Safari since this redesign.**
+- [x] **6. Midnight redesign + verification** — 2026-10-01. Owner approved OLED black, graphite vinyl, champagne/ivory type and a metal tonearm, replacing task 5's bright sleeves. Added `DESIGN.md`, responsive whole-record layouts, compact clip rail/history, dark autocomplete with clear/IME support, matching favicon, and global scrollbar tokens. Headless-browser checks at 320×568, 360×740, 390×844, 844×390, 768×1024, 1024×768, 1024×1366, 1440×900 and 1920×1080 passed. Isolated browser fixtures covered play/stop and animated canvas, skip, keyboard wrong guess, reload, win/loss, full clip, clear-focus, IME, no results, injected search/move/load errors and retry, loading, reduced motion, and 390×480 keyboard-height popup placement. No unexpected browser errors; expected injected 502s were recorded. Real API smoke also passed. `just check`, `just test` (136), frontend tests (14), strict design audit and official DESIGN lint passed; independent review found no blocking issues. Bundle: JS 77.28 kB (29.30 gzip), CSS 17.10 kB (4.45 gzip). **Not checked by ear or on a physical phone/Safari since this redesign.**
 - [x] **7. Animated background atmosphere** — 2026-10-01. Added oversized sound trails, continuously sweeping champagne highlights and twenty independently drifting dust motes. Playback strengthens the wave; the footer offers Pause motion / Resume motion. Decoration scrolls with the record, with masks protecting the control area, hidden-tab suspension and reduced-motion support. The owner requested more visible idle animation after the initial restrained version. **Final stronger-motion revision was not tested or screenshotted at the owner's explicit request; the owner will verify it.** Existing API/audio/game logic and preview ports are unchanged.
 - [x] **8. Playback-only musical notes** — 2026-10-01. Replaced dust with small authored SVG eighth notes and beamed pairs floating slowly at varied depths. Notes, champagne sweeps and the wave now move only while audio plays and pause in place between clips. Pause override, hidden-tab suspension and reduced-motion support remain. **No tests or screenshots run, as requested by the owner.**
 - [x] **9. Deep-space atmosphere** — 2026-10-01. The owner disliked the floating notes and groove circles and asked for tasteful "space vibes". `Atmosphere.svelte` is now a canvas night sky (`lib/sky.ts` model, `lib/starfield.ts` painter): seeded three-depth starfield with twinkle and slow drift, playback-reactive pace and brightness, shooting stars, two CSS hazes, stars dimmed behind text, and a stardust burst on a win. `App.svelte` gained the eclipse light behind the record, a new SVG header mark (the `◎` glyph is gone), a one-time arrival sequence and a living current step on the clip rail; Play and Guess have glow / light-sweep states. Record, game store, API client and audio engine untouched; `Atmosphere` gained the `status` and `analyser` props. `just check` and `pnpm --dir web test` (45 tests, 31 new for `lib/sky.ts`) pass. Bundle: JS 88.52 kB (33.58 gzip), CSS 23.73 kB (5.77 gzip). **NOT visually verified: no browser was run and no screenshot taken, at the owner's request.** Every size, alpha and timing was chosen by reasoning and one rough offline rasterisation of star positions, so expect tuning. The owner should look at: star density and brightness at idle on a 1× desktop monitor and on a phone (constants at the top of `lib/sky.ts`); whether the idle drift is unnoticeable while typing; the light behind the record at idle and during a long clip (it must read as an eclipse, not a ring); the hazes (the page must still read as black, without banding); a shooting star; the win burst; the arrival sequence; the rail's current step; Play and Guess hover; Pause motion; and scrolling on a phone (the sky is viewport-fixed, the record's light scrolls with the record).
-- [ ] **Daily pick from playlists** — replace the hard-coded track: load the playlist pool from `config.toml`, drop unplayable tracks and past picks, pick one per UTC day, keep a history.
+
+The remaining tasks implement the **Roadmap** section above, in this order. Each is one subagent-sized task and ends with a report to the owner saying what he should test.
+
+- [ ] **10. Song database (server)** — the `Store` trait with its SQLite and in-memory implementations and the shared contract tests (see Storage), the database created under `data_dir` and seeded with the six songs recorded in `server/seed.sql`, and the song half of the admin API: list, add (never validated: callers check playability themselves), change genres, remove, and admin search with the `playable` flag. Nothing reads the pool yet; the game still plays `track_id`.
+- [ ] **11. Anonymous players and stats (server)** — the cookie becomes a player ID; games move from the cookie into the database; stats (current and best streak, played, win rate, guess distribution) are derived from the stored games and returned with the daily state; a route for Clear my data. Still one game per day.
+- [ ] **12. Sections, daily picks and the day clock (server)** — the four sections and the per-section player routes; the pick rules (fixed order, no song twice in a day, no repeat until the pool is used up, a song without a preview skipped for the day); stored picks; the effective day with its offset; the rest of the admin API (state, re-roll, next day, reset to day 1). Removes `track_id`, `GTS_TRACK_ID` and `playlists`.
+- [ ] **13. Player UI: sections, stats, clear data** — the four tabs with their URLs and per-section state, the stats display, the streak while playing, the Clear my data button with its confirmation, "No song today".
+- [ ] **14. Admin UI at `/admin`** — clock, today's picks with re-roll, add a song by search with the preview check, and the pool list with genre editing and remove.
 
 ### Next up
 
-- The owner reviews the midnight UI at https://gts.icyfire.dev on a physical phone and desktop: the record during a longer clip, reveal, autocomplete with the real keyboard, and first-tap audio in iOS Safari. Follow-up polish should use `DESIGN.md`.
-- Daily pick from playlists, when it is taken up. What it needs to know:
-  - `Daily::pick(day) -> u64` in `daily.rs` is the only thing that decides the track. Everything else (`song_for`, the disk cache keyed by track ID, the routes) already works per day and per track; `song_for` reloads when the picked ID changes.
-  - `pick` is synchronous and infallible today. A real pick needs the pool (network) and a history file, so it will become async and fallible; `song_for` already holds a lock for the whole load and already has the fail / pause 10 s / retry path to hang that on.
-  - `Deezer` has no `playlist_tracks` yet. `config.rs` does not parse `playlists`; add the field when something reads it. `Track::is_playable()` is the readable-and-has-a-preview check.
-  - Playlist pages go through `Deezer::get_json`, so they count against the 40-per-5-s request budget; a 500-track playlist is 5 requests.
-  - `rand` 0.10 is already a dependency (unused until then).
-  - Old `data/audio/<id>.mp3` files are never deleted; with a new song every day that needs a clean-up.
+- The owner reviews the UI on a physical phone and desktop: the night sky (see task 9), the record during a longer clip, reveal, autocomplete with the real keyboard, and first-tap audio in iOS Safari. Follow-up polish should use `DESIGN.md`.
+- Task 10, then 11–14 in order. What they need to know about the code as it stands:
+  - `Daily::pick(day) -> u64` in `daily.rs` is the only thing that decides the track. `song_for`, the disk cache keyed by track ID and the routes already work per day and per track, but `Daily` keeps one song in memory; with sections it needs up to four.
+  - `pick` is synchronous and infallible today. A database-backed pick that verifies the preview becomes async and fallible; `song_for` already holds a lock for the whole load and already has the fail / pause 10 s / retry path to hang that on.
+  - `Track::is_playable()` is the readable-and-has-a-preview check. Deezer search results carry `readable` and `preview` too, so the admin search can flag results without a request per row.
+  - Every Deezer call goes through `Deezer::get_json` and counts against the 40-per-5-s request budget, admin routes included.
+  - `daily::today_utc()` is read once per request and passed down; the game module has no clock on purpose. The effective day replaces it at that one point.
+  - `game::GameState` is the cookie payload today and serializes to JSON; the same value can be stored per player, day and section.
+  - `rand` 0.10 is already a dependency (unused until the picks).
+  - The frontend is plain Vite with no router, and Vite's dev server already answers unknown paths with `index.html`, so `/admin` and `/pop` reach the app; a production build served by the Rust server will need the same fallback.
+  - `GuessInput.svelte` knows nothing about the game (it takes `onguess` and `busy`), so the admin search can reuse it or its pattern.
+  - `web/mock/` mirrors the single-game API and will need the same changes, or retiring.
 - The two pure modules' public API, for reference:
 
 ```rust
@@ -267,14 +361,14 @@ pub fn normalize_artist(artist: &str) -> String;
 
 ### Known issues
 
-- **The song never changes.** Every day plays `track_id` from `config.toml` until the daily pick is built, so anyone who has finished one game knows every later answer. The day number and the daily cookie reset work as designed.
+- **The song never changes.** Every day plays `track_id` from `config.toml` until task 12 is built, so anyone who has finished one game knows every later answer. The day number and the daily cookie reset work as designed.
 - `GET /api/daily` needs the song, not only the cookie: with Deezer unreachable and nothing in `data/audio/`, it answers 502 `upstream` (as do the audio and guess routes) until a load succeeds. Loads are retried on a request at most every 10 s. Once the song is in memory or on disk, Deezer being down only breaks search and guesses whose track is not in the metadata cache; skips keep working.
 - The request budget (40 Deezer API calls per 5 s, shared by all players) turns searches beyond it into 502 `upstream` rather than queueing them. The client should treat a failed search as "no results for now", not as a fatal error.
 - Search fetches 25 Deezer results and de-duplicates afterwards, so a query whose top 25 are mostly releases of one song returns fewer than 8 rows.
 - Numbers that are whole serialize with a decimal point (`"clipSeconds":1.0`, `ladder` `[…,1.0,3.0,…]`). They are the same numbers to JavaScript.
 - The track metadata cached in `data/audio/<id>.json` is never refreshed; delete the file to refetch.
 - `rand` and the tower-http `fs` / `compression-gzip` features are in `Cargo.toml` but unused until the daily pick and the production static-file serving exist.
-- The playlist pool is weaker than hoped. The plan's candidate `88551731` was dropped (37% playable). The two in `config.toml` are 59% and 71% playable, and `5123717724` leans towards 2014–2018 chart pop and hip-hop with some obscure tracks. Better candidates were seen but only half-checked — first 100 tracks only, playlist metadata not fetched — so they are not in the config: `8499830842` "Party Hits & All-Time Classics" (1075 tracks, 90 of the first 100 playable), `1321696237` "80s HITS | TOP 100 SONGS" (139, 92/100), `1319830927` "90s HITS | TOP 100 SONGS" (146, 93/100), `1318937087` "2000s HITS Y2K THROWBACKS" (213, 85/100), `11153461484` "10s HITS - 100 Greatest Songs of the 2010s" (100, 97/100). Whoever revisits the pool should finish checking these rather than search again.
+- Playlists are no longer the plan for the daily pick (the song database is; see Roadmap), but they remain a possible source for a bulk import through the admin API. What was learnt: the pool is weaker than hoped. The original candidate `88551731` was dropped (37% playable). The two in `config.toml` are 59% and 71% playable, and `5123717724` leans towards 2014–2018 chart pop and hip-hop with some obscure tracks. Better candidates were seen but only half-checked — first 100 tracks only, playlist metadata not fetched — so they are not in the config: `8499830842` "Party Hits & All-Time Classics" (1075 tracks, 90 of the first 100 playable), `1321696237` "80s HITS | TOP 100 SONGS" (139, 92/100), `1319830927` "90s HITS | TOP 100 SONGS" (146, 93/100), `1318937087` "2000s HITS Y2K THROWBACKS" (213, 85/100), `11153461484` "10s HITS - 100 Greatest Songs of the 2010s" (100, 97/100). Whoever revisits the pool should finish checking these rather than search again.
 - The shortest clip is bigger than "a few hundred bytes": `prefix(100)` is 8 frames (4 for 100 ms + 4 padding), 3,343 bytes on the real preview, about 209 ms of audio. The padding is what makes the cut safe to decode; the client must trim to the exact duration, and a determined player can hear ~0.2 s instead of 0.1 s on the first turn. Accepted.
 - A preview is 29.988 s, so on the last ladder step the client must clamp playback to the decoded buffer's length rather than assume 30 s.
 - Matching drops every `(…)` and `[…]` segment, so "(Remix)" and "(Instrumental)" variants count as the same song as the original, and titles differing only in a bracketed part ("Da Doo Ron Ron (When He Walked Me Home)") lose it. Checked offline against the 2,710 distinct tracks cached during playlist research: 37 key collisions, all the same song in another release, no false merges.
@@ -295,4 +389,4 @@ pub fn normalize_artist(artist: &str) -> String;
 
 ## Later
 
-Out of MVP scope: random and genre modes, stats and streaks, a share-result grid, a Nix package and the production vhost (server serving `web/dist`, nginx pointing everything at 4810).
+Not planned yet: protecting `/admin` and `/api/admin/*` (required before any public deployment), a script or agent that fills the song database through the admin API (possibly from Deezer playlists), choosing a specific song for a section, an overall streak across sections, a random (non-daily) mode, a share-result grid, a Nix package and a production deployment (server serving `web/dist`, a reverse proxy pointing everything at 4810).
