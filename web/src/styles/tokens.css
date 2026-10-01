@@ -1,45 +1,29 @@
-/* Every colour, size and space the page uses. Restyle here first.
- *
- * The page is printed like a record sleeve: two inks (field and accent) on a
- * pale paper, plus the black of the vinyl. There are no greys and no
- * opacity-dimmed text; hierarchy comes from size, weight and width.
- */
-
 :root {
-  /* The sleeve is the same in light and dark mode. */
-  color-scheme: only light;
-
-  /* Thursday's sleeve, also the fallback before a weekday is known. */
-  --field: #2340e0;
-  --accent: #ff6a1f;
-  --paper: #eef0ff;
-  --ink: #0b1560;
-
-  --vinyl: #050505;
-  /* Clip lengths printed on bands that are still locked. */
-  --vinyl-text: #9a9a9a;
-
-  --font: 'Bricolage Grotesque Variable', system-ui, -apple-system, 'Segoe UI', sans-serif;
-  /* The family's width axis runs from 75 (condensed) to 100. */
+  color-scheme: dark;
+  --field: #000000;
+  --surface: #151515;
+  --accent: #d8b983;
+  --paper: #f3efe7;
+  --ink: #15120d;
+  --muted: #96999e;
+  --border: #303030;
+  --control-border: #666666;
+  --vinyl: #101112;
+  --vinyl-text: #96999e;
+  --font: 'Bricolage Grotesque Variable', system-ui, sans-serif;
   --width-condensed: 75;
   --width-normal: 100;
   --weight-regular: 400;
   --weight-medium: 600;
   --weight-heavy: 800;
-
-  /* Type scale: 14 / 17 / 21 / 28, then the two display sizes. */
-  --text-small: 0.875rem;
-  --text-body: 1.0625rem;
-  --text-large: 1.3125rem;
+  --text-small: 0.8125rem;
+  --text-body: 1rem;
+  --text-large: 1.25rem;
   --text-title: 1.75rem;
-  /* The day number in the header. */
-  --text-number: clamp(2.75rem, 1.75rem + 4.4vw, 5.5rem);
-  /* The song title once the game is over. */
-  --text-display: clamp(3.25rem, 1rem + 12vw, 7rem);
-
-  --leading-body: 1.4;
-  --leading-display: 0.88;
-
+  --text-number: 1rem;
+  --text-display: clamp(3rem, 5vw, 5rem);
+  --leading-body: 1.5;
+  --leading-display: 0.96;
   --space-1: 0.25rem;
   --space-2: 0.5rem;
   --space-3: 0.75rem;
@@ -47,114 +31,40 @@
   --space-5: 1.5rem;
   --space-6: 2rem;
   --space-7: 3rem;
-
-  /* 44 px is the smallest comfortable touch target; the main controls are taller. */
   --target: 2.75rem;
-  --control: 3.25rem;
+  --control: 3.5rem;
   --play-disc: 3.5rem;
-
-  --line: 2px;
-  /* Paper surfaces lift off the sleeve with a hard, offset shadow, like a misregistered print. */
-  --lift: 0.375rem 0.375rem 0 var(--ink);
-
-  /* The height of the screen with the browser's bars showing; the app never uses plain 100vh. */
+  --line: 1px;
+  --lift: 0 12px 36px #000;
   --screen: 100vh;
-
-  --column-width: 34rem;
-  --gutter: max(var(--space-4), env(safe-area-inset-left), env(safe-area-inset-right));
-
-  /* The record. `--record-r` is its radius; the canvas is a square 2.24 radii
-   * wide so the tonearm fits beside the disc. Stacked layout (phones, portrait):
-   * the record hangs from under the header, cropped at the top. */
-  --record-r: min(52vw, 19rem, var(--screen) * 0.28);
-  --record-x: 50vw;
-  --record-y: calc(var(--record-r) * 0.33);
-  /* 0: tonearm pivot above the record's right shoulder. 1: turned a quarter, below it. */
-  --record-arm: 1;
-  /* Degrees clockwise from 3 o'clock: where the clip lengths are printed on the bands. */
-  --record-scale-angle: 124;
-
+  --column-width: 29rem;
+  --gutter: max(1.25rem, env(safe-area-inset-left), env(safe-area-inset-right));
+  --record-r: min(39vw, 18rem, var(--screen) * 0.19);
+  --record-x: 50%;
+  --record-y: calc(var(--record-r) * 1.16);
+  --record-arm: 0;
+  --record-scale-angle: 140;
   --ease-out: cubic-bezier(0.2, 0.7, 0.2, 1);
-  --reveal-step: 140ms;
+  --reveal-step: 65ms;
+  --scroll-thumb: #55575a;
+  --scroll-track: #151515;
+  --scroll-hover: #96999e;
+  --scroll-active: #d8b983;
 }
-
 @supports (height: 100svh) {
   :root {
     --screen: 100svh;
   }
 }
-
-/* Side layout (landscape with room for two columns): the record fills the
- * left of the window, cropped by its left, top and bottom edges. */
-@media (min-width: 40rem) and (min-aspect-ratio: 6/5) {
+@media (max-width: 39.99rem) and (max-height: 650px) {
   :root {
-    --record-r: min(var(--screen) * 0.56, 36vw);
-    --record-x: calc(var(--record-r) * 0.5);
-    --record-y: calc(var(--screen) * 0.54);
-    --record-arm: 0;
-    --record-scale-angle: 52;
-    --gutter: max(var(--space-6), env(safe-area-inset-right));
+    --record-r: min(36vw, var(--screen) * 0.14);
   }
 }
-
-/* One sleeve per UTC weekday, numbered like Date.getUTCDay(): 0 is Sunday.
- * Each is a saturated field, a vivid accent, a pale paper and a deep ink of
- * the field's hue. Contrast, checked numerically for every sleeve:
- * paper on field, ink on paper and ink on accent at least 4.5:1; accent and
- * paper on vinyl at least 3:1. Accent on field is not guaranteed, so the
- * accent never carries meaning on the field without ink text or a paper edge. */
-:root[data-sleeve='0'] {
-  /* Sunday: petrol and coral. */
-  --field: #00677f;
-  --accent: #ff7a66;
-  --paper: #e8fbff;
-  --ink: #00303c;
-}
-
-:root[data-sleeve='1'] {
-  /* Monday: signal red and sky. */
-  --field: #cc121c;
-  --accent: #a9e2ff;
-  --paper: #fff0ee;
-  --ink: #4a0408;
-}
-
-:root[data-sleeve='2'] {
-  /* Tuesday: violet and lemon. */
-  --field: #6420d4;
-  --accent: #ffe03a;
-  --paper: #f3edff;
-  --ink: #24085a;
-}
-
-:root[data-sleeve='3'] {
-  /* Wednesday: leaf green and pink. */
-  --field: #1b7a2b;
-  --accent: #ffb3cf;
-  --paper: #effbea;
-  --ink: #06330f;
-}
-
-:root[data-sleeve='4'] {
-  /* Thursday: cobalt and tangerine. */
-  --field: #2340e0;
-  --accent: #ff6a1f;
-  --paper: #eef0ff;
-  --ink: #0b1560;
-}
-
-:root[data-sleeve='5'] {
-  /* Friday: magenta and lime. */
-  --field: #c4166e;
-  --accent: #c6f53c;
-  --paper: #fff0f7;
-  --ink: #4a0428;
-}
-
-:root[data-sleeve='6'] {
-  /* Saturday: burnt orange and mint. */
-  --field: #bb410a;
-  --accent: #9ff5d0;
-  --paper: #fff3ea;
-  --ink: #461600;
+@media (min-width: 40rem) and (min-aspect-ratio: 6/5) {
+  :root {
+    --record-r: min(23vw, var(--screen) * 0.32, 21rem);
+    --record-y: calc(var(--record-r) * 1.2);
+    --gutter: max(2.5rem, env(safe-area-inset-right));
+  }
 }

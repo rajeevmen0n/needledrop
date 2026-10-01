@@ -1,6 +1,6 @@
 <script lang="ts">
-  // The record: a canvas that shows the game. Seven groove bands are the seven
-  // clip lengths, lit when unlocked; while a clip plays the record turns, the
+  // The record: fine champagne groove details follow the unlocked clip.
+  // While a clip plays the record turns, the
   // needle crosses the lit bands on the audio clock and the grooves ripple
   // with the signal; when the game ends the cover prints onto the label.
   //
@@ -11,7 +11,7 @@
   import { RecordPainter } from '../record'
   import type { Palette, RecordView } from '../record'
 
-  let { game, sleeve }: { game: Game; sleeve: number } = $props()
+  let { game }: { game: Game } = $props()
 
   const TURN = Math.PI * 2
   /** 33⅓ turns a minute, in radians a second. */
@@ -22,7 +22,7 @@
   /** The reveal keeps the record turning for at least this long, and gives the cover this long to arrive. */
   const REVEAL_MIN = 1.2
   const REVEAL_MAX = 6
-  /** Phones have the pixels but not the fill rate: never draw more than this. */
+  /** Cap pixel density and backing-store size to keep animation economical. */
   const MAX_SCALE = 2
   const MAX_PIXELS = 1800
 
@@ -33,7 +33,12 @@
   let rotation = 0
   let speed = 0
   /** A spin-down that ends with the label upright: where and how fast it began, and how long it takes. */
-  let coast: { from: number; speed: number; time: number; length: number } | null = null
+  let coast: {
+    from: number
+    speed: number
+    time: number
+    length: number
+  } | null = null
   let needle = 0
   let lit: number[] = []
   let targets: number[] = []
@@ -57,7 +62,12 @@
   const samples = new Float32Array(2048)
 
   const figure = (seconds: number) => String(Math.round(seconds * 10) / 10)
-  const dayFormat = new Intl.DateTimeFormat('en-GB', { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' })
+  const dayFormat = new Intl.DateTimeFormat('en-GB', {
+    day: 'numeric',
+    month: 'short',
+    year: 'numeric',
+    timeZone: 'UTC',
+  })
   /** "1 Oct 2026" for the game's day; empty for anything that is not a date. */
   function dayStamp(day: string | undefined): string {
     const time = day ? Date.parse(`${day}T00:00:00Z`) : NaN
@@ -80,7 +90,11 @@
     painter.setPalette(palette)
 
     const size = node.clientWidth
-    const scale = Math.min(window.devicePixelRatio || 1, MAX_SCALE, MAX_PIXELS / Math.max(size, 1))
+    const scale = Math.min(
+      window.devicePixelRatio || 1,
+      MAX_SCALE,
+      MAX_PIXELS / Math.max(size, 1),
+    )
     painter.configure({
       size,
       scale,
@@ -110,7 +124,8 @@
     if (reveal !== null) {
       reveal += dt
       const waiting = cover !== null && !coverReady && reveal < REVEAL_MAX
-      if (reveal >= REVEAL_MIN && !waiting && (printed >= 1 || !coverReady)) reveal = null
+      if (reveal >= REVEAL_MIN && !waiting && (printed >= 1 || !coverReady))
+        reveal = null
     }
     const turning = playing || reveal !== null
     if (turning) {
@@ -123,7 +138,12 @@
       if (!coast) {
         let distance = TURN - rotation
         while (distance < speed * 0.35) distance += TURN
-        coast = { from: rotation, speed, time: 0, length: (2 * distance) / speed }
+        coast = {
+          from: rotation,
+          speed,
+          time: 0,
+          length: (2 * distance) / speed,
+        }
       }
       coast.time += dt
       if (coast.time >= coast.length) {
@@ -132,7 +152,8 @@
         coast = null
       } else {
         const t = coast.time
-        rotation = (coast.from + coast.speed * t * (1 - t / (2 * coast.length))) % TURN
+        rotation =
+          (coast.from + coast.speed * t * (1 - t / (2 * coast.length))) % TURN
         speed = coast.speed * (1 - t / coast.length)
         moving = true
       }
@@ -161,7 +182,10 @@
         continue
       }
       const change = dt / LIGHT
-      lit[i] = targets[i] > lit[i] ? Math.min(targets[i], lit[i] + change) : Math.max(targets[i], lit[i] - change)
+      lit[i] =
+        targets[i] > lit[i]
+          ? Math.min(targets[i], lit[i] + change)
+          : Math.max(targets[i], lit[i] - change)
     }
 
     if (coverReady && printed < 1) {
@@ -207,7 +231,8 @@
 
   /** Asks for a frame. Frames then keep coming only while something moves. */
   function wake(): void {
-    if (frame === 0 && painter && !document.hidden) frame = requestAnimationFrame(tick)
+    if (frame === 0 && painter && !document.hidden)
+      frame = requestAnimationFrame(tick)
   }
 
   function restyle(): void {
@@ -248,10 +273,14 @@
     document.addEventListener('visibilitychange', onvisible)
 
     // Text drawn before the font arrived used a fallback: draw it again.
-    void document.fonts.load(`800 condensed 16px ${getComputedStyle(canvas).getPropertyValue('--font')}`).then(() => {
-      painter?.invalidate()
-      wake()
-    })
+    void document.fonts
+      .load(
+        `800 condensed 16px ${getComputedStyle(canvas).getPropertyValue('--font')}`,
+      )
+      .then(() => {
+        painter?.invalidate()
+        wake()
+      })
 
     wake()
     return () => {
@@ -262,12 +291,6 @@
       frame = 0
       painter = undefined
     }
-  })
-
-  // The colours belong to the sleeve; read them again when it changes.
-  $effect(() => {
-    void sleeve
-    restyle()
   })
 
   // Which bands are lit follows the unlocked clip length.
@@ -287,7 +310,9 @@
     } else {
       // Bands light one after another, outermost first.
       let order = 0
-      delays = targets.map((target, i) => (target !== lit[i] ? order++ * STAGGER : 0))
+      delays = targets.map((target, i) =>
+        target !== lit[i] ? order++ * STAGGER : 0,
+      )
     }
     if (finished && !wasFinished && shown) reveal = 0
     wasFinished = finished

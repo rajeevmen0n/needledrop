@@ -15,7 +15,7 @@
 
   let { onguess, busy = false }: Props = $props()
 
-  const DEBOUNCE_MS = 200
+  const DEBOUNCE_MS = 300
   const MIN_CHARS = 2
   /** The list opens under the field when it has at least this much room there, in pixels. */
   const ROOM_BELOW = 232
@@ -46,18 +46,22 @@
 
   let timer: ReturnType<typeof setTimeout> | undefined
   let request: AbortController | undefined
+  let composing = false
 
   const expanded = $derived(open && results.length > 0)
   const hint = $derived.by(() => {
     if (phase === 'searching') return 'Searching…'
-    if (phase === 'failed') return "Couldn't search. Check your connection and keep typing."
+    if (phase === 'failed')
+      return "Couldn't search. Check your connection and keep typing."
     if (phase === 'done' && results.length === 0) return 'No songs found'
     return ''
   })
   // Sighted players see the list grow; screen readers get the count instead.
   const spoken = $derived.by(() => {
     if (phase === 'done' && results.length > 0) {
-      return results.length === 1 ? '1 song found' : `${results.length} songs found`
+      return results.length === 1
+        ? '1 song found'
+        : `${results.length} songs found`
     }
     return hint
   })
@@ -94,6 +98,11 @@
     // Rows for the previous text go at once, so an old list is never shown under new text.
     results = []
     active = -1
+    if (composing) {
+      phase = 'idle'
+      open = false
+      return
+    }
     const query = text.trim()
     if (query.length < MIN_CHARS) {
       phase = 'idle'
@@ -140,11 +149,14 @@
     active = -1
     phase = 'idle'
     open = false
+    input?.focus()
   }
 
   function highlight(index: number) {
     active = index
-    document.getElementById(optionId(index))?.scrollIntoView({ block: 'nearest' })
+    document
+      .getElementById(optionId(index))
+      ?.scrollIntoView({ block: 'nearest' })
   }
 
   function onkeydown(event: KeyboardEvent) {
@@ -189,7 +201,7 @@
 
   async function onsubmit(event: SubmitEvent) {
     event.preventDefault()
-    if (!picked || busy) return
+    if (!picked || busy || composing) return
     const accepted = await onguess(picked)
     // On a failed request the pick stays, so one more press retries it.
     if (accepted) clear()
@@ -217,8 +229,8 @@
   })
 </script>
 
-<form class="guess" {onsubmit}>
-  <label class="sr-only" for="{uid}-input">Your guess</label>
+<form class="guess" {onsubmit} novalidate aria-busy={busy}>
+  <label for="{uid}-input">What's the song?</label>
   <div class="row">
     <div class="field">
       <input
@@ -230,7 +242,9 @@
         aria-autocomplete="list"
         aria-expanded={expanded}
         aria-controls={listId}
-        aria-activedescendant={expanded && active >= 0 ? optionId(active) : undefined}
+        aria-activedescendant={expanded && active >= 0
+          ? optionId(active)
+          : undefined}
         aria-describedby={helpId}
         placeholder="Search for a song"
         autocomplete="off"
@@ -240,9 +254,27 @@
         enterkeyhint="search"
         {oninput}
         {onkeydown}
+        disabled={busy}
+        oncompositionstart={() => {
+          composing = true
+          cancelSearch()
+        }}
+        oncompositionend={() => {
+          composing = false
+          oninput()
+        }}
         onfocus={() => (open = phase !== 'idle')}
         onblur={() => (open = false)}
       />
+      {#if text}
+        <button
+          class="clear"
+          type="button"
+          aria-label="Clear search"
+          disabled={busy}
+          onclick={clear}>×</button
+        >
+      {/if}
       <!-- preventDefault on mousedown keeps the focus in the field, so a tap on a row does not close the list first. -->
       <div
         class="popup"
@@ -269,7 +301,13 @@
               onpointermove={() => (active = i)}
             >
               {#if track.cover}
-                <img src={track.cover} alt="" width="40" height="40" loading="lazy" />
+                <img
+                  src={track.cover}
+                  alt=""
+                  width="40"
+                  height="40"
+                  loading="lazy"
+                />
               {:else}
                 <span class="no-cover"></span>
               {/if}
@@ -285,10 +323,14 @@
         {/if}
       </div>
     </div>
-    <button class="button solid" type="submit" disabled={!picked || busy}>Guess</button>
+    <button class="button solid" type="submit" disabled={!picked || busy}
+      >Guess</button
+    >
   </div>
   <p class="help" id={helpId}>
-    {picked ? 'Press Guess to send it.' : 'Type a title or artist, then pick a song from the list.'}
+    {picked
+      ? 'Press Guess to send it.'
+      : 'Type a title or artist, then pick a song from the list.'}
   </p>
   <p class="sr-only" role="status">{spoken}</p>
 </form>
@@ -296,119 +338,133 @@
 <style>
   .guess {
     display: grid;
-    gap: var(--space-2);
+    gap: 0.5rem;
   }
-
+  label {
+    font-size: 0.8125rem;
+    font-weight: 600;
+  }
   .row {
     display: flex;
+    gap: 0.5rem;
   }
-
   .field {
     position: relative;
     flex: 1;
     min-width: 0;
   }
-
-  /* A slip of paper stuck on the sleeve: the one place the player writes. */
   input {
     display: block;
     width: 100%;
     height: var(--control);
-    padding: 0 var(--space-4);
-    border: var(--line) solid var(--paper);
-    border-radius: 0;
-    background: var(--paper);
-    color: var(--ink);
-    /* 16 px or more, or iOS zooms the page when the field takes focus. */
-    font-size: max(var(--text-body), 16px);
-    font-weight: var(--weight-medium);
+    padding: 0 2.75rem 0 1rem;
+    border: 1px solid var(--control-border);
+    border-radius: 6px;
+    background: var(--surface);
+    color: var(--paper);
+    font-size: 16px;
     appearance: none;
   }
-
   input::placeholder {
-    color: var(--ink);
-    font-weight: var(--weight-regular);
+    color: var(--muted);
     opacity: 1;
   }
-
-  /* The ring goes inside the field: outside, the list and the button are in its way. */
   input:focus-visible {
-    outline: 3px solid var(--ink);
-    outline-offset: -5px;
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
     box-shadow: none;
   }
-
+  .clear {
+    position: absolute;
+    right: 2px;
+    top: 6px;
+    width: 44px;
+    height: 44px;
+    font-size: 1.5rem;
+    color: var(--muted);
+    border-radius: 4px;
+  }
+  .clear:hover {
+    color: var(--paper);
+    background: #252525;
+  }
   .button {
     flex: none;
+    padding: 0 1.25rem;
+    min-width: 5.2rem;
   }
-
   .popup {
     position: absolute;
-    z-index: 2;
-    inset: calc(100% + var(--space-2)) 0 auto 0;
+    z-index: 5;
+    inset: calc(100% + 0.5rem) 0 auto 0;
     overflow-y: auto;
     overscroll-behavior: contain;
-    background: var(--paper);
-    color: var(--ink);
+    background: var(--surface);
+    color: var(--paper);
     box-shadow: var(--lift);
+    border: 1px solid var(--border);
+    border-radius: 6px;
   }
-
   .popup.above {
-    inset: auto 0 calc(100% + var(--space-2)) 0;
+    inset: auto 0 calc(100% + 0.5rem) 0;
   }
-
   li {
     display: flex;
     align-items: center;
-    gap: var(--space-3);
+    gap: 0.75rem;
     min-height: var(--control);
-    padding: var(--space-2) var(--space-3) var(--space-2) 0;
-    /* A bar on the left marks the highlighted row, so it does not depend on colour alone. */
-    border-left: var(--space-2) solid transparent;
+    padding: 0.65rem 0.75rem 0.65rem 0.5rem;
+    border-left: 3px solid transparent;
     cursor: pointer;
     touch-action: manipulation;
     -webkit-tap-highlight-color: transparent;
     user-select: none;
-    -webkit-user-select: none;
   }
-
   li.active {
-    border-left-color: var(--ink);
-    background: var(--accent);
+    border-left-color: var(--accent);
+    background: #2a2721;
   }
-
   img,
   .no-cover {
     flex: none;
     width: 2.5rem;
     height: 2.5rem;
-    background: var(--ink);
+    background: var(--border);
+    border-radius: 2px;
   }
-
   .names {
     display: grid;
     min-width: 0;
-    line-height: 1.25;
+    line-height: 1.3;
   }
-
   .title,
   .artist {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-
   .title {
-    font-weight: var(--weight-medium);
+    font-weight: 600;
+    font-size: 0.875rem;
   }
-
   .artist,
   .hint,
   .help {
     font-size: var(--text-small);
+    color: var(--muted);
   }
-
   .hint {
-    padding: var(--space-4);
+    padding: 1rem;
+  }
+  .help {
+    min-height: 1.5em;
+  }
+  @media (max-width: 360px) {
+    .help {
+      font-size: 0.6875rem;
+    }
+    .button {
+      padding: 0 0.85rem;
+    }
   }
 </style>

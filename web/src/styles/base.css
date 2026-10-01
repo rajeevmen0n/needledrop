@@ -22,7 +22,7 @@ body {
   font-stretch: calc(var(--width-normal) * 1%);
   font-optical-sizing: auto;
   line-height: var(--leading-body);
-  /* The record is wider than a phone; only it may be cropped. */
+  /* Keep decorative canvas edges from introducing horizontal document scroll. */
   overflow-x: clip;
   -webkit-font-smoothing: antialiased;
 }
@@ -87,14 +87,42 @@ button:disabled {
   cursor: not-allowed;
 }
 
-/* A rectangular button. `solid` is the one to press next; `outline` is the quiet one. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--scroll-thumb) var(--scroll-track);
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-track {
+  background: var(--scroll-track);
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--scroll-thumb);
+  border-radius: 4px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--scroll-hover);
+}
+*::-webkit-scrollbar-thumb:active {
+  background: var(--scroll-active);
+}
+@media (forced-colors: active) {
+  * {
+    scrollbar-color: auto;
+  }
+}
+
+/* Shared button emphasis: champagne primary, quiet outlined secondary. */
 .button {
   display: inline-flex;
   align-items: center;
   justify-content: center;
   min-height: var(--control);
   padding: 0 var(--space-5);
-  border: var(--line) solid var(--paper);
+  border: var(--line) solid var(--border);
+  border-radius: 6px;
   font-weight: var(--weight-medium);
   white-space: nowrap;
 }
@@ -107,7 +135,9 @@ button:disabled {
 
 .button:disabled {
   /* Dashed as well as hollow, so "not yet" is not carried by colour alone. */
-  border-style: dashed;
+  border-style: solid;
+  background: var(--surface);
+  color: var(--muted);
 }
 
 @media (hover: hover) {
@@ -126,7 +156,7 @@ button:disabled {
   transform: translateY(1px);
 }
 
-/* Paper on the field, with ink filling the gap: visible on the field, on paper and on vinyl, on every sleeve. */
+/* Ivory focus with a dark gap stays visible on every interactive surface. */
 :focus-visible {
   outline: 3px solid var(--paper);
   outline-offset: 3px;

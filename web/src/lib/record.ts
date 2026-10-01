@@ -90,7 +90,11 @@ function random(seed: number): () => number {
   }
 }
 
-function ring(ctx: CanvasRenderingContext2D, outer: number, inner: number): void {
+function ring(
+  ctx: CanvasRenderingContext2D,
+  outer: number,
+  inner: number,
+): void {
   ctx.beginPath()
   ctx.arc(0, 0, outer, 0, TAU)
   ctx.arc(0, 0, inner, 0, TAU, true)
@@ -101,7 +105,12 @@ export class RecordPainter {
   private readonly canvas: HTMLCanvasElement
   private readonly ctx: CanvasRenderingContext2D
   private palette: Palette | null = null
-  private geometry: RecordGeometry = { size: 0, scale: 1, turned: false, scaleAngle: 0 }
+  private geometry: RecordGeometry = {
+    size: 0,
+    scale: 1,
+    turned: false,
+    scaleAngle: 0,
+  }
 
   // Layers that only change with the size or the colours.
   private base: HTMLCanvasElement | null = null
@@ -120,7 +129,8 @@ export class RecordPainter {
   configure(geometry: RecordGeometry): void {
     const previous = this.geometry
     this.geometry = geometry
-    if (previous.size === geometry.size && previous.scale === geometry.scale) return
+    if (previous.size === geometry.size && previous.scale === geometry.scale)
+      return
     const pixels = Math.max(1, Math.round(geometry.size * geometry.scale))
     this.canvas.width = pixels
     this.canvas.height = pixels
@@ -153,7 +163,6 @@ export class RecordPainter {
     // From here on the spindle is the origin.
     ctx.translate(centre, centre)
     this.paintBands(view, palette, radius)
-    this.paintScale(view, palette, radius)
 
     // The light stays put while the record turns; a slight rock stands in for the warp of a real disc.
     ctx.save()
@@ -179,7 +188,8 @@ export class RecordPainter {
 
   /** True where grooves are cut: inside a band, not in the smooth gaps between them. */
   private grooved(fraction: number, count: number): boolean {
-    if (fraction > BANDS_OUTER || fraction < BANDS_INNER + BAND_GAP) return false
+    if (fraction > BANDS_OUTER || fraction < BANDS_INNER + BAND_GAP)
+      return false
     const width = (BANDS_OUTER - BANDS_INNER) / count
     return (BANDS_OUTER - fraction) % width < width - BAND_GAP
   }
@@ -216,7 +226,7 @@ export class RecordPainter {
     }
 
     // The rim catches the light; the run-out next to the label has one scribed ring.
-    ctx.globalAlpha = 0.22
+    ctx.globalAlpha = 0.45
     ctx.lineWidth = 1.2
     ctx.beginPath()
     ctx.arc(0, 0, radius - 0.8, 0, TAU)
@@ -249,13 +259,23 @@ export class RecordPainter {
       [0.14, 0],
     ]
     const mirrored = (centre: number, alpha: number): [number, number][] => [
-      ...lobe(alpha).map(([at, a]): [number, number] => [centre - at, a]).reverse(),
-      ...lobe(alpha).map(([at, a]): [number, number] => [centre + at, a]).slice(1),
+      ...lobe(alpha)
+        .map(([at, a]): [number, number] => [centre - at, a])
+        .reverse(),
+      ...lobe(alpha)
+        .map(([at, a]): [number, number] => [centre + at, a])
+        .slice(1),
     ]
     // The brighter wedge points up and to the right, or to the left when turned; the other is opposite.
     const start = this.geometry.turned ? 2.76 : -0.66
     const light = ctx.createConicGradient(start, 0, 0)
-    for (const [at, alpha] of [...lobe(0.62), ...mirrored(0.5, 0.42), ...lobe(0.62).map(([at, a]): [number, number] => [1 - at, a]).reverse()]) {
+    for (const [at, alpha] of [
+      ...lobe(0.62),
+      ...mirrored(0.5, 0.42),
+      ...lobe(0.62)
+        .map(([at, a]): [number, number] => [1 - at, a])
+        .reverse(),
+    ]) {
       light.addColorStop(at, `rgb(255 255 255 / ${alpha})`)
     }
     ctx.fillStyle = light
@@ -279,8 +299,15 @@ export class RecordPainter {
     // Between the wedges the surface faces away from the light: a quarter turn on, it darkens a little.
     ctx.globalCompositeOperation = 'source-over'
     ctx.globalAlpha = 1
+
     const shade = ctx.createConicGradient(start + Math.PI / 2, 0, 0)
-    for (const [at, alpha] of [...lobe(0.3), ...mirrored(0.5, 0.3), ...lobe(0.3).map(([at, a]): [number, number] => [1 - at, a]).reverse()]) {
+    for (const [at, alpha] of [
+      ...lobe(0.3),
+      ...mirrored(0.5, 0.3),
+      ...lobe(0.3)
+        .map(([at, a]): [number, number] => [1 - at, a])
+        .reverse(),
+    ]) {
       shade.addColorStop(at, `rgb(0 0 0 / ${alpha})`)
     }
     ctx.fillStyle = shade
@@ -315,6 +342,17 @@ export class RecordPainter {
     ctx.stroke()
     ctx.globalAlpha = 1
 
+    ctx.fillStyle = palette.ink
+    ctx.textAlign = 'center'
+    ctx.textBaseline = 'middle'
+    ctx.font = `800 ${radius * 0.21}px ${palette.font}`
+    ctx.fillText('Needledrop', 0, -radius * 0.35, radius * 1.7)
+    ctx.font = `400 ${radius * 0.105}px ${palette.font}`
+    ctx.fillText('THE DAILY PRESSING', 0, -radius * 0.12, radius * 1.65)
+    ctx.font = `600 ${radius * 0.11}px ${palette.font}`
+    ctx.fillText('SIDE A', -radius * 0.49, radius * 0.22)
+    ctx.fillText('33⅓', radius * 0.49, radius * 0.22)
+
     if (stamp) {
       ctx.fillStyle = palette.ink
       ctx.textAlign = 'center'
@@ -341,7 +379,7 @@ export class RecordPainter {
       const outer = outerEdge * radius
       const inner = innerEdge * radius
 
-      ctx.globalAlpha = lit
+      ctx.globalAlpha = lit * 0.025
       ctx.fillStyle = palette.accent
       ring(ctx, outer, inner)
       ctx.fill()
@@ -349,9 +387,9 @@ export class RecordPainter {
       // The grooves of a lit band, in ink.
       const lines = Math.max(3, Math.min(8, Math.round((outer - inner) / 3.6)))
       const spacing = (outer - inner) / lines
-      ctx.strokeStyle = palette.ink
-      ctx.lineWidth = Math.max(0.8, spacing * 0.22)
-      ctx.globalAlpha = lit * 0.42
+      ctx.strokeStyle = palette.accent
+      ctx.lineWidth = 0.55
+      ctx.globalAlpha = lit * (view.wave ? 0.25 : 0.065)
       ctx.beginPath()
       for (let j = 0; j < lines; j++) {
         const r = inner + (j + 0.5) * spacing
@@ -367,7 +405,11 @@ export class RecordPainter {
         for (let k = 0; k <= points; k++) {
           const turn = k / points
           const sample = wave[(offset + k * 2) % wave.length]
-          const push = Math.max(-1, Math.min(1, sample * 2.4)) * Math.sin(Math.PI * turn) * spacing * 0.55
+          const push =
+            Math.max(-1, Math.min(1, sample * 2.4)) *
+            Math.sin(Math.PI * turn) *
+            spacing *
+            0.55
           const angle = seam + turn * TAU
           const x = Math.cos(angle) * (r + push)
           const y = Math.sin(angle) * (r + push)
@@ -378,37 +420,6 @@ export class RecordPainter {
       ctx.stroke()
     }
     ctx.globalAlpha = 1
-  }
-
-  // The clip length of each band, printed along one radius. These do not turn with the record.
-  private paintScale(view: RecordView, palette: Palette, radius: number): void {
-    const { ctx } = this
-    const count = view.labels.length
-    if (count === 0) return
-    const width = ((BANDS_OUTER - BANDS_INNER) / count - BAND_GAP) * radius
-    const size = Math.max(9, Math.min(17, width * 0.6))
-    const cos = Math.cos(this.geometry.scaleAngle)
-    const sin = Math.sin(this.geometry.scaleAngle)
-
-    ctx.font = `600 ${size}px ${palette.font}`
-    ctx.textAlign = 'center'
-    ctx.textBaseline = 'middle'
-    for (let i = 0; i < count; i++) {
-      const [outer, inner] = bandEdges(i, count)
-      const r = ((outer + inner) / 2) * radius
-      const x = cos * r
-      const y = sin * r
-      const lit = view.lit[i] ?? 0
-      const text = view.labels[i]
-      const half = ctx.measureText(text).width / 2 + size * 0.35
-      // A plain patch under the figure keeps the groove lines out of it.
-      ctx.fillStyle = lit >= 0.5 ? palette.accent : palette.vinyl
-      ctx.beginPath()
-      ctx.ellipse(x, y, half, Math.min(width * 0.5, size * 0.78), 0, 0, TAU)
-      ctx.fill()
-      ctx.fillStyle = lit >= 0.5 ? palette.ink : palette.vinylText
-      ctx.fillText(text, x, y + size * 0.04)
-    }
   }
 
   private paintLabel(view: RecordView, palette: Palette, radius: number): void {
@@ -497,9 +508,14 @@ export class RecordPainter {
     const { scale } = this.geometry
 
     // The stylus sits on the groove at this radius; the arm swings about its pivot to reach it.
-    const r = BANDS_OUTER - Math.max(0, Math.min(1, needle)) * (BANDS_OUTER - BANDS_INNER)
+    const r =
+      BANDS_OUTER -
+      Math.max(0, Math.min(1, needle)) * (BANDS_OUTER - BANDS_INNER)
     const reach = Math.hypot(PIVOT.x, PIVOT.y)
-    const swing = Math.acos((reach * reach + ARM_LENGTH * ARM_LENGTH - r * r) / (2 * reach * ARM_LENGTH))
+    const swing = Math.acos(
+      (reach * reach + ARM_LENGTH * ARM_LENGTH - r * r) /
+        (2 * reach * ARM_LENGTH),
+    )
     const heading = Math.atan2(-PIVOT.y, -PIVOT.x) - swing
     const at = (point: Point): Point => {
       const turned = this.turn(point)
@@ -513,9 +529,13 @@ export class RecordPainter {
 
     // Unit vectors: along the arm, and sideways away from the spindle.
     const length = Math.hypot(stylus.x - pivot.x, stylus.y - pivot.y)
-    const along = { x: (stylus.x - pivot.x) / length, y: (stylus.y - pivot.y) / length }
+    const along = {
+      x: (stylus.x - pivot.x) / length,
+      y: (stylus.y - pivot.y) / length,
+    }
     let side = { x: -along.y, y: along.x }
-    if (side.x * stylus.x + side.y * stylus.y < 0) side = { x: -side.x, y: -side.y }
+    if (side.x * stylus.x + side.y * stylus.y < 0)
+      side = { x: -side.x, y: -side.y }
 
     // The tube runs outside the straight line and the headshell angles back in, as on a real arm.
     const elbow = {
@@ -523,13 +543,25 @@ export class RecordPainter {
       y: pivot.y + along.y * length * 0.8 + side.y * radius * 0.055,
     }
     const tubeLength = Math.hypot(elbow.x - pivot.x, elbow.y - pivot.y)
-    const tube = { x: (elbow.x - pivot.x) / tubeLength, y: (elbow.y - pivot.y) / tubeLength }
+    const tube = {
+      x: (elbow.x - pivot.x) / tubeLength,
+      y: (elbow.y - pivot.y) / tubeLength,
+    }
     const shellLength = Math.hypot(stylus.x - elbow.x, stylus.y - elbow.y)
-    const shell = { x: (stylus.x - elbow.x) / shellLength, y: (stylus.y - elbow.y) / shellLength }
+    const shell = {
+      x: (stylus.x - elbow.x) / shellLength,
+      y: (stylus.y - elbow.y) / shellLength,
+    }
     const lift = { x: -shell.y, y: shell.x }
     const liftSign = lift.x * side.x + lift.y * side.y < 0 ? -1 : 1
 
-    const line = (from: Point, to: Point, width: number, colour: string, cap: CanvasLineCap = 'round') => {
+    const line = (
+      from: Point,
+      to: Point,
+      width: number,
+      colour: string,
+      cap: CanvasLineCap = 'round',
+    ) => {
       ctx.strokeStyle = colour
       ctx.lineWidth = width * radius
       ctx.lineCap = cap
@@ -538,7 +570,11 @@ export class RecordPainter {
       ctx.lineTo(to.x, to.y)
       ctx.stroke()
     }
-    const along2 = (origin: Point, direction: Point, distance: number): Point => ({
+    const along2 = (
+      origin: Point,
+      direction: Point,
+      distance: number,
+    ): Point => ({
       x: origin.x + direction.x * distance * radius,
       y: origin.y + direction.y * distance * radius,
     })
@@ -551,13 +587,31 @@ export class RecordPainter {
 
     const body = (paper: string, ink: string) => {
       // Counterweight behind the pivot.
-      line(along2(pivot, tube, -0.075), along2(pivot, tube, -0.2), 0.092, paper, 'butt')
+      line(
+        along2(pivot, tube, -0.075),
+        along2(pivot, tube, -0.2),
+        0.092,
+        paper,
+        'butt',
+      )
       line(pivot, elbow, 0.026, paper)
       // Headshell, finger lift, cartridge.
-      line(along2(elbow, shell, -0.012), along2(stylus, shell, 0.03), 0.064, paper, 'butt')
+      line(
+        along2(elbow, shell, -0.012),
+        along2(stylus, shell, 0.03),
+        0.064,
+        paper,
+        'butt',
+      )
       const grip = along2(stylus, shell, -0.115)
       line(grip, along2(grip, lift, 0.085 * liftSign), 0.014, paper)
-      line(along2(stylus, shell, -0.075), along2(stylus, shell, 0.012), 0.04, ink, 'butt')
+      line(
+        along2(stylus, shell, -0.075),
+        along2(stylus, shell, 0.012),
+        0.04,
+        ink,
+        'butt',
+      )
       disc(pivot, 0.072, paper)
     }
 
@@ -572,10 +626,53 @@ export class RecordPainter {
     body('#000000', '#000000')
     ctx.restore()
 
-    body(palette.paper, palette.ink)
+    body('#414448', '#121314')
+    line(pivot, elbow, 0.021, '#96999e')
+    line(pivot, elbow, 0.008, '#ece9e3')
+    const counterStart = along2(pivot, tube, -0.075)
+    const counterEnd = along2(pivot, tube, -0.2)
+    line(counterStart, counterEnd, 0.078, '#96999e', 'butt')
+    line(counterStart, counterEnd, 0.035, '#d8d9da', 'butt')
+    for (let i = 0; i < 5; i++) {
+      const at = along2(pivot, tube, -0.08 - i * 0.023)
+      line(
+        along2(at, side, -0.035),
+        along2(at, side, 0.035),
+        0.003,
+        '#35383b',
+        'butt',
+      )
+    }
+    disc(pivot, 0.066, '#9b9da0')
+    disc(pivot, 0.05, '#323538')
+    disc(pivot, 0.032, '#bfc1c3')
+    disc(pivot, 0.02, '#56595b')
+    line(
+      along2(elbow, shell, -0.012),
+      along2(stylus, shell, -0.005),
+      0.048,
+      '#b6b8ba',
+      'butt',
+    )
+    for (let i = 0; i < 3; i++) {
+      const at = along2(elbow, shell, 0.025 + i * 0.03)
+      line(
+        along2(at, lift, -0.015),
+        along2(at, lift, 0.015),
+        0.005,
+        '#4e5154',
+        'butt',
+      )
+    }
 
     // Details in ink: a band on the counterweight, the bearing, and the needle's point in the accent.
-    line(along2(pivot, tube, -0.118), along2(pivot, tube, -0.13), 0.092, palette.ink, 'butt')
+    line(
+      along2(pivot, tube, -0.118),
+      along2(pivot, tube, -0.13),
+      0.092,
+      palette.ink,
+      'butt',
+    )
     ctx.strokeStyle = palette.ink
     ctx.lineWidth = radius * 0.011
     ctx.beginPath()

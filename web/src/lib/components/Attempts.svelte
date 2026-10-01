@@ -8,10 +8,19 @@
 </script>
 
 <section class="attempts" aria-labelledby="attempts-heading">
-  <h2 class="sr-only" id="attempts-heading">Tries</h2>
+  <h2 id="attempts-heading">
+    {game.finished
+      ? 'Your listening notes'
+      : `Try ${game.turn} of ${game.ladder.length}`}<span
+      >{game.finished ? "Today's pressing" : 'Trust your ears'}</span
+    >
+  </h2>
   <ol>
     {#each game.slots as slot, i}
-      <li class={slot.kind} aria-current={slot.kind === 'current' ? 'step' : undefined}>
+      <li
+        class={slot.kind}
+        aria-current={slot.kind === 'current' ? 'step' : undefined}
+      >
         <span class="clip numeric">{clipShort(game.ladder[i])}</span>
         <span class="mark" aria-hidden="true">
           <svg viewBox="0 0 16 16" width="16" height="16">
@@ -49,59 +58,75 @@
 </section>
 
 <style>
+  .attempts {
+    border-top: 1px solid var(--border);
+    padding-top: 1rem;
+  }
+  h2 {
+    display: flex;
+    justify-content: space-between;
+    gap: 1rem;
+    font-size: 0.8125rem;
+    font-weight: 600;
+  }
+  h2 span {
+    color: var(--muted);
+    font-weight: 400;
+  }
+  ol {
+    margin-top: 0.5rem;
+  }
   li {
     display: grid;
-    grid-template-columns: 3.25rem 1.5rem 1fr;
+    grid-template-columns: 3rem 1.25rem minmax(0, 1fr);
     align-items: start;
-    gap: var(--space-2);
-    padding: var(--space-2) 0;
-    border-top: var(--line) solid transparent;
-    line-height: 1.5rem;
+    gap: 0.5rem;
+    padding: 0.45rem 0;
+    font-size: 0.8125rem;
+    line-height: 1.25rem;
+    color: var(--muted);
   }
-
+  li.empty {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+  }
+  li.current {
+    color: var(--paper);
+    font-weight: 600;
+  }
   .mark {
     display: grid;
     place-items: center;
-    width: 1.5rem;
-    height: 1.5rem;
+    width: 1.25rem;
+    height: 1.25rem;
     border-radius: 50%;
   }
-
   svg {
     fill: none;
     stroke: currentColor;
-    stroke-width: 2.2;
+    stroke-width: 1.5;
     stroke-linecap: round;
     stroke-linejoin: round;
   }
-
   .what {
     min-width: 0;
     overflow-wrap: anywhere;
   }
-
   .title {
-    font-weight: var(--weight-medium);
+    color: var(--paper);
   }
-
-  /* The try being played: a full dot, like the lit band, and heavier words. */
-  li.current {
-    font-weight: var(--weight-medium);
-  }
-
   .dot {
     fill: var(--accent);
-    stroke: var(--paper);
-    stroke-width: 1.5;
+    stroke: none;
   }
-
-  /* The right answer: the mark turns into a filled disc. */
   li.correct .mark {
     background: var(--accent);
     color: var(--ink);
   }
-
   li.correct {
-    font-weight: var(--weight-medium);
+    color: var(--paper);
   }
 </style>

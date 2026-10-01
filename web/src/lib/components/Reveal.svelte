@@ -114,7 +114,7 @@
     gap: var(--space-3);
   }
 
-  /* The sleeve gets its title: the one line of display type on the page. */
+  /* The revealed song takes the display role previously held by the question. */
   .title {
     font-size: var(--text-display);
     font-weight: var(--weight-heavy);
@@ -166,8 +166,7 @@
     font-weight: var(--weight-medium);
   }
 
-  /* The one orchestrated moment: each line is uncovered from the left, like ink
-   * rolled onto the sleeve, starting as the cover prints on the label. */
+  /* The reveal is uncovered in sequence as the artwork arrives on the label. */
   .fresh .print {
     animation: print 700ms var(--ease-out) both;
   }

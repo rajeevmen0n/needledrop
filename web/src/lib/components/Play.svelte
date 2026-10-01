@@ -10,15 +10,21 @@
 
   let elapsed = $state(0)
 
-  const stoppable = $derived(game.playing && game.clipSeconds >= STOPPABLE_SECONDS)
+  const stoppable = $derived(
+    game.playing && game.clipSeconds >= STOPPABLE_SECONDS,
+  )
   const label = $derived.by(() => {
     if (stoppable) return 'Stop'
-    return game.finished ? `Play all ${clipLabel(game.clipSeconds)}` : `Play ${clipLabel(game.clipSeconds)}`
+    return game.finished
+      ? `Play all ${clipLabel(game.clipSeconds)}`
+      : `Play ${clipLabel(game.clipSeconds)}`
   })
   const readout = $derived.by(() => {
     if (game.clipLoading) return 'Loading the clip…'
     if (stoppable) return `${elapsed.toFixed(1)} s`
-    return game.finished ? '' : `${clipShort(game.clipSeconds)} of ${game.totalSeconds}`
+    return game.finished
+      ? ''
+      : `${clipShort(game.clipSeconds)} of ${game.totalSeconds}`
   })
 
   function press() {
@@ -43,7 +49,13 @@
 </script>
 
 <div class="play">
-  <button type="button" class:playing={stoppable} onclick={press}>
+  <button
+    type="button"
+    class:playing={stoppable}
+    onclick={press}
+    disabled={game.clipLoading || game.submitting}
+    aria-busy={game.clipLoading}
+  >
     <span class="disc" aria-hidden="true">
       <svg viewBox="0 0 24 24" width="24" height="24">
         {#if stoppable}
@@ -59,7 +71,9 @@
       <span class="readout" aria-hidden="true">{readout}</span>
     </span>
   </button>
-  <p class="sr-only">{clipLabel(game.clipSeconds)} of {game.totalSeconds} unlocked.</p>
+  <p class="sr-only">
+    {clipLabel(game.clipSeconds)} of {game.totalSeconds} unlocked.
+  </p>
   {#if game.clipError}
     <p class="error" role="alert">{game.clipError}</p>
   {/if}
@@ -90,7 +104,7 @@
     place-items: center;
     width: var(--play-disc);
     height: var(--play-disc);
-    border: var(--line) solid var(--paper);
+    border: var(--line) solid var(--accent);
     border-radius: 50%;
     background: var(--accent);
     color: var(--ink);
@@ -124,6 +138,7 @@
   .readout {
     font-size: var(--text-small);
     font-weight: var(--weight-regular);
+    color: var(--muted);
   }
 
   .readout:empty {
