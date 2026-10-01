@@ -47,7 +47,7 @@
   --screen: 100vh;
   --column-width: 29rem;
   --gutter: max(1.25rem, env(safe-area-inset-left), env(safe-area-inset-right));
-  --record-r: min(39vw, 18rem, var(--screen) * 0.19);
+  --record-r: min(32vw, 7rem, var(--screen) * 0.115);
   --record-x: 50%;
   --record-y: calc(var(--record-r) * 1.16);
   --record-arm: 0;
@@ -71,7 +71,7 @@
 }
 @media (min-width: 40rem) and (min-aspect-ratio: 6/5) {
   :root {
-    --record-r: min(23vw, var(--screen) * 0.32, 21rem);
+    --record-r: min(23vw, 21rem, calc((var(--screen) - 14.5rem) / 2.8));
     --record-y: calc(var(--record-r) * 1.2);
     --gutter: max(2.5rem, env(safe-area-inset-right));
   }

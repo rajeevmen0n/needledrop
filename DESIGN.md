@@ -117,11 +117,15 @@ wrap the reveal and attempt history and truncate autocomplete rows only.
 
 Desktop: header across the page, the row of section tabs under it, a fully
 visible record on the left, a focused game column on the right, and a quiet
-footer. At 40rem with landscape aspect
-ratio, switch to two columns; other viewports stack the record over the controls.
-Document scrolling owns overflow; never lock the game to a fixed viewport.
+footer. At 40rem with landscape aspect ratio, switch to two columns; other
+viewports stack the record over the controls. The game shell fits the visible
+viewport, keeping the header, tabs, record and footer in place as sections
+change. The game column owns overflow for long reveals, history, short screens
+and zoom; switching sections returns that column to its top. The panel fades
+in without moving the record. Keep every control and song detail reachable.
 
-On phones, reduce the headline and record to keep play, search, and skip nearby.
+On phones, reduce the record and omit the introductory headline to keep play,
+search, and skip nearby.
 Safe-area gutters, 44px minimum targets, 56px main controls, and 16px input text
 support touch. Seven equal clip segments communicate the ladder at a glance;
 history shows used and current attempts without seven empty visual rows.

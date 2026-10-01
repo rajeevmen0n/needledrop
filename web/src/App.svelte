@@ -32,6 +32,7 @@
   const CLEARED = 'Your data was cleared. This browser is now a new player.'
 
   let motionPaused = $state(false)
+  let gameRegion: HTMLElement
   /** Clear my data went through, and nothing has been played since. */
   let cleared = $state(false)
 
@@ -64,6 +65,7 @@
   /** A tab was chosen on the page: the address follows it. */
   function choose(next: Section) {
     if (next === game.section) return
+    gameRegion.scrollTop = 0
     history.pushState(null, '', sectionPath(next))
     game.select(next)
   }
@@ -76,7 +78,10 @@
     // Back and forward: the address has changed already, and the page follows it.
     const onpop = () => {
       const route = routeFor(location.pathname)
-      if (route.page === 'game') game.select(route.section)
+      if (route.page === 'game') {
+        gameRegion.scrollTop = 0
+        game.select(route.section)
+      }
       else location.reload()
     }
     document.addEventListener('visibilitychange', onvisible)
@@ -138,7 +143,7 @@
       >
     </div>
   </div>
-  <main data-sky-calm>
+  <main bind:this={gameRegion} data-sky-calm>
     <!-- Always there, so that what it comes to say is announced. -->
     <p class="sr-only" role="status">{spoken}</p>
     {#key game.section}
@@ -253,12 +258,12 @@
     z-index: 1;
     max-width: 1440px;
     margin: auto;
-    min-height: var(--screen);
+    height: var(--screen);
     padding: 0 var(--gutter);
     display: grid;
     grid-template-columns: minmax(0, 1fr);
     /* Header, tabs, record, game, footer: room to spare goes to the game, not to the bars above it. */
-    grid-template-rows: auto auto auto 1fr auto;
+    grid-template-rows: auto auto auto minmax(0, 1fr) auto;
     /* The light behind the record is larger than its stage; it must not lengthen the page. */
     overflow-y: clip;
   }
@@ -365,7 +370,7 @@
   }
   .stage {
     position: relative;
-    height: calc(var(--record-r) * 2.45);
+    height: calc(var(--record-r) * 2.3);
     margin: 0 calc(var(--gutter) * -1);
   }
   /* Light from behind the record, as around an eclipsed sun: brightest at the
@@ -421,7 +426,11 @@
     width: 100%;
     max-width: 34rem;
     justify-self: center;
-    padding: 0 0 2rem;
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-gutter: stable;
+    padding: 0.5rem 0 1rem;
     min-width: 0;
   }
   /* One section's game. A tab that is opened fades in; nothing slides. */
@@ -430,7 +439,7 @@
     gap: 1.25rem;
     align-content: start;
     min-width: 0;
-    animation: arrive 260ms var(--ease-out);
+    animation: arrive 320ms var(--ease-out) both;
   }
   /* News the player did not cause: a replaced song, a new day. */
   .info {
@@ -615,7 +624,7 @@
       gap: 1rem;
     }
     .stage {
-      height: calc(var(--record-r) * 2.35);
+      height: calc(var(--record-r) * 2.3);
     }
   }
   @media (min-width: 40rem) and (min-aspect-ratio: 6/5) {
@@ -624,7 +633,7 @@
       column-gap: clamp(2rem, 6vw, 6rem);
     }
     .page {
-      grid-template-rows: auto auto 1fr auto;
+      grid-template-rows: auto auto minmax(0, 1fr) auto;
     }
     header,
     .sections,
@@ -659,11 +668,13 @@
       grid-column: 2;
       grid-row: 3;
       max-width: 29rem;
-      padding: 3.5rem 0;
+      padding: 1.25rem 0;
+    }
+    .panel {
+      gap: 0.85rem;
     }
     .intro {
-      gap: 1rem;
-      margin-bottom: 0.75rem;
+      gap: 0.75rem;
     }
     .intro h2 {
       font-size: clamp(2.75rem, 4.2vw, 3.75rem);
@@ -681,9 +692,18 @@
       margin-top: auto;
     }
   }
+  @media (min-width: 40rem) and (min-aspect-ratio: 6/5) and (max-height: 800px) {
+    .intro .eyebrow,
+    .intro > p:last-child {
+      display: none;
+    }
+    .intro h2 {
+      font-size: 2.25rem;
+    }
+  }
   @media (max-height: 600px) and (min-width: 40rem) and (min-aspect-ratio: 6/5) {
     main {
-      padding: 1.5rem 0;
+      padding: 0.75rem 0;
     }
     .panel {
       gap: 0.8rem;
@@ -703,12 +723,6 @@
     header {
       padding: 1rem 0;
     }
-    .stage {
-      position: sticky;
-      top: 1rem;
-      align-self: start;
-      margin-top: 1.5rem;
-    }
   }
   @media (max-width: 39.99rem) and (max-height: 650px) {
     .intro {
@@ -723,6 +737,37 @@
     }
     .panel {
       gap: 0.75rem;
+    }
+  }
+  @media (max-width: 39.99rem) {
+    /* The record and primary controls share one phone screen. The notes and
+       long reveals scroll inside the game region when the content needs it. */
+    .intro {
+      display: none;
+    }
+    .panel {
+      gap: 0.75rem;
+    }
+    footer {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 0.5rem;
+      padding: 0.5rem 0 max(0.5rem, env(safe-area-inset-bottom));
+    }
+    footer > span:first-child {
+      display: none;
+    }
+    .switches {
+      flex-wrap: nowrap;
+      margin: 0 -0.5rem 0 0;
+    }
+    .cleared {
+      grid-column: 1 / -1;
+    }
+  }
+  @media (max-width: 22.5rem) {
+    footer {
+      grid-template-columns: minmax(0, 1fr);
     }
   }
 </style>
