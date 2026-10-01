@@ -23,12 +23,16 @@ use async_trait::async_trait;
 use jiff::civil::Date;
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
-use super::{Genre, Genres, NewSong, PoolSong, Store, StoreError};
+use super::{Genre, Genres, NewSong, PlayerId, PoolSong, Section, Store, StoreError, decode_game};
+use crate::game::GameState;
 
 /// The script that brings the schema to each version, in order. Version 0 is
 /// a database without a schema version: a new file, or the one that was built
 /// by hand before the server made its own (see the first script).
-const MIGRATIONS: [(i64, &str); 1] = [(1, include_str!("sqlite/001_songs.sql"))];
+const MIGRATIONS: [(i64, &str); 2] = [
+    (1, include_str!("sqlite/001_songs.sql")),
+    (2, include_str!("sqlite/002_games.sql")),
+];
 
 /// The version this server reads and writes.
 const SCHEMA_VERSION: i64 = MIGRATIONS[MIGRATIONS.len() - 1].0;
@@ -149,6 +153,7 @@ fn check_schema(connection: &Connection) -> Result<(), Failure> {
     for sql in [
         format!("SELECT {SONG_COLUMNS} FROM songs"),
         "SELECT track_id, genre FROM song_genres".to_owned(),
+        "SELECT player, section, day, state FROM games".to_owned(),
     ] {
         connection.prepare(&sql).map_err(|error| {
             Failure::Data(format!(
@@ -242,6 +247,15 @@ fn load_song(connection: &Connection, id: i64) -> Result<Option<PoolSong>, Failu
         song.genres.insert(genre_from_slug(&slug)?);
     }
     Ok(Some(song))
+}
+
+/// A text column of the current row, or `""` when what is stored there is not
+/// text (a blob, bytes that are not UTF-8). Nothing this server writes is
+/// like that, and the empty string then fails [`decode_game`]'s checks, which
+/// is how a game that cannot be read is meant to be treated: left out and
+/// logged, not an error.
+fn text_or_empty<'row>(row: &'row Row<'_>, column: usize) -> Result<&'row str, Failure> {
+    Ok(row.get_ref(column)?.as_str().unwrap_or_default())
 }
 
 /// Makes `genres` the tags of song `id`, dropping the ones it had.
@@ -359,12 +373,91 @@ impl Store for SqliteStore {
         })
         .await
     }
+
+    async fn game(
+        &self,
+        player: &PlayerId,
+        section: Section,
+        day: Date,
+    ) -> Result<Option<GameState>, StoreError> {
+        let player = player.clone();
+        let day = day.to_string();
+        self.run("reading a game", move |connection| {
+            let mut statement = connection.prepare(
+                "SELECT state FROM games WHERE player = ?1 AND section = ?2 AND day = ?3",
+            )?;
+            let mut rows = statement.query(params![player.as_str(), section.slug(), day])?;
+            let Some(row) = rows.next()? else {
+                return Ok(None);
+            };
+            Ok(decode_game(&player, section, &day, text_or_empty(row, 0)?))
+        })
+        .await
+    }
+
+    async fn save_game(
+        &self,
+        player: &PlayerId,
+        section: Section,
+        game: &GameState,
+    ) -> Result<(), StoreError> {
+        const WHAT: &str = "saving a game";
+        // The state is kept as the JSON `GameState` writes and checks itself,
+        // so reading it back goes through the same validation as ever.
+        let state = serde_json::to_string(game).map_err(|error| StoreError::new(WHAT, error))?;
+        let player = player.clone();
+        let day = game.day().to_string();
+        self.run(WHAT, move |connection| {
+            // One statement, so the row is replaced whole or not at all.
+            connection.execute(
+                "INSERT INTO games (player, section, day, state) VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT (player, section, day) DO UPDATE SET state = excluded.state",
+                params![player.as_str(), section.slug(), day, state],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn games(
+        &self,
+        player: &PlayerId,
+        section: Section,
+    ) -> Result<Vec<GameState>, StoreError> {
+        let player = player.clone();
+        self.run("listing a player's games", move |connection| {
+            let mut statement = connection
+                .prepare("SELECT day, state FROM games WHERE player = ?1 AND section = ?2")?;
+            let mut rows = statement.query(params![player.as_str(), section.slug()])?;
+            let mut games = Vec::new();
+            while let Some(row) = rows.next()? {
+                let day = text_or_empty(row, 0)?;
+                games.extend(decode_game(&player, section, day, text_or_empty(row, 1)?));
+            }
+            // Sorted here, as the pool is: the order is the trait's, not the
+            // query's.
+            games.sort_by_key(GameState::day);
+            Ok(games)
+        })
+        .await
+    }
+
+    async fn delete_player(&self, player: &PlayerId) -> Result<usize, StoreError> {
+        let player = player.clone();
+        self.run("deleting a player's games", move |connection| {
+            Ok(connection.execute("DELETE FROM games WHERE player = ?1", [player.as_str()])?)
+        })
+        .await
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::contract::{Fixture, contract_tests};
+    use crate::{
+        store::contract::{Fixture, contract_tests},
+        testutil::{lost_game, playing_game, won_game},
+    };
     use jiff::civil::date;
 
     /// A store on a new database in a temporary directory.
@@ -525,6 +618,222 @@ mod tests {
             .map(|song| song.track_id)
             .collect();
         assert_eq!(ids, vec![15_391_618, 4_091_937_401]);
+    }
+
+    #[tokio::test]
+    async fn a_database_with_only_the_song_pool_gains_the_games_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("needledrop.db");
+        // A database as the previous version of the server left it: schema
+        // version 1, songs and no games.
+        execute(&path, HAND_BUILT);
+        execute(&path, "PRAGMA user_version = 1");
+
+        let store = SqliteStore::open(&path).unwrap();
+        assert_eq!(user_version(&path), SCHEMA_VERSION);
+        // The pool is as it was.
+        let ids: Vec<u64> = store
+            .songs()
+            .await
+            .unwrap()
+            .iter()
+            .map(|song| song.track_id)
+            .collect();
+        assert_eq!(ids, vec![4_603_408, 4_091_937_401]);
+
+        // And games can be kept.
+        let player = PlayerId::generate();
+        let game = won_game(date(2026, 10, 1), 2);
+        store
+            .save_game(&player, Section::General, &game)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.games(&player, Section::General).await.unwrap(),
+            vec![game]
+        );
+    }
+
+    #[tokio::test]
+    async fn games_survive_reopening_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("games.db");
+        let player = PlayerId::generate();
+        let other = PlayerId::generate();
+        let rock = Section::Genre(Genre::Rock);
+
+        let store = SqliteStore::open(&path).unwrap();
+        let general = [
+            won_game(date(2026, 10, 1), 0),
+            lost_game(date(2026, 10, 2)),
+            playing_game(date(2026, 10, 3), 3),
+        ];
+        for game in &general {
+            store
+                .save_game(&player, Section::General, game)
+                .await
+                .unwrap();
+        }
+        let rock_game = won_game(date(2026, 10, 3), 6);
+        store.save_game(&player, rock, &rock_game).await.unwrap();
+        store
+            .save_game(&other, Section::General, &general[0])
+            .await
+            .unwrap();
+        // One that is replaced and one that is deleted before the restart.
+        store
+            .save_game(
+                &player,
+                Section::General,
+                &playing_game(date(2026, 10, 3), 4),
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.delete_player(&other).await.unwrap(), 1);
+        drop(store);
+
+        // A restart: the same file, a new connection, nothing migrated twice.
+        let reopened = SqliteStore::open(&path).unwrap();
+        assert_eq!(user_version(&path), SCHEMA_VERSION);
+        assert_eq!(
+            reopened.games(&player, Section::General).await.unwrap(),
+            vec![
+                general[0].clone(),
+                general[1].clone(),
+                playing_game(date(2026, 10, 3), 4),
+            ]
+        );
+        assert_eq!(
+            reopened
+                .game(&player, rock, date(2026, 10, 3))
+                .await
+                .unwrap(),
+            Some(rock_game)
+        );
+        assert_eq!(
+            reopened.games(&other, Section::General).await.unwrap(),
+            Vec::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_game_is_stored_as_one_row_of_documented_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("games.db");
+        let store = SqliteStore::open(&path).unwrap();
+        let player = PlayerId::generate();
+        let rock = Section::Genre(Genre::Rock);
+        for misses in [1, 2] {
+            store
+                .save_game(&player, rock, &playing_game(date(2026, 10, 1), misses))
+                .await
+                .unwrap();
+        }
+
+        let rows: Vec<(String, String, String, String)> = Connection::open(&path)
+            .unwrap()
+            .prepare("SELECT player, section, day, state FROM games")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![(
+                player.as_str().to_owned(),
+                "rock".to_owned(),
+                "2026-10-01".to_owned(),
+                r#"{"day":"2026-10-01","attempts":[{"kind":"skip"},{"kind":"skip"}],"status":"playing"}"#
+                    .to_owned(),
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stored_game_that_cannot_be_read_counts_as_not_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("games.db");
+        let store = SqliteStore::open(&path).unwrap();
+        let player = PlayerId::generate();
+        let id = player.as_str();
+        let good = won_game(date(2026, 10, 1), 1);
+        store
+            .save_game(&player, Section::General, &good)
+            .await
+            .unwrap();
+
+        // Rows this server would never write: not JSON, a state no sequence
+        // of moves produces, a game filed under another day than its own, a
+        // day that is not a date, and a blob where the text should be.
+        execute(
+            &path,
+            &format!(
+                r#"INSERT INTO games (player, section, day, state) VALUES
+                     ('{id}', 'general', '2026-10-02', 'not json at all'),
+                     ('{id}', 'general', '2026-10-03',
+                      '{{"day":"2026-10-03","attempts":[],"status":"lost"}}'),
+                     ('{id}', 'general', '2026-10-04',
+                      '{{"day":"2026-10-09","attempts":[],"status":"won"}}'),
+                     ('{id}', 'general', 'last tuesday',
+                      '{{"day":"2026-10-05","attempts":[],"status":"won"}}'),
+                     ('{id}', 'general', '2026-10-06', x'00ff00');"#
+            ),
+        );
+
+        // None of them is an error, for the day or for the list: the player
+        // is not locked out, they lose those games.
+        for day in [2, 3, 4, 6, 9] {
+            let day = date(2026, 10, day);
+            assert_eq!(
+                store.game(&player, Section::General, day).await.unwrap(),
+                None,
+                "{day}"
+            );
+        }
+        assert_eq!(
+            store.games(&player, Section::General).await.unwrap(),
+            vec![good.clone()]
+        );
+
+        // The next move on such a day replaces the row with a good one.
+        let replacement = playing_game(date(2026, 10, 2), 1);
+        store
+            .save_game(&player, Section::General, &replacement)
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .game(&player, Section::General, date(2026, 10, 2))
+                .await
+                .unwrap(),
+            Some(replacement.clone())
+        );
+        assert_eq!(
+            store.games(&player, Section::General).await.unwrap(),
+            vec![good, replacement]
+        );
+        // Clearing the player's data removes the unreadable rows too.
+        assert_eq!(store.delete_player(&player).await.unwrap(), 6);
+    }
+
+    #[test]
+    fn a_games_table_of_another_shape_is_refused_and_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool.db");
+        execute(&path, HAND_BUILT);
+        execute(
+            &path,
+            "CREATE TABLE games (id INTEGER PRIMARY KEY, score INTEGER)",
+        );
+
+        // The script that creates the table fails on the one in its way, and
+        // nothing of the migration is kept.
+        let error = SqliteStore::open(&path).err().unwrap().to_string();
+        assert!(error.contains("pool.db"), "{error}");
+        assert_eq!(user_version(&path), 0);
     }
 
     #[test]

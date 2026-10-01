@@ -26,8 +26,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     deezer::{DeezerError, Track},
-    routes::{ApiError, AppState, SearchParams, find_tracks, no_store},
-    store::{Genre, Genres, NewSong, PoolSong, StoreError},
+    routes::{ApiError, AppState, SearchParams, find_tracks, no_store, store_failed},
+    store::{Genre, Genres, NewSong, PoolSong},
 };
 
 /// The admin routes, to be merged into the server's router.
@@ -36,13 +36,6 @@ pub fn routes() -> Router<AppState> {
         .route("/api/admin/songs", get(list_songs).post(add_song))
         .route("/api/admin/songs/{track_id}", delete(remove_song))
         .route("/api/admin/search", get(search))
-}
-
-/// A failed store operation as a response. What went wrong can name files
-/// and tracks, so it goes to the log and the client gets the fixed sentence.
-fn store_failed(error: StoreError) -> ApiError {
-    tracing::error!(%error, "the store failed");
-    ApiError::Internal
 }
 
 // --- GET /api/admin/songs -------------------------------------------------------
@@ -230,21 +223,16 @@ async fn search(
 mod tests {
     use super::*;
     use crate::{
-        daily::Daily,
-        routes::router,
-        store::{MemoryStore, Store},
-        testutil::{MockDeezer, MockTrack, Preview},
+        store::PlayerId,
+        testutil::{BrokenStore, Harness, MockTrack, Preview, Reply},
     };
-    use async_trait::async_trait;
     use axum::{
         body::Body,
-        http::{HeaderMap, Method, Request, header},
+        http::{Method, Request, header},
     };
-    use axum_extra::extract::cookie::Key;
     use jiff::civil::date;
     use serde_json::{Value, json};
     use std::sync::Arc;
-    use tower::ServiceExt;
 
     const QUEEN: u64 = 10;
     const QUEEN_REMASTER: u64 = 11;
@@ -280,61 +268,21 @@ mod tests {
         tracks
     }
 
-    /// The whole router over a Deezer stand-in and a store the test can reach.
-    struct Harness {
-        deezer: MockDeezer,
-        store: Arc<dyn Store>,
-        app: Router,
-        _data_dir: tempfile::TempDir,
+    /// The whole router over a Deezer stand-in and an empty in-memory store.
+    async fn start() -> Harness {
+        Harness::start(tracks(), CONFIGURED_TRACK).await
     }
 
-    impl Harness {
-        async fn start() -> Self {
-            Self::with_store(Arc::new(MemoryStore::new())).await
-        }
-
-        async fn with_store(store: Arc<dyn Store>) -> Self {
-            let deezer = MockDeezer::start(tracks()).await;
-            let data_dir = tempfile::tempdir().unwrap();
-            let client = deezer.client();
-            let daily = Daily::new(client.clone(), data_dir.path(), CONFIGURED_TRACK);
-            let state = AppState::new(
-                client,
-                daily,
-                Arc::clone(&store),
-                date(2026, 10, 1),
-                Key::generate(),
-            );
-            Self {
-                deezer,
-                store,
-                app: router(state),
-                _data_dir: data_dir,
-            }
-        }
-
-        async fn send(&self, request: Request<Body>) -> Reply {
-            let response = self.app.clone().oneshot(request).await.unwrap();
-            let (parts, body) = response.into_parts();
-            let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
-            Reply {
-                status: parts.status,
-                headers: parts.headers,
-                body,
-            }
-        }
-
-        async fn get(&self, uri: &str) -> Reply {
-            self.send(Request::get(uri).body(Body::empty()).unwrap())
-                .await
-        }
-
-        async fn delete(&self, uri: &str) -> Reply {
-            self.send(Request::delete(uri).body(Body::empty()).unwrap())
-                .await
-        }
-
+    /// The admin requests, on the shared harness.
+    trait AdminRequests {
         /// `POST /api/admin/songs` with a JSON body.
+        async fn add(&self, body: Value) -> Reply;
+        async fn add_raw(&self, content_type: &str, body: impl Into<Body>) -> Reply;
+        /// The pool as `GET /api/admin/songs` lists it.
+        async fn pool(&self) -> Value;
+    }
+
+    impl AdminRequests for Harness {
         async fn add(&self, body: Value) -> Reply {
             self.add_raw("application/json", body.to_string()).await
         }
@@ -349,44 +297,10 @@ mod tests {
             self.send(request).await
         }
 
-        /// The pool as `GET /api/admin/songs` lists it.
         async fn pool(&self) -> Value {
             let reply = self.get("/api/admin/songs").await;
             assert_eq!(reply.status, StatusCode::OK);
             reply.json()
-        }
-    }
-
-    struct Reply {
-        status: StatusCode,
-        headers: HeaderMap,
-        body: bytes::Bytes,
-    }
-
-    impl Reply {
-        fn json(&self) -> Value {
-            serde_json::from_slice(&self.body)
-                .unwrap_or_else(|error| panic!("not JSON ({error}): {:?}", self.body))
-        }
-
-        fn assert_no_store(&self) {
-            assert_eq!(
-                self.headers
-                    .get(header::CACHE_CONTROL)
-                    .and_then(|value| value.to_str().ok()),
-                Some("no-store")
-            );
-        }
-
-        fn assert_error(&self, status: StatusCode, code: &str) {
-            assert_eq!(self.status, status, "{:?}", self.body);
-            let body = self.json();
-            assert_eq!(body["error"], code);
-            assert!(
-                body["message"].as_str().is_some_and(|m| !m.is_empty()),
-                "{body}"
-            );
-            self.assert_no_store();
         }
     }
 
@@ -404,7 +318,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_empty_pool_is_an_empty_list() {
-        let harness = Harness::start().await;
+        let harness = start().await;
         let reply = harness.get("/api/admin/songs").await;
         assert_eq!(reply.status, StatusCode::OK);
         assert_eq!(reply.json(), json!([]));
@@ -413,7 +327,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_pool_is_listed_by_artist_then_title() {
-        let harness = Harness::start().await;
+        let harness = start().await;
         let store = &harness.store;
         for (track_id, title, artist, genres) in [
             (
@@ -495,7 +409,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_added_song_gets_its_text_from_deezer() {
-        let harness = Harness::start().await;
+        let harness = start().await;
 
         // Whatever else the body claims about the track is ignored.
         let reply = harness
@@ -527,7 +441,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_track_without_a_preview_is_added_all_the_same() {
-        let harness = Harness::start().await;
+        let harness = start().await;
 
         let reply = harness
             .add(json!({ "trackId": WITHDRAWN, "genres": ["rock"] }))
@@ -562,7 +476,7 @@ mod tests {
 
     #[tokio::test]
     async fn genres_may_be_left_out_empty_or_repeated() {
-        let harness = Harness::start().await;
+        let harness = start().await;
 
         for (body, expected) in [
             (json!({ "trackId": 100 }), json!([])),
@@ -586,7 +500,7 @@ mod tests {
 
     #[tokio::test]
     async fn adding_a_song_already_there_replaces_its_genres_without_asking_deezer() {
-        let harness = Harness::start().await;
+        let harness = start().await;
         harness
             .add(json!({ "trackId": QUEEN, "genres": ["rock"] }))
             .await;
@@ -624,7 +538,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_track_deezer_does_not_have_is_not_added() {
-        let harness = Harness::start().await;
+        let harness = start().await;
 
         for track_id in [UNKNOWN_ID, BLANK_TITLE, 0] {
             harness
@@ -637,7 +551,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_deezer_failure_adds_nothing_and_is_an_upstream_error() {
-        let harness = Harness::start().await;
+        let harness = start().await;
         harness.deezer.set_failing(true);
         harness
             .add(json!({ "trackId": QUEEN, "genres": ["rock"] }))
@@ -656,7 +570,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_adds_are_bad_requests_that_reach_neither_deezer_nor_the_pool() {
-        let harness = Harness::start().await;
+        let harness = start().await;
 
         for body in [
             json!({}),
@@ -701,7 +615,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_bad_genre_does_not_retag_a_song_that_is_there() {
-        let harness = Harness::start().await;
+        let harness = start().await;
         harness
             .add(json!({ "trackId": QUEEN, "genres": ["rock"] }))
             .await;
@@ -717,7 +631,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_removed_song_leaves_the_pool() {
-        let harness = Harness::start().await;
+        let harness = start().await;
         harness
             .add(json!({ "trackId": QUEEN, "genres": ["rock"] }))
             .await;
@@ -739,7 +653,7 @@ mod tests {
 
     #[tokio::test]
     async fn removing_a_song_that_is_not_in_the_pool_is_not_found() {
-        let harness = Harness::start().await;
+        let harness = start().await;
         harness.add(json!({ "trackId": QUEEN })).await;
 
         // A track Deezer knows but the pool does not, and one nobody knows.
@@ -761,7 +675,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_track_id_that_is_not_a_number_is_a_bad_request() {
-        let harness = Harness::start().await;
+        let harness = start().await;
         harness.add(json!({ "trackId": QUEEN })).await;
 
         for uri in [
@@ -782,7 +696,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_admin_search_lists_every_release_and_whether_it_plays() {
-        let harness = Harness::start().await;
+        let harness = start().await;
 
         let reply = harness
             .get("/api/admin/search?q=%20Under%20%20PRESSURE%20")
@@ -831,7 +745,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_admin_search_is_not_cut_to_the_autocomplete_length() {
-        let harness = Harness::start().await;
+        let harness = start().await;
 
         // 30 tracks match; Deezer is asked for 25 and all of them are shown,
         // live versions included.
@@ -858,7 +772,7 @@ mod tests {
 
     #[tokio::test]
     async fn short_admin_queries_do_not_reach_deezer() {
-        let harness = Harness::start().await;
+        let harness = start().await;
         for uri in [
             "/api/admin/search",
             "/api/admin/search?q=",
@@ -876,7 +790,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_admin_search_is_an_upstream_error() {
-        let harness = Harness::start().await;
+        let harness = start().await;
         harness.deezer.set_failing(true);
         harness
             .get("/api/admin/search?q=queen")
@@ -886,40 +800,9 @@ mod tests {
 
     // --- the rest -----------------------------------------------------------
 
-    /// A store whose every operation fails, with a message no client may see.
-    struct BrokenStore;
-
-    const BROKEN: &str = "disk on fire at /var/lib/needledrop.db";
-
-    fn broken<T>() -> Result<T, StoreError> {
-        Err(StoreError::new("pretending", BROKEN))
-    }
-
-    #[async_trait]
-    impl Store for BrokenStore {
-        async fn songs(&self) -> Result<Vec<PoolSong>, StoreError> {
-            broken()
-        }
-        async fn song(&self, _: u64) -> Result<Option<PoolSong>, StoreError> {
-            broken()
-        }
-        async fn add_song(&self, _: NewSong, _: Genres) -> Result<PoolSong, StoreError> {
-            broken()
-        }
-        async fn set_song_genres(&self, _: u64, _: Genres) -> Result<Option<PoolSong>, StoreError> {
-            broken()
-        }
-        async fn remove_song(&self, _: u64) -> Result<bool, StoreError> {
-            broken()
-        }
-        async fn set_preview_failed_on(&self, _: u64, _: Option<Date>) -> Result<bool, StoreError> {
-            broken()
-        }
-    }
-
     #[tokio::test]
     async fn a_store_failure_is_an_internal_error_with_a_fixed_message() {
-        let harness = Harness::with_store(Arc::new(BrokenStore)).await;
+        let harness = Harness::with_store(tracks(), CONFIGURED_TRACK, Arc::new(BrokenStore)).await;
 
         for reply in [
             harness.get("/api/admin/songs").await,
@@ -927,25 +810,30 @@ mod tests {
             harness.delete("/api/admin/songs/10").await,
         ] {
             reply.assert_error(StatusCode::INTERNAL_SERVER_ERROR, "internal");
-            let text = String::from_utf8_lossy(&reply.body).into_owned();
-            assert!(!text.contains("fire"), "{text}");
-            assert!(!text.contains("needledrop.db"), "{text}");
+            reply.assert_lacks(&["fire", "needledrop.db"]);
         }
         // The retag is tried before Deezer is asked, so nothing was looked up.
         assert_eq!(harness.deezer.api_hits(), 0);
 
-        // The game does not read the store, and the search never did.
+        // What does not need the store carries on: the search, and the game
+        // of a browser without a cookie, which has no games to read.
         assert_eq!(harness.get("/api/health").await.status, StatusCode::OK);
         assert_eq!(harness.get("/api/daily").await.status, StatusCode::OK);
         assert_eq!(
             harness.get("/api/admin/search?q=queen").await.status,
             StatusCode::OK
         );
+        // A known player's game is in the store, so that does fail.
+        harness
+            .player_with_id(&PlayerId::generate())
+            .get("/api/daily")
+            .await
+            .assert_error(StatusCode::INTERNAL_SERVER_ERROR, "internal");
     }
 
     #[tokio::test]
     async fn the_pool_does_not_change_what_the_game_plays() {
-        let harness = Harness::start().await;
+        let harness = start().await;
         let before = harness.get("/api/daily").await.json();
 
         harness
@@ -963,7 +851,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_admin_routes_are_json_errors() {
-        let harness = Harness::start().await;
+        let harness = start().await;
         for uri in [
             "/api/admin",
             "/api/admin/nope",
@@ -978,7 +866,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_method_a_route_does_not_have_changes_nothing() {
-        let harness = Harness::start().await;
+        let harness = start().await;
         harness.add(json!({ "trackId": QUEEN })).await;
 
         // A song can be removed but not fetched on its own, and the list

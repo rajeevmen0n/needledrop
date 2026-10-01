@@ -24,9 +24,10 @@ pub const MAX_FIELD_CHARS: usize = 80;
 /// Longest title or artist kept in an [`Attempt`], in bytes of JSON.
 ///
 /// 80 characters of Japanese are 240 bytes, so a character limit alone does
-/// not bound the cookie. With both limits a lost game of seven wrong guesses
-/// stays under 2.7 kB of JSON, about 3.7 kB once encrypted and base64-encoded,
-/// inside the 4 kB a browser accepts.
+/// not bound a stored game. With both limits a lost game of seven wrong
+/// guesses stays under 2.7 kB of JSON. The limits date from when the state
+/// had to fit in a 4 kB cookie; they stay because they bound a row of the
+/// database and what one response carries, whatever Deezer calls a track.
 pub const MAX_FIELD_BYTES: usize = 160;
 
 /// The ladder in seconds, as the API reports it: `0.1, 0.3, 1, 3, 8, 16, 30`.
@@ -63,7 +64,7 @@ pub enum Attempt {
 
 impl Attempt {
     /// A wrong guess. The title and artist are cut to [`MAX_FIELD_CHARS`] and
-    /// [`MAX_FIELD_BYTES`], because every attempt lives in the session cookie.
+    /// [`MAX_FIELD_BYTES`], because every attempt is stored with the game.
     pub fn wrong(title: &str, artist: &str) -> Self {
         Self::Wrong {
             title: clip_field(title),
@@ -108,21 +109,22 @@ pub struct InvalidState {
     status: Status,
 }
 
-/// One player's game for one day. This is the whole session: it is what the
-/// encrypted cookie holds, as JSON.
+/// One player's game for one day, in one section. It is what the store keeps
+/// per player, section and day; as JSON it reads
 ///
 /// ```json
 /// {"day":"2026-10-01","attempts":[{"kind":"skip"},{"kind":"wrong","title":"Under Pressure","artist":"Queen"}],"status":"playing"}
 /// ```
 ///
 /// `day` is the UTC date as `YYYY-MM-DD`. The field names are spelled out
-/// rather than abbreviated: the worst case is still well inside a cookie (see
+/// rather than abbreviated: the worst case is small all the same (see
 /// [`MAX_FIELD_BYTES`]), and `attempts` and `status` can go into the API
-/// response as they are.
+/// response as they are. Who is playing and in which section are not part of
+/// it; they are what the game is stored under.
 ///
 /// Deserializing checks that the attempts and status agree (see
 /// [`InvalidState`]), so the methods can rely on it. Treat a state that fails
-/// to deserialize like a missing cookie: start a new game.
+/// to deserialize like a game that was never stored: start a new one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "StoredState")]
 pub struct GameState {
@@ -131,7 +133,7 @@ pub struct GameState {
     status: Status,
 }
 
-/// [`GameState`] as read from the cookie, before its invariants are checked.
+/// [`GameState`] as read from where it was stored, before its invariants are checked.
 #[derive(Deserialize)]
 struct StoredState {
     day: Date,
@@ -173,7 +175,7 @@ impl GameState {
     }
 
     /// This state if it is for `today`, otherwise a fresh game for `today`.
-    /// Yesterday's cookie says nothing about today's song.
+    /// Yesterday's game says nothing about today's song.
     pub fn for_day(self, today: Date) -> Self {
         if self.day == today {
             self
@@ -1041,7 +1043,7 @@ mod tests {
         assert_eq!(next, GameState::new(tomorrow));
         assert_eq!(next.unlocked_ms(), 100);
 
-        // A finished game rolls over as well, and so does a cookie from the future.
+        // A finished game rolls over as well, and so does a game from the future.
         let mut won = GameState::new(DAY);
         won.guess(&answer(), &answer()).unwrap();
         assert_eq!(won.clone().for_day(DAY).status(), Status::Won);
@@ -1187,7 +1189,7 @@ mod tests {
     }
 
     #[test]
-    fn worst_case_state_fits_in_a_cookie() {
+    fn the_worst_case_state_is_a_small_row() {
         // Six wrong guesses with 80-character titles and artists, still playing.
         let mut six = GameState::new(DAY);
         let long = "W".repeat(300);
@@ -1201,13 +1203,10 @@ mod tests {
         let json = serde_json::to_string(&worst_case(&long)).unwrap();
         assert!(json.len() < 1500, "{} bytes", json.len());
 
-        // Multi-byte and escaped text is where the byte limit matters. The
-        // cookie holds 12 + 16 bytes of nonce and tag on top, base64-encoded.
+        // Multi-byte and escaped text is where the byte limit matters.
         for text in ["夜", "é", "🎵", "\"", "\\", "\u{7}"] {
             let json = serde_json::to_string(&worst_case(&text.repeat(300))).unwrap();
             assert!(json.len() < 2700, "{text:?}: {} bytes", json.len());
-            let cookie_value = (json.len() + 28).div_ceil(3) * 4;
-            assert!(cookie_value < 3700, "{text:?}: {cookie_value} bytes");
         }
     }
 }

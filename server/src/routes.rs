@@ -1,21 +1,21 @@
-//! The player's HTTP handlers, the shared state and the encrypted-cookie game session.
+//! The game's HTTP handlers and the state every handler shares.
 //!
-//! The admin routes live in [`crate::admin`] and are mounted by [`router`].
+//! The admin routes live in [`crate::admin`] and the player cookie and Clear
+//! my data in [`crate::player`]; [`router`] mounts them all.
 //!
 //! The rule every handler here keeps: while a game is `playing`, nothing that
 //! identifies the song leaves the server. The answer goes out through one
-//! place only ([`DailyView::new`]), error messages are fixed sentences, and
-//! the audio is the clip the session has unlocked and no more.
+//! place only ([`DailyView::new`]), error messages are fixed sentences, the
+//! cookie holds an anonymous ID and nothing about the game, and the audio is
+//! the clip the player has unlocked and no more.
+//!
+//! A game is kept in the store under the player's ID, its section and its
+//! day. It is written when a move is made and never by a visit: a player who
+//! has made no move today has, by definition, a fresh game, so a crawler or a
+//! visitor who only looks leaves nothing behind.
 
-use std::{
-    collections::HashSet,
-    io::{self, Write},
-    os::unix::fs::OpenOptionsExt,
-    path::Path,
-    sync::Arc,
-};
+use std::{collections::HashSet, sync::Arc};
 
-use anyhow::Context;
 use axum::{
     Json, Router,
     extract::{
@@ -24,9 +24,9 @@ use axum::{
     },
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
-use axum_extra::extract::cookie::{Cookie, Key, PrivateCookieJar, SameSite};
+use axum_extra::extract::cookie::{Key, PrivateCookieJar};
 use jiff::civil::Date;
 use serde::{Deserialize, Serialize};
 
@@ -34,22 +34,15 @@ use crate::{
     admin,
     daily::{Answer, Daily, Song, today_utc},
     deezer::{Deezer, DeezerError, Track},
-    game::{self, Attempt, GameError, GameState, MAX_ATTEMPTS, Status},
-    store::Store,
+    game::{self, Attempt, GameError, GameState, MAX_ATTEMPTS, Status, TrackMeta},
+    player::{self, MoveLocks},
+    stats::Stats,
+    store::{PlayerId, Section, Store, StoreError},
 };
 
-/// The session cookie: the player's [`GameState`] as JSON, encrypted.
-const COOKIE_NAME: &str = "gts_daily";
-
-/// A game lasts one UTC day; two days cover every time zone's "today" with
-/// room to spare, and the state inside is discarded once its day is over.
-const COOKIE_MAX_AGE: time::Duration = time::Duration::days(2);
-
-/// The cookie key on disk, under the data directory.
-const KEY_FILE: &str = "secret.key";
-
-/// Length of the cookie key: 32 bytes to sign with and 32 to encrypt with.
-const KEY_BYTES: usize = 64;
+/// The section every game is played in, and stored under, until each section
+/// has a song of its own and the routes take the section from the address.
+const SECTION: Section = Section::General;
 
 /// Autocomplete rows sent to the client.
 const SEARCH_RESULTS: usize = 8;
@@ -73,6 +66,7 @@ struct Shared {
     deezer: Deezer,
     daily: Daily,
     store: Arc<dyn Store>,
+    move_locks: MoveLocks,
     launch_date: Date,
     key: Key,
 }
@@ -89,6 +83,7 @@ impl AppState {
             deezer,
             daily,
             store,
+            move_locks: MoveLocks::new(),
             launch_date,
             key,
         }))
@@ -100,10 +95,16 @@ impl AppState {
         &self.0.deezer
     }
 
-    /// The persistent data. Nothing on the player's routes reads it yet: the
-    /// game still plays the configured track.
+    /// The persistent data: the song pool and the players' games. The song
+    /// that is played does not come from it yet; that is still the configured
+    /// track.
     pub fn store(&self) -> &dyn Store {
         self.0.store.as_ref()
+    }
+
+    /// The locks that keep each player's moves one after another.
+    pub fn move_locks(&self) -> &MoveLocks {
+        &self.0.move_locks
     }
 
     /// The song played on `day`, loading it if needed.
@@ -132,6 +133,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/daily", get(daily))
         .route("/api/daily/audio", get(audio))
         .route("/api/daily/guess", post(guess))
+        .route("/api/player", delete(player::clear))
         .route("/api/search", get(search))
         .merge(admin::routes())
         .fallback(not_found)
@@ -159,7 +161,8 @@ pub enum ApiError {
     /// 502: Deezer failed, or this server is holding back to stay under
     /// Deezer's rate limit.
     Upstream(&'static str),
-    /// 500: a bug or a broken environment on this side.
+    /// 500: a bug or a broken environment on this side, such as a store that
+    /// cannot be read or written.
     Internal,
 }
 
@@ -212,139 +215,12 @@ pub(crate) fn no_store() -> [(header::HeaderName, HeaderValue); 1] {
     [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))]
 }
 
-// --- the session cookie ---------------------------------------------------------
-
-/// The player's game for `today`, read from the cookie.
-///
-/// A cookie that is missing, does not decrypt (the jar then reports it as
-/// absent) or does not hold a possible game is a fresh game, and so is one
-/// left over from another day.
-fn load_game(jar: &PrivateCookieJar, today: Date) -> GameState {
-    jar.get(COOKIE_NAME)
-        .and_then(|cookie| serde_json::from_str::<GameState>(cookie.value()).ok())
-        .unwrap_or_else(|| GameState::new(today))
-        .for_day(today)
-}
-
-/// Puts `game` into the cookie. `secure` marks it HTTPS-only.
-fn store_game(
-    jar: PrivateCookieJar,
-    game: &GameState,
-    secure: bool,
-) -> Result<PrivateCookieJar, ApiError> {
-    let json = serde_json::to_string(game).map_err(|error| {
-        tracing::error!(%error, "could not serialize the game state");
-        ApiError::Internal
-    })?;
-    let cookie = Cookie::build((COOKIE_NAME, json))
-        .path("/")
-        .http_only(true)
-        .same_site(SameSite::Lax)
-        .max_age(COOKIE_MAX_AGE)
-        .secure(secure)
-        .build();
-    Ok(jar.add(cookie))
-}
-
-/// Whether the player's browser reached the site over HTTPS.
-///
-/// The server itself only ever sees plain HTTP from nginx, which reports the
-/// original scheme in `X-Forwarded-Proto`. A `Secure` cookie on plain HTTP
-/// (the Vite dev server on localhost) would be dropped by the browser, so the
-/// flag follows the header instead of being always on.
-fn is_https(headers: &HeaderMap) -> bool {
-    headers
-        .get("x-forwarded-proto")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(',').next())
-        .is_some_and(|scheme| scheme.trim().eq_ignore_ascii_case("https"))
-}
-
-/// The cookie key could not be read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error(
-    "expected 128 hexadecimal characters (64 random bytes, for example from `openssl rand -hex 64`)"
-)]
-pub struct KeyFormatError;
-
-/// The key the session cookie is encrypted with.
-///
-/// `secret` is `GTS_SECRET`: 128 hexadecimal characters, that is 64 random
-/// bytes (`openssl rand -hex 64`). Without it the key lives in
-/// `<data_dir>/secret.key`, in the same format, and is generated on the first
-/// start. The file is created readable by its owner only.
-///
-/// Changing the key makes every existing cookie undecryptable, which the game
-/// treats as "no cookie": each player starts the day again.
-pub fn session_key(secret: Option<&str>, data_dir: &Path) -> anyhow::Result<Key> {
-    if let Some(secret) = secret {
-        // The error does not repeat the value: it would end up in the log.
-        return parse_key(secret).context("GTS_SECRET is not a usable cookie key");
-    }
-
-    let path = data_dir.join(KEY_FILE);
-    match std::fs::read_to_string(&path) {
-        Ok(text) => parse_key(&text).with_context(|| {
-            format!(
-                "the cookie key in {} is unusable; delete the file to have a new one generated",
-                path.display()
-            )
-        }),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let key = Key::try_generate().context("no secure random source for the cookie key")?;
-            std::fs::create_dir_all(data_dir)
-                .with_context(|| format!("creating the data directory {}", data_dir.display()))?;
-            write_key_file(&path, &key)
-                .with_context(|| format!("writing the cookie key to {}", path.display()))?;
-            tracing::info!(path = %path.display(), "generated a new cookie key");
-            Ok(key)
-        }
-        Err(error) => {
-            Err(error).with_context(|| format!("reading the cookie key from {}", path.display()))
-        }
-    }
-}
-
-/// Writes the key as hex, to a file only its owner can read. Fails if the
-/// file already exists, so a key is never silently replaced.
-fn write_key_file(path: &Path, key: &Key) -> io::Result<()> {
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
-    let mut text = encode_hex(key.master());
-    text.push('\n');
-    file.write_all(text.as_bytes())
-}
-
-fn parse_key(text: &str) -> Result<Key, KeyFormatError> {
-    let bytes = decode_hex(text.trim()).ok_or(KeyFormatError)?;
-    if bytes.len() != KEY_BYTES {
-        return Err(KeyFormatError);
-    }
-    Key::try_from(bytes.as_slice()).map_err(|_| KeyFormatError)
-}
-
-fn encode_hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    bytes.iter().fold(String::new(), |mut text, byte| {
-        // Writing to a `String` cannot fail.
-        let _ = write!(text, "{byte:02x}");
-        text
-    })
-}
-
-fn decode_hex(text: &str) -> Option<Vec<u8>> {
-    let nibble = |byte: u8| char::from(byte).to_digit(16);
-    let (pairs, rest) = text.as_bytes().as_chunks::<2>();
-    if !rest.is_empty() {
-        return None;
-    }
-    pairs
-        .iter()
-        .map(|&[high, low]| u8::try_from(nibble(high)? * 16 + nibble(low)?).ok())
-        .collect()
+/// A failed store operation as a response. What went wrong can name files,
+/// tracks and players, so it goes to the log and the client gets the fixed
+/// sentence.
+pub(crate) fn store_failed(error: StoreError) -> ApiError {
+    tracing::error!(%error, "the store failed");
+    ApiError::Internal
 }
 
 // --- GET /api/health ------------------------------------------------------------
@@ -372,6 +248,8 @@ struct DailyView<'a> {
     day: Date,
     /// 1 on the launch day.
     number: i64,
+    /// The section this game belongs to, as its slug.
+    section: Section,
     /// Clip length of each turn, in seconds.
     ladder: [f64; MAX_ATTEMPTS],
     attempts: &'a [Attempt],
@@ -380,35 +258,115 @@ struct DailyView<'a> {
     clip_seconds: f64,
     /// `null` until the game is over.
     answer: Option<&'a Answer>,
+    /// The player's record in this section, this game included once it is
+    /// finished. It says nothing about the song, so it is there while
+    /// playing too.
+    stats: Stats,
 }
 
 impl<'a> DailyView<'a> {
     /// What the player may see of `game`. This is the only place the answer
     /// is handed out, and only for a finished game.
-    fn new(game: &'a GameState, launch_date: Date, song: &'a Song) -> Self {
+    fn new(
+        game: &'a GameState,
+        section: Section,
+        stats: Stats,
+        launch_date: Date,
+        song: &'a Song,
+    ) -> Self {
         Self {
             day: game.day(),
             number: game::day_number(launch_date, game.day()),
+            section,
             ladder: game::ladder_seconds(),
             attempts: game.attempts(),
             status: game.status(),
             clip_seconds: f64::from(game.unlocked_ms()) / 1000.0,
             answer: game.is_finished().then_some(&song.answer),
+            stats,
         }
     }
 }
 
-/// The state of `game` as a response that also stores it in the cookie.
+/// One player's games in [`SECTION`], as the handlers need them: today's on
+/// its own, the rest for the stats.
+struct History {
+    /// Today's game: the stored one, or a fresh one when the player has made
+    /// no move today.
+    today: GameState,
+    /// The player's games on other days.
+    other_days: Vec<GameState>,
+}
+
+impl History {
+    /// The history of a player the server has not seen before: no games, and
+    /// nothing to ask the store for.
+    fn new(today: Date) -> Self {
+        Self {
+            today: GameState::new(today),
+            other_days: Vec::new(),
+        }
+    }
+
+    /// Reads the player's games from the store.
+    async fn load(app: &AppState, player: &PlayerId, today: Date) -> Result<Self, ApiError> {
+        let mut games = app
+            .store()
+            .games(player, SECTION)
+            .await
+            .map_err(store_failed)?;
+        let todays = games.iter().position(|game| game.day() == today);
+        Ok(Self {
+            today: todays.map_or_else(|| GameState::new(today), |index| games.remove(index)),
+            other_days: games,
+        })
+    }
+
+    /// The record these games make, as of the day of today's game.
+    fn stats(&self) -> Stats {
+        let games = self.other_days.iter().chain([&self.today]);
+        Stats::as_of(self.today.day(), games)
+    }
+}
+
+/// The player's game for `today`, when that is all a handler needs: the
+/// stored one, or a fresh one when they have made no move today.
+async fn todays_game(
+    app: &AppState,
+    player: &PlayerId,
+    today: Date,
+) -> Result<GameState, ApiError> {
+    let stored = app
+        .store()
+        .game(player, SECTION, today)
+        .await
+        .map_err(store_failed)?;
+    // The store answers for the day it was asked about; `for_day` makes sure
+    // that no backend's mistake turns another day's game into today's.
+    Ok(stored
+        .unwrap_or_else(|| GameState::new(today))
+        .for_day(today))
+}
+
+/// The state of today's game as a response, which also sets the player
+/// cookie again so that it lasts from this visit.
 fn game_response(
     app: &AppState,
     jar: PrivateCookieJar,
     headers: &HeaderMap,
-    game: &GameState,
+    player: &PlayerId,
+    history: &History,
     song: &Song,
-) -> Result<Response, ApiError> {
-    let view = DailyView::new(game, app.0.launch_date, song);
-    let jar = store_game(jar, game, is_https(headers))?;
-    Ok((jar, no_store(), Json(view)).into_response())
+) -> Response {
+    let view = DailyView::new(
+        &history.today,
+        SECTION,
+        history.stats(),
+        app.0.launch_date,
+        song,
+    );
+    let jar = player::remember(jar, player, headers);
+    (jar, no_store(), Json(view)).into_response()
 }
 
 async fn daily(
@@ -417,21 +375,36 @@ async fn daily(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let today = today_utc();
-    let game = load_game(&jar, today);
+    let known = player::known_player(&jar);
+    let history = match &known {
+        Some(player) => History::load(&app, player, today).await?,
+        // A new player has no games, so there is nothing to read; and the
+        // visit stores nothing, so there is nothing to write.
+        None => History::new(today),
+    };
     let song = app.song(today).await?;
-    game_response(&app, jar, &headers, &game, &song)
+    let player = known.unwrap_or_else(PlayerId::generate);
+    Ok(game_response(&app, jar, &headers, &player, &history, &song))
 }
 
 // --- GET /api/daily/audio -------------------------------------------------------
 
-/// The clip the session has unlocked: the leading frames of the preview, cut
+/// The clip the player has unlocked: the leading frames of the preview, cut
 /// by [`Mp3::prefix`](crate::mp3::Mp3::prefix), which also leaves out the tags.
+///
+/// The game is found through the player cookie. Without one it is a fresh
+/// game, so the shortest clip, and no cookie is set: listening is not a
+/// visit, and the page has asked for the daily state before it plays
+/// anything.
 ///
 /// There is no range support. A `Range` header gets the whole clip, which is
 /// what a plain `fetch` wants and all the client does.
 async fn audio(State(app): State<AppState>, jar: PrivateCookieJar) -> Result<Response, ApiError> {
     let today = today_utc();
-    let game = load_game(&jar, today);
+    let game = match player::known_player(&jar) {
+        Some(player) => todays_game(&app, &player, today).await?,
+        None => GameState::new(today),
+    };
     let song = app.song(today).await?;
     let clip = song.mp3.prefix(game.unlocked_ms());
     let headers = [
@@ -470,6 +443,21 @@ impl GuessRequest {
     }
 }
 
+/// What a guessed track is, asked of Deezer by its ID: the title and artist
+/// never come from the client, so a guess cannot be forged.
+async fn guessed_track(app: &AppState, track_id: u64) -> Result<TrackMeta, ApiError> {
+    match app.deezer().track_meta(track_id).await {
+        Ok(guessed) if !guessed.title.trim().is_empty() => Ok(guessed),
+        Ok(_) | Err(DeezerError::NotFound) => Err(ApiError::UnknownTrack),
+        Err(error) => {
+            tracing::warn!(%error, track_id, "could not look up a guessed track");
+            Err(ApiError::Upstream(
+                "Deezer did not answer, so the guess was not counted. Try again in a moment.",
+            ))
+        }
+    }
+}
+
 async fn guess(
     State(app): State<AppState>,
     jar: PrivateCookieJar,
@@ -484,34 +472,47 @@ async fn guess(
         ))?;
 
     let today = today_utc();
-    let mut game = load_game(&jar, today);
-    // Checked before anything is looked up: a finished game costs Deezer nothing.
-    if game.is_finished() {
+    let known = player::known_player(&jar);
+    // Checked before anything is looked up: a finished game costs Deezer
+    // nothing. It is only a first look; the check that counts is the one
+    // made under the lock below.
+    if let Some(player) = &known
+        && todays_game(&app, player, today).await?.is_finished()
+    {
         return Err(ApiError::Finished);
     }
+    let player = known.unwrap_or_else(PlayerId::generate);
+
+    // Everything slow happens here, before the player's turn is taken: the
+    // song (a download, the first time) and what the guessed track is.
     let song = app.song(today).await?;
-
-    let moved = match chosen {
-        Move::Skip => game.skip(),
-        Move::Guess(track_id) => {
-            // The title and artist come from Deezer by ID, never from the
-            // client, so a guess cannot be forged.
-            let guessed = match app.0.deezer.track_meta(track_id).await {
-                Ok(guessed) if !guessed.title.trim().is_empty() => guessed,
-                Ok(_) | Err(DeezerError::NotFound) => return Err(ApiError::UnknownTrack),
-                Err(error) => {
-                    tracing::warn!(%error, track_id, "could not look up a guessed track");
-                    return Err(ApiError::Upstream(
-                        "Deezer did not answer, so the guess was not counted. Try again in a moment.",
-                    ));
-                }
-            };
-            game.guess(&song.meta, &guessed)
-        }
+    let guessed = match chosen {
+        Move::Skip => None,
+        Move::Guess(track_id) => Some(guessed_track(&app, track_id).await?),
     };
-    moved.map_err(|GameError::Finished| ApiError::Finished)?;
 
-    game_response(&app, jar, &headers, &game, &song)
+    // The move itself: read the game, apply the move, store the result, as
+    // one critical section per player (see `MoveLocks` for why). Two moves
+    // sent at once are made one after the other, each on the game the one
+    // before it left, so each costs its own try and none is made on a game
+    // that has ended in the meantime.
+    let history = {
+        let _turn = app.move_locks().lock(&player).await;
+        let mut history = History::load(&app, &player, today).await?;
+        let game = &mut history.today;
+        let moved = match &guessed {
+            None => game.skip(),
+            Some(guessed) => game.guess(&song.meta, guessed),
+        };
+        moved.map_err(|GameError::Finished| ApiError::Finished)?;
+        app.store()
+            .save_game(&player, SECTION, game)
+            .await
+            .map_err(store_failed)?;
+        history
+    };
+
+    Ok(game_response(&app, jar, &headers, &player, &history, &song))
 }
 
 // --- GET /api/search ------------------------------------------------------------
@@ -598,21 +599,18 @@ async fn search(
 mod tests {
     use super::*;
     use crate::{
-        game::{FULL_CLIP_MS, LADDER_MS, TrackMeta},
+        game::{FULL_CLIP_MS, LADDER_MS},
         mp3::Mp3,
-        store::MemoryStore,
-        testutil::{ID3_MARKER, MockDeezer, MockTrack, PREVIEW_FRAMES, synthetic_mp3},
+        store::{Genre, Genres, MemoryStore, NewSong, PoolSong, SqliteStore},
+        testutil::{
+            BrokenStore, Harness, ID3_MARKER, LAUNCH, MockTrack, PREVIEW_FRAMES, Reply, lost_game,
+            playing_game, synthetic_mp3, won_game,
+        },
     };
-    use axum::{
-        body::Body,
-        http::{Method, Request},
-    };
+    use async_trait::async_trait;
+    use axum::{body::Body, http::Request};
     use jiff::civil::date;
     use serde_json::{Value, json};
-    use std::os::unix::fs::PermissionsExt;
-    use tower::ServiceExt;
-
-    const LAUNCH: Date = date(2026, 10, 1);
 
     /// The song being played. The ID is long so that it cannot turn up by
     /// chance in a `Content-Length` or in the cookie's ciphertext.
@@ -659,147 +657,33 @@ mod tests {
         tracks
     }
 
-    /// The router over a local Deezer stand-in and a temporary data directory.
-    struct Harness {
-        deezer: MockDeezer,
-        app: Router,
-        _data_dir: tempfile::TempDir,
+    /// The router over a local Deezer stand-in and an empty in-memory store.
+    async fn start() -> Harness {
+        Harness::start(tracks(), ANSWER_ID).await
     }
 
-    impl Harness {
-        async fn start() -> Self {
-            let deezer = MockDeezer::start(tracks()).await;
-            let data_dir = tempfile::tempdir().unwrap();
-            let client = deezer.client();
-            let daily = Daily::new(client.clone(), data_dir.path(), ANSWER_ID)
-                .with_retry_after(std::time::Duration::ZERO);
-            let store = Arc::new(MemoryStore::new());
-            let state = AppState::new(client, daily, store, LAUNCH, Key::generate());
-            Self {
-                deezer,
-                app: router(state),
-                _data_dir: data_dir,
-            }
-        }
-
-        fn player(&self) -> Player {
-            Player {
-                app: self.app.clone(),
-                cookie: None,
-            }
-        }
+    /// The anti-leak rule, as a check on one response: headers, cookie and
+    /// body together.
+    trait NoSecrets {
+        fn assert_no_secrets(&self);
     }
 
-    /// A browser: it keeps the session cookie between requests.
-    struct Player {
-        app: Router,
-        /// `gts_daily=<value>`, as last set by the server.
-        cookie: Option<String>,
-    }
-
-    struct Reply {
-        status: StatusCode,
-        headers: HeaderMap,
-        body: bytes::Bytes,
-    }
-
-    impl Reply {
-        fn json(&self) -> Value {
-            serde_json::from_slice(&self.body)
-                .unwrap_or_else(|error| panic!("not JSON ({error}): {:?}", self.body))
-        }
-
-        fn header(&self, name: header::HeaderName) -> &str {
-            self.headers
-                .get(&name)
-                .unwrap_or_else(|| panic!("no {name} header"))
-                .to_str()
-                .unwrap()
-        }
-
-        fn content_length(&self) -> usize {
-            self.header(header::CONTENT_LENGTH).parse().unwrap()
-        }
-
-        /// Everything a client can see of this response, as text.
-        fn visible(&self) -> String {
-            format!(
-                "{:?}\n{}",
-                self.headers,
-                String::from_utf8_lossy(&self.body)
-            )
-        }
-
-        fn assert_error(&self, status: StatusCode, code: &str) {
-            assert_eq!(self.status, status, "{}", self.visible());
-            let body = self.json();
-            assert_eq!(body["error"], code);
-            assert!(
-                body["message"].as_str().is_some_and(|m| !m.is_empty()),
-                "{body}"
-            );
-        }
-
+    impl NoSecrets for Reply {
         fn assert_no_secrets(&self) {
-            let visible = self.visible();
-            for secret in SECRETS {
-                assert!(
-                    !visible.contains(secret),
-                    "{secret:?} leaked in:\n{visible}"
-                );
-            }
+            self.assert_lacks(&SECRETS);
         }
     }
 
-    impl Player {
-        async fn send(&mut self, mut request: Request<Body>) -> Reply {
-            if let Some(cookie) = &self.cookie {
-                request
-                    .headers_mut()
-                    .insert(header::COOKIE, cookie.parse().unwrap());
-            }
-            let response = self.app.clone().oneshot(request).await.unwrap();
-            let (parts, body) = response.into_parts();
-            let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
-            for set in parts.headers.get_all(header::SET_COOKIE) {
-                let pair = set.to_str().unwrap().split(';').next().unwrap();
-                if pair.starts_with(COOKIE_NAME) {
-                    self.cookie = Some(pair.to_owned());
-                }
-            }
-            Reply {
-                status: parts.status,
-                headers: parts.headers,
-                body,
-            }
-        }
-
-        async fn get(&mut self, uri: &str) -> Reply {
-            self.send(Request::get(uri).body(Body::empty()).unwrap())
-                .await
-        }
-
-        async fn post(&mut self, body: Value) -> Reply {
-            self.post_raw("application/json", body.to_string()).await
-        }
-
-        async fn post_raw(&mut self, content_type: &str, body: impl Into<Body>) -> Reply {
-            let request = Request::builder()
-                .method(Method::POST)
-                .uri("/api/daily/guess")
-                .header(header::CONTENT_TYPE, content_type)
-                .body(body.into())
-                .unwrap();
-            self.send(request).await
-        }
-
-        async fn skip(&mut self) -> Reply {
-            self.post(json!({ "skip": true })).await
-        }
-
-        async fn guess(&mut self, track_id: u64) -> Reply {
-            self.post(json!({ "trackId": track_id })).await
-        }
+    /// The record of a player who has finished no game.
+    fn no_stats() -> Value {
+        json!({
+            "played": 0,
+            "won": 0,
+            "winPercent": 0,
+            "currentStreak": 0,
+            "bestStreak": 0,
+            "guessDistribution": [0, 0, 0, 0, 0, 0, 0],
+        })
     }
 
     fn reference_mp3() -> Mp3 {
@@ -810,15 +694,15 @@ mod tests {
 
     #[tokio::test]
     async fn health_still_answers() {
-        let harness = Harness::start().await;
+        let harness = start().await;
         let reply = harness.player().get("/api/health").await;
         assert_eq!(reply.status, StatusCode::OK);
         assert_eq!(reply.json(), json!({ "ok": true }));
     }
 
     #[tokio::test]
-    async fn a_first_visit_gets_a_fresh_game_and_a_cookie() {
-        let harness = Harness::start().await;
+    async fn a_first_visit_gets_a_fresh_game_and_an_empty_record() {
+        let harness = start().await;
         let mut player = harness.player();
         let reply = player.get("/api/daily").await;
 
@@ -829,91 +713,701 @@ mod tests {
             json!({
                 "day": today.to_string(),
                 "number": game::day_number(LAUNCH, today),
+                "section": "general",
                 "ladder": [0.1, 0.3, 1.0, 3.0, 8.0, 16.0, 30.0],
                 "attempts": [],
                 "status": "playing",
                 "clipSeconds": 0.1,
                 "answer": null,
+                "stats": no_stats(),
             })
         );
         assert_eq!(reply.header(header::CACHE_CONTROL), "no-store");
-
-        let cookie = reply.header(header::SET_COOKIE);
-        assert!(cookie.starts_with("gts_daily="), "{cookie}");
-        for attribute in ["HttpOnly", "SameSite=Lax", "Path=/", "Max-Age=172800"] {
-            assert!(cookie.contains(attribute), "{attribute} missing: {cookie}");
-        }
-        // Plain HTTP (the dev server): a `Secure` cookie would be dropped.
-        assert!(!cookie.contains("Secure"), "{cookie}");
-        // Encrypted: the state is not readable in the cookie.
-        assert!(!cookie.contains("playing"), "{cookie}");
-        assert!(!cookie.contains("attempts"), "{cookie}");
+        // The cookie that comes with it is `player::tests`' subject; here it
+        // only matters that it gives nothing away.
+        assert!(reply.header(header::SET_COOKIE).starts_with("gts_player="));
         reply.assert_no_secrets();
     }
 
     #[tokio::test]
-    async fn the_cookie_is_secure_behind_https() {
-        let harness = Harness::start().await;
+    async fn a_visit_stores_nothing_and_the_first_move_stores_the_game() {
+        let harness = start().await;
+        let today = today_utc();
         let mut player = harness.player();
-        let request = Request::get("/api/daily")
-            .header("x-forwarded-proto", "https")
-            .body(Body::empty())
-            .unwrap();
-        let reply = player.send(request).await;
-        assert!(
-            reply.header(header::SET_COOKIE).contains("Secure"),
-            "{}",
-            reply.visible()
+
+        // Looking, reloading and listening are not moves.
+        player.get("/api/daily").await;
+        player.get("/api/daily").await;
+        player.get("/api/daily/audio").await;
+        let id = harness.player_id(&player).unwrap();
+        let store = &harness.store;
+        assert_eq!(
+            store.game(&id, Section::General, today).await.unwrap(),
+            None
+        );
+        assert_eq!(
+            store.games(&id, Section::General).await.unwrap(),
+            Vec::new()
+        );
+
+        // A request that is not a valid move stores nothing either.
+        player.post(json!({})).await;
+        player.guess(UNKNOWN_ID).await;
+        assert_eq!(
+            store.games(&id, Section::General).await.unwrap(),
+            Vec::new()
+        );
+
+        // The first move does, under the General section and today's date.
+        player.skip().await;
+        assert_eq!(harness.player_id(&player), Some(id.clone()));
+        assert_eq!(
+            store.games(&id, Section::General).await.unwrap(),
+            vec![playing_game(today, 1)]
+        );
+        for genre in Genre::ALL {
+            assert_eq!(store.games(&id, genre.into()).await.unwrap(), Vec::new());
+        }
+
+        // Each later move replaces that one game; a visit changes nothing.
+        player.skip().await;
+        player.get("/api/daily").await;
+        assert_eq!(
+            store.games(&id, Section::General).await.unwrap(),
+            vec![playing_game(today, 2)]
         );
     }
 
     #[tokio::test]
-    async fn a_garbage_cookie_is_a_fresh_game() {
-        let harness = Harness::start().await;
+    async fn a_first_move_without_a_visit_starts_the_game_and_issues_the_cookie() {
+        let harness = start().await;
         let mut player = harness.player();
-        player.skip().await;
-        let real = player.cookie.clone().unwrap();
 
-        // Not a cookie this server made, then a real one with its end cut off.
-        for garbage in [
-            "gts_daily=not-even-base64!!".to_owned(),
-            "gts_daily=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
-            real[..real.len() - 6].to_owned(),
-        ] {
-            player.cookie = Some(garbage.clone());
-            let reply = player.get("/api/daily").await;
-            assert_eq!(reply.status, StatusCode::OK, "{garbage}");
-            let body = reply.json();
-            assert_eq!(body["attempts"], json!([]), "{garbage}");
-            assert_eq!(body["status"], "playing");
-            // And it is replaced by a good one.
-            assert_ne!(player.cookie.as_deref(), Some(garbage.as_str()));
-        }
+        let reply = player.skip().await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(reply.json()["attempts"], json!([{ "kind": "skip" }]));
+        reply.assert_no_secrets();
 
-        // The untouched cookie still holds the skip.
-        player.cookie = Some(real);
+        // The cookie from that response finds the game again.
+        let id = harness.player_id(&player).unwrap();
         let body = player.get("/api/daily").await.json();
         assert_eq!(body["attempts"], json!([{ "kind": "skip" }]));
+        assert_eq!(harness.player_id(&player), Some(id));
+    }
+
+    // --- the game is the player's, in the store ---------------------------------
+
+    #[tokio::test]
+    async fn moves_are_found_again_with_nothing_but_the_id_cookie() {
+        let harness = start().await;
+        let mut player = harness.player();
+        player.skip().await;
+        let wrong = player.guess(QUEEN).await.json();
+        let id = harness.player_id(&player).unwrap();
+
+        // Another browser object holding a cookie for the same ID, made from
+        // the ID alone: all it carries is who the player is.
+        let mut elsewhere = harness.player_with_id(&id);
+        assert_eq!(elsewhere.get("/api/daily").await.json(), wrong);
+        let clip = elsewhere.get("/api/daily/audio").await;
+        assert_eq!(clip.body, reference_mp3().prefix(1_000));
+
+        // And a move made there is seen here.
+        elsewhere.skip().await;
+        let body = player.get("/api/daily").await.json();
+        assert_eq!(body["attempts"].as_array().unwrap().len(), 3);
+        assert_eq!(body["clipSeconds"], 3.0);
     }
 
     #[tokio::test]
-    async fn another_players_key_does_not_decrypt_the_cookie() {
-        let first = Harness::start().await;
-        let second = Harness::start().await;
-        let mut player = first.player();
-        player.skip().await;
+    async fn replaying_an_old_cookie_does_not_take_moves_back() {
+        let harness = start().await;
+        let mut player = harness.player();
+        player.get("/api/daily").await;
+        // The cookie as it was before any move. When the game lived in the
+        // cookie, sending this one again undid every attempt.
+        let before_any_move = player.cookie.clone();
 
-        // The same cookie, sent to a server with a different key.
-        player.app = second.app.clone();
-        let body = player.get("/api/daily").await.json();
+        player.skip().await;
+        player.guess(QUEEN).await;
+        let after_two = player.get("/api/daily").await.json();
+        assert_eq!(after_two["attempts"].as_array().unwrap().len(), 2);
+
+        player.cookie = before_any_move.clone();
+        let replayed = player.get("/api/daily").await;
+        assert_eq!(replayed.json(), after_two);
+        replayed.assert_no_secrets();
+        player.cookie = before_any_move.clone();
+        let clip = player.get("/api/daily/audio").await;
+        assert_eq!(clip.body, reference_mp3().prefix(1_000));
+
+        // A move sent with the old cookie is the third, not the first again.
+        player.cookie = before_any_move.clone();
+        let body = player.skip().await.json();
+        assert_eq!(body["attempts"].as_array().unwrap().len(), 3);
+        assert_eq!(body["clipSeconds"], 3.0);
+
+        // Nor does it reopen a game that is over.
+        for _ in 0..MAX_ATTEMPTS - 3 {
+            player.skip().await;
+        }
+        player.cookie = before_any_move;
+        assert_eq!(player.get("/api/daily").await.json()["status"], "lost");
+        player
+            .skip()
+            .await
+            .assert_error(StatusCode::CONFLICT, "finished");
+    }
+
+    #[tokio::test]
+    async fn two_players_do_not_see_each_others_games() {
+        let harness = start().await;
+        let mut first = harness.player();
+        let mut second = harness.player();
+
+        first.skip().await;
+        first.guess(QUEEN).await;
+        let reply = second.get("/api/daily").await;
+        assert_eq!(reply.json()["attempts"], json!([]));
+        assert_eq!(reply.json()["clipSeconds"], 0.1);
+        assert_eq!(
+            second.get("/api/daily/audio").await.content_length(),
+            8 * 418
+        );
+
+        // One winning tells the other nothing.
+        assert_eq!(first.guess(ANSWER_ID).await.json()["status"], "won");
+        let reply = second.skip().await;
+        let body = reply.json();
+        assert_eq!(body["status"], "playing");
+        assert_eq!(body["attempts"], json!([{ "kind": "skip" }]));
+        assert_eq!(body["answer"], Value::Null);
+        assert_eq!(body["stats"], no_stats());
+        reply.assert_no_secrets();
+
+        let body = first.get("/api/daily").await.json();
+        assert_eq!(body["status"], "won");
+        assert_eq!(body["attempts"].as_array().unwrap().len(), 2);
+        assert_ne!(harness.player_id(&first), harness.player_id(&second));
+    }
+
+    #[tokio::test]
+    async fn yesterdays_game_does_not_carry_over() {
+        let harness = start().await;
+        let today = today_utc();
+        let yesterday = today.yesterday().unwrap();
+        let mut player = harness.player();
+        player.get("/api/daily").await;
+        let id = harness.player_id(&player).unwrap();
+        let store = &harness.store;
+
+        // Lost yesterday, with every clip unlocked and the answer shown.
+        store
+            .save_game(&id, Section::General, &lost_game(yesterday))
+            .await
+            .unwrap();
+
+        let reply = player.get("/api/daily").await;
+        let body = reply.json();
+        assert_eq!(body["day"], today.to_string());
+        assert_eq!(body["status"], "playing");
         assert_eq!(body["attempts"], json!([]));
+        assert_eq!(body["clipSeconds"], 0.1);
+        assert_eq!(body["answer"], Value::Null);
+        reply.assert_no_secrets();
+        assert_eq!(
+            player.get("/api/daily/audio").await.content_length(),
+            8 * 418
+        );
+
+        // It is in the record, though, and it stays as it was when today's
+        // game is played.
+        assert_eq!(body["stats"]["played"], 1);
+        assert_eq!(body["stats"]["won"], 0);
+        let body = player.skip().await.json();
+        assert_eq!(body["attempts"], json!([{ "kind": "skip" }]));
+        assert_eq!(
+            store.games(&id, Section::General).await.unwrap(),
+            vec![lost_game(yesterday), playing_game(today, 1)]
+        );
+
+        // The same for a game still open yesterday: its attempts are not
+        // today's, and a game dated tomorrow is not today's either.
+        let other = PlayerId::generate();
+        for game in [
+            playing_game(yesterday, 5),
+            won_game(today.tomorrow().unwrap(), 0),
+        ] {
+            store
+                .save_game(&other, Section::General, &game)
+                .await
+                .unwrap();
+        }
+        let body = harness
+            .player_with_id(&other)
+            .get("/api/daily")
+            .await
+            .json();
+        assert_eq!(body["attempts"], json!([]));
+        assert_eq!(body["status"], "playing");
+        assert_eq!(body["stats"], no_stats());
+    }
+
+    #[tokio::test]
+    async fn a_game_in_another_section_is_not_this_one() {
+        let harness = start().await;
+        let today = today_utc();
+        let id = PlayerId::generate();
+        // Until the sections have routes, everything is played in General;
+        // what is stored under a genre is another game.
+        for genre in Genre::ALL {
+            harness
+                .store
+                .save_game(&id, genre.into(), &won_game(today, 0))
+                .await
+                .unwrap();
+        }
+
+        let mut player = harness.player_with_id(&id);
+        let reply = player.get("/api/daily").await;
+        let body = reply.json();
+        assert_eq!(body["section"], "general");
+        assert_eq!(body["status"], "playing");
+        assert_eq!(body["stats"], no_stats());
+        reply.assert_no_secrets();
+    }
+
+    // --- stats --------------------------------------------------------------
+
+    #[tokio::test]
+    async fn the_record_is_worked_out_from_the_stored_games() {
+        let harness = start().await;
+        let today = today_utc();
+        let ago = |days: i64| today.checked_sub(jiff::Span::new().days(days)).unwrap();
+        let id = PlayerId::generate();
+        let store = &harness.store;
+        for game in [
+            won_game(ago(6), 0),
+            lost_game(ago(5)),
+            won_game(ago(3), 2),
+            won_game(ago(2), 2),
+            won_game(ago(1), 6),
+        ] {
+            store.save_game(&id, Section::General, &game).await.unwrap();
+        }
+        let mut player = harness.player_with_id(&id);
+
+        // Before today's game: the streak ran through yesterday and stands.
+        let reply = player.get("/api/daily").await;
+        assert_eq!(
+            reply.json()["stats"],
+            json!({
+                "played": 5,
+                "won": 4,
+                "winPercent": 80,
+                "currentStreak": 3,
+                "bestStreak": 3,
+                "guessDistribution": [1, 0, 2, 0, 0, 0, 1],
+            })
+        );
+        reply.assert_no_secrets();
+
+        // While playing it does not move.
+        let reply = player.skip().await;
+        let body = reply.json();
+        assert_eq!(body["status"], "playing");
+        assert_eq!(body["stats"]["played"], 5);
+        assert_eq!(body["stats"]["currentStreak"], 3);
+        reply.assert_no_secrets();
+
+        // A win on the second try is in the response to the winning guess.
+        let body = player.guess(ANSWER_ID).await.json();
+        assert_eq!(body["status"], "won");
+        let won = json!({
+            "played": 6,
+            "won": 5,
+            "winPercent": 83,
+            "currentStreak": 4,
+            "bestStreak": 4,
+            "guessDistribution": [1, 1, 2, 0, 0, 0, 1],
+        });
+        assert_eq!(body["stats"], won);
+        // And in every later look at the day.
+        assert_eq!(player.get("/api/daily").await.json()["stats"], won);
+    }
+
+    #[tokio::test]
+    async fn a_loss_ends_the_streak_and_counts_as_played() {
+        let harness = start().await;
+        let today = today_utc();
+        let id = PlayerId::generate();
+        for game in [
+            won_game(today.yesterday().unwrap().yesterday().unwrap(), 1),
+            won_game(today.yesterday().unwrap(), 1),
+        ] {
+            harness
+                .store
+                .save_game(&id, Section::General, &game)
+                .await
+                .unwrap();
+        }
+        let mut player = harness.player_with_id(&id);
+        for _ in 0..MAX_ATTEMPTS - 1 {
+            let body = player.skip().await.json();
+            assert_eq!(body["stats"]["currentStreak"], 2);
+        }
+
+        let body = player.skip().await.json();
+        assert_eq!(body["status"], "lost");
+        assert_eq!(
+            body["stats"],
+            json!({
+                "played": 3,
+                "won": 2,
+                "winPercent": 67,
+                "currentStreak": 0,
+                "bestStreak": 2,
+                "guessDistribution": [0, 2, 0, 0, 0, 0, 0],
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_players_first_win_is_a_streak_of_one() {
+        let harness = start().await;
+        let mut player = harness.player();
+        let body = player.guess(ANSWER_ID).await.json();
+        assert_eq!(body["status"], "won");
+        assert_eq!(
+            body["stats"],
+            json!({
+                "played": 1,
+                "won": 1,
+                "winPercent": 100,
+                "currentStreak": 1,
+                "bestStreak": 1,
+                "guessDistribution": [1, 0, 0, 0, 0, 0, 0],
+            })
+        );
+    }
+
+    // --- two moves at once --------------------------------------------------
+
+    /// A store that gives way to other tasks in the middle of every game
+    /// operation, as a database on the network would: between a handler's
+    /// read and its write, every other request gets to run.
+    struct Unhurried(MemoryStore);
+
+    #[async_trait]
+    impl Store for Unhurried {
+        async fn songs(&self) -> Result<Vec<PoolSong>, StoreError> {
+            self.0.songs().await
+        }
+        async fn song(&self, track_id: u64) -> Result<Option<PoolSong>, StoreError> {
+            self.0.song(track_id).await
+        }
+        async fn add_song(&self, song: NewSong, genres: Genres) -> Result<PoolSong, StoreError> {
+            self.0.add_song(song, genres).await
+        }
+        async fn set_song_genres(
+            &self,
+            track_id: u64,
+            genres: Genres,
+        ) -> Result<Option<PoolSong>, StoreError> {
+            self.0.set_song_genres(track_id, genres).await
+        }
+        async fn remove_song(&self, track_id: u64) -> Result<bool, StoreError> {
+            self.0.remove_song(track_id).await
+        }
+        async fn set_preview_failed_on(
+            &self,
+            track_id: u64,
+            day: Option<Date>,
+        ) -> Result<bool, StoreError> {
+            self.0.set_preview_failed_on(track_id, day).await
+        }
+        async fn game(
+            &self,
+            player: &PlayerId,
+            section: Section,
+            day: Date,
+        ) -> Result<Option<GameState>, StoreError> {
+            let game = self.0.game(player, section, day).await;
+            tokio::task::yield_now().await;
+            game
+        }
+        async fn save_game(
+            &self,
+            player: &PlayerId,
+            section: Section,
+            game: &GameState,
+        ) -> Result<(), StoreError> {
+            tokio::task::yield_now().await;
+            self.0.save_game(player, section, game).await
+        }
+        async fn games(
+            &self,
+            player: &PlayerId,
+            section: Section,
+        ) -> Result<Vec<GameState>, StoreError> {
+            let games = self.0.games(player, section).await;
+            tokio::task::yield_now().await;
+            games
+        }
+        async fn delete_player(&self, player: &PlayerId) -> Result<usize, StoreError> {
+            tokio::task::yield_now().await;
+            self.0.delete_player(player).await
+        }
+    }
+
+    /// Sends every request in `moves` at the same moment, each from its own
+    /// task and all as the player `id`, and returns the replies in order.
+    async fn all_at_once(harness: &Harness, id: &PlayerId, moves: Vec<Value>) -> Vec<Reply> {
+        let requests: Vec<_> = moves
+            .into_iter()
+            .map(|body| {
+                let mut player = harness.player_with_id(id);
+                tokio::spawn(async move { player.post(body).await })
+            })
+            .collect();
+        let mut replies = Vec::new();
+        for request in requests {
+            replies.push(request.await.unwrap());
+        }
+        replies
+    }
+
+    #[tokio::test]
+    async fn moves_sent_at_once_each_cost_a_try() {
+        let harness =
+            Harness::with_store(tracks(), ANSWER_ID, Arc::new(Unhurried(MemoryStore::new()))).await;
+        let today = today_utc();
+        let id = PlayerId::generate();
+        // Load the song first, so that the requests meet at the store.
+        harness.player_with_id(&id).get("/api/daily").await;
+
+        // Three wrong guesses and two skips, all read before any is written
+        // if nothing keeps them apart. Then they would all store "one
+        // attempt", and five tries would have cost one.
+        let moves = vec![
+            json!({ "trackId": QUEEN }),
+            json!({ "skip": true }),
+            json!({ "trackId": 100 }),
+            json!({ "trackId": 101 }),
+            json!({ "skip": true }),
+        ];
+        let replies = all_at_once(&harness, &id, moves).await;
+
+        // Each was made on the game the one before it left: the replies show
+        // one to five attempts, each exactly once.
+        let mut counts: Vec<usize> = replies
+            .iter()
+            .map(|reply| {
+                assert_eq!(reply.status, StatusCode::OK, "{}", reply.visible());
+                reply.assert_no_secrets();
+                reply.json()["attempts"].as_array().unwrap().len()
+            })
+            .collect();
+        counts.sort_unstable();
+        assert_eq!(counts, vec![1, 2, 3, 4, 5]);
+
+        let stored = harness
+            .store
+            .game(&id, Section::General, today)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.attempts().len(), 5);
+        let body = harness.player_with_id(&id).get("/api/daily").await.json();
+        assert_eq!(body["attempts"].as_array().unwrap().len(), 5);
+        assert_eq!(body["clipSeconds"], 16.0);
+    }
+
+    #[tokio::test]
+    async fn more_moves_at_once_than_tries_left_end_the_game_and_no_more() {
+        let harness =
+            Harness::with_store(tracks(), ANSWER_ID, Arc::new(Unhurried(MemoryStore::new()))).await;
+        let id = PlayerId::generate();
+        harness.player_with_id(&id).get("/api/daily").await;
+
+        // Ten skips. All of them pass the first look ("not finished yet");
+        // the look that counts is the one each takes on its turn.
+        let replies = all_at_once(&harness, &id, vec![json!({ "skip": true }); 10]).await;
+
+        let made = replies
+            .iter()
+            .filter(|reply| reply.status == StatusCode::OK)
+            .count();
+        assert_eq!(made, MAX_ATTEMPTS);
+        for reply in replies
+            .iter()
+            .filter(|reply| reply.status != StatusCode::OK)
+        {
+            reply.assert_error(StatusCode::CONFLICT, "finished");
+        }
+        let lost = replies
+            .iter()
+            .filter(|reply| reply.status == StatusCode::OK && reply.json()["status"] == "lost")
+            .count();
+        assert_eq!(lost, 1);
+
+        let body = harness.player_with_id(&id).get("/api/daily").await.json();
+        assert_eq!(body["status"], "lost");
+        assert_eq!(body["attempts"].as_array().unwrap().len(), MAX_ATTEMPTS);
+        assert_eq!(body["stats"]["played"], 1);
+    }
+
+    #[tokio::test]
+    async fn a_win_and_a_miss_at_once_do_not_overwrite_each_other() {
+        let harness =
+            Harness::with_store(tracks(), ANSWER_ID, Arc::new(Unhurried(MemoryStore::new()))).await;
+        let id = PlayerId::generate();
+        harness.player_with_id(&id).get("/api/daily").await;
+
+        let moves = vec![json!({ "skip": true }), json!({ "trackId": ANSWER_ID })];
+        let replies = all_at_once(&harness, &id, moves).await;
+
+        // Whichever came second was made on the result of the first: either
+        // the skip and then the win, or the win and then a refused skip.
+        // Never a won game turned back into one that is being played.
+        let body = harness.player_with_id(&id).get("/api/daily").await.json();
+        assert_eq!(body["status"], "won");
+        assert_eq!(replies[1].json()["status"], "won");
+        match replies[0].status {
+            StatusCode::OK => assert_eq!(body["attempts"], json!([{ "kind": "skip" }])),
+            _ => {
+                replies[0].assert_error(StatusCode::CONFLICT, "finished");
+                assert_eq!(body["attempts"], json!([]));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn different_players_moving_at_once_keep_their_own_games() {
+        let harness =
+            Harness::with_store(tracks(), ANSWER_ID, Arc::new(Unhurried(MemoryStore::new()))).await;
+        harness.get("/api/daily").await;
+        let ids: Vec<PlayerId> = (0..8).map(|_| PlayerId::generate()).collect();
+
+        // Player n skips n times, everybody at the same moment.
+        let mut requests = Vec::new();
+        for (n, id) in ids.iter().enumerate() {
+            for _ in 0..n {
+                let mut player = harness.player_with_id(id);
+                requests.push(tokio::spawn(async move { player.skip().await }));
+            }
+        }
+        for request in requests {
+            assert_eq!(request.await.unwrap().status, StatusCode::OK);
+        }
+
+        for (n, id) in ids.iter().enumerate() {
+            let body = harness.player_with_id(id).get("/api/daily").await.json();
+            assert_eq!(body["attempts"].as_array().unwrap().len(), n, "player {n}");
+        }
+    }
+
+    // --- the store behind the game ------------------------------------------
+
+    #[tokio::test]
+    async fn a_store_failure_is_an_internal_error_with_a_fixed_message() {
+        let harness = Harness::with_store(tracks(), ANSWER_ID, Arc::new(BrokenStore)).await;
+        let mut player = harness.player_with_id(&PlayerId::generate());
+
+        for reply in [
+            player.get("/api/daily").await,
+            player.get("/api/daily/audio").await,
+            player.skip().await,
+            player.guess(QUEEN).await,
+        ] {
+            reply.assert_error(StatusCode::INTERNAL_SERVER_ERROR, "internal");
+            reply.assert_lacks(&["fire", "needledrop.db"]);
+            reply.assert_no_secrets();
+            // No new identity is handed out over a failure.
+            assert!(reply.headers.get(header::SET_COOKIE).is_none());
+        }
+        // The game was looked for before the guess was looked up.
+        assert_eq!(harness.deezer.api_hits(), 0);
+
+        // A browser without a cookie has no games to read, so looking and
+        // listening work; its first move cannot be stored and fails.
+        let mut stranger = harness.player();
+        let reply = stranger.get("/api/daily").await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(reply.json()["stats"], no_stats());
+        assert_eq!(harness.get("/api/daily/audio").await.status, StatusCode::OK);
+        let reply = harness.player().skip().await;
+        reply.assert_error(StatusCode::INTERNAL_SERVER_ERROR, "internal");
+        reply.assert_no_secrets();
+        assert!(reply.headers.get(header::SET_COOKIE).is_none());
+    }
+
+    #[tokio::test]
+    async fn the_game_is_the_same_over_the_sqlite_store_and_outlives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("needledrop.db");
+        let today = today_utc();
+
+        let store = Arc::new(SqliteStore::open(&path).unwrap());
+        let harness = Harness::with_store(tracks(), ANSWER_ID, store).await;
+        let mut player = harness.player();
+        assert_eq!(player.get("/api/daily").await.json()["stats"], no_stats());
+        player.skip().await;
+        let reply = player.guess(QUEEN).await;
+        reply.assert_no_secrets();
+        let before = reply.json();
+        assert_eq!(
+            before["attempts"],
+            json!([
+                { "kind": "skip" },
+                { "kind": "wrong", "title": "Under Pressure", "artist": "Queen" },
+            ])
+        );
+        let id = harness.player_id(&player).unwrap();
+        // An earlier day, for the record.
+        harness
+            .store
+            .save_game(
+                &id,
+                Section::General,
+                &won_game(today.yesterday().unwrap(), 4),
+            )
+            .await
+            .unwrap();
+        drop(harness);
+
+        // A new process over the same file. (Its cookie key is another one,
+        // which a real restart keeps; the ID is what matters here.)
+        let store = Arc::new(SqliteStore::open(&path).unwrap());
+        let restarted = Harness::with_store(tracks(), ANSWER_ID, store).await;
+        let mut player = restarted.player_with_id(&id);
+        let body = player.get("/api/daily").await.json();
+        assert_eq!(body["attempts"], before["attempts"]);
+        assert_eq!(body["clipSeconds"], 1.0);
+        assert_eq!(body["stats"]["played"], 1);
+        assert_eq!(body["stats"]["currentStreak"], 1);
+
+        let body = player.guess(ANSWER_ID).await.json();
+        assert_eq!(body["status"], "won");
+        assert_eq!(body["stats"]["currentStreak"], 2);
+        assert_eq!(
+            body["stats"]["guessDistribution"],
+            json!([0, 0, 1, 0, 1, 0, 0])
+        );
+
+        // Clear my data empties the file's games for that player.
+        assert_eq!(player.clear().await.status, StatusCode::NO_CONTENT);
+        assert_eq!(
+            restarted.store.games(&id, Section::General).await.unwrap(),
+            Vec::new()
+        );
     }
 
     // --- moves --------------------------------------------------------------
 
     #[tokio::test]
     async fn each_skip_adds_an_attempt_and_unlocks_a_longer_clip() {
-        let harness = Harness::start().await;
+        let harness = start().await;
         let mut player = harness.player();
         let mp3 = reference_mp3();
         let mut lengths = Vec::new();
@@ -956,7 +1450,7 @@ mod tests {
 
     #[tokio::test]
     async fn seven_misses_lose_and_reveal_the_answer() {
-        let harness = Harness::start().await;
+        let harness = start().await;
         let mut player = harness.player();
         for _ in 0..MAX_ATTEMPTS - 1 {
             player.skip().await;
@@ -977,7 +1471,7 @@ mod tests {
         assert_eq!(body["attempts"].as_array().unwrap().len(), MAX_ATTEMPTS);
         assert_eq!(body["answer"], expected_answer);
 
-        // The cookie remembers it: a reload shows the same finished game.
+        // The store remembers it: a reload shows the same finished game.
         assert_eq!(player.get("/api/daily").await.json(), body);
 
         let clip = player.get("/api/daily/audio").await;
@@ -987,7 +1481,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_move_after_the_end_is_a_conflict() {
-        let harness = Harness::start().await;
+        let harness = start().await;
         let mut player = harness.player();
         for _ in 0..MAX_ATTEMPTS {
             player.skip().await;
@@ -1015,7 +1509,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_wrong_guess_is_recorded_with_the_servers_title_and_artist() {
-        let harness = Harness::start().await;
+        let harness = start().await;
         let mut player = harness.player();
 
         // Extra fields a client might add to forge the attempt are ignored.
@@ -1039,7 +1533,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_right_song_wins_whatever_release_was_picked() {
-        let harness = Harness::start().await;
+        let harness = start().await;
 
         for track_id in [ANSWER_ID, ANSWER_OTHER_RELEASE] {
             let mut player = harness.player();
@@ -1065,7 +1559,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_guess_picked_from_search_needs_no_second_lookup() {
-        let harness = Harness::start().await;
+        let harness = start().await;
         let mut player = harness.player();
         player.get("/api/daily").await;
         player.get("/api/search?q=under+pressure").await;
@@ -1078,7 +1572,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unknown_track_is_not_found_and_costs_no_turn() {
-        let harness = Harness::start().await;
+        let harness = start().await;
         let mut player = harness.player();
         player.skip().await;
 
@@ -1092,7 +1586,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_moves_are_bad_requests() {
-        let harness = Harness::start().await;
+        let harness = start().await;
         let mut player = harness.player();
 
         for body in [
@@ -1111,6 +1605,8 @@ mod tests {
             reply.assert_no_secrets();
             assert!(reply.headers.get(header::SET_COOKIE).is_none(), "{body}");
         }
+        // Not even a player was made of it.
+        assert_eq!(player.cookie, None);
         player
             .post_raw("application/json", "{not json")
             .await
@@ -1131,7 +1627,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_deezer_failure_during_a_guess_is_an_upstream_error() {
-        let harness = Harness::start().await;
+        let harness = start().await;
         let mut player = harness.player();
         player.get("/api/daily").await;
 
@@ -1149,7 +1645,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_song_that_cannot_be_loaded_is_an_upstream_error_until_deezer_is_back() {
-        let harness = Harness::start().await;
+        let harness = start().await;
         let mut player = harness.player();
         harness.deezer.set_failing(true);
 
@@ -1170,7 +1666,7 @@ mod tests {
 
     #[tokio::test]
     async fn audio_without_a_cookie_is_the_shortest_clip() {
-        let harness = Harness::start().await;
+        let harness = start().await;
         let mut player = harness.player();
         let clip = player.get("/api/daily/audio?t=1727740800000").await;
 
@@ -1193,7 +1689,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_range_request_gets_the_whole_clip_and_no_more() {
-        let harness = Harness::start().await;
+        let harness = start().await;
         let mut player = harness.player();
         let request = Request::get("/api/daily/audio")
             .header(header::RANGE, "bytes=100000-")
@@ -1209,7 +1705,7 @@ mod tests {
 
     #[tokio::test]
     async fn short_queries_do_not_reach_deezer() {
-        let harness = Harness::start().await;
+        let harness = start().await;
         let mut player = harness.player();
         for uri in [
             "/api/search",
@@ -1227,7 +1723,7 @@ mod tests {
 
     #[tokio::test]
     async fn search_maps_and_deduplicates_the_results() {
-        let harness = Harness::start().await;
+        let harness = start().await;
         let mut player = harness.player();
 
         let reply = player.get("/api/search?q=%20Under%20%20PRESSURE%20").await;
@@ -1263,7 +1759,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_search_is_an_upstream_error() {
-        let harness = Harness::start().await;
+        let harness = start().await;
         harness.deezer.set_failing(true);
         harness
             .player()
@@ -1274,7 +1770,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_routes_are_json_errors() {
-        let harness = Harness::start().await;
+        let harness = start().await;
         harness
             .player()
             .get("/api/nope")
@@ -1341,6 +1837,12 @@ mod tests {
         Song::new(&track, Mp3::parse(synthetic_mp3(20)).unwrap())
     }
 
+    /// The view of a player's only game, in the General section.
+    fn view_of<'a>(game: &'a GameState, song: &'a Song) -> DailyView<'a> {
+        let stats = Stats::as_of(game.day(), [game]);
+        DailyView::new(game, Section::General, stats, LAUNCH, song)
+    }
+
     #[test]
     fn the_view_has_no_answer_while_playing() {
         let song = song();
@@ -1350,13 +1852,15 @@ mod tests {
         game.guess(&song.meta, &TrackMeta::new("Under Pressure", "", "Queen"))
             .unwrap();
 
-        let view = DailyView::new(&game, LAUNCH, &song);
+        let stats = Stats::as_of(today, [&won_game(date(2026, 10, 2), 1), &game]);
+        let view = DailyView::new(&game, Section::Genre(Genre::HipHop), stats, LAUNCH, &song);
         let json = serde_json::to_value(&view).unwrap();
         assert_eq!(
             json,
             json!({
                 "day": "2026-10-03",
                 "number": 3,
+                "section": "hip-hop",
                 "ladder": [0.1, 0.3, 1.0, 3.0, 8.0, 16.0, 30.0],
                 "attempts": [
                     { "kind": "skip" },
@@ -1365,6 +1869,14 @@ mod tests {
                 "status": "playing",
                 "clipSeconds": 1.0,
                 "answer": null,
+                "stats": {
+                    "played": 1,
+                    "won": 1,
+                    "winPercent": 100,
+                    "currentStreak": 1,
+                    "bestStreak": 1,
+                    "guessDistribution": [0, 1, 0, 0, 0, 0, 0],
+                },
             })
         );
         let text = json.to_string();
@@ -1380,8 +1892,10 @@ mod tests {
 
         let mut won = GameState::new(today);
         won.guess(&song.meta, &song.meta).unwrap();
-        let view = serde_json::to_value(DailyView::new(&won, LAUNCH, &song)).unwrap();
+        let view = serde_json::to_value(view_of(&won, &song)).unwrap();
         assert_eq!(view["status"], "won");
+        assert_eq!(view["section"], "general");
+        assert_eq!(view["stats"]["currentStreak"], 1);
         assert_eq!(view["number"], 1);
         assert_eq!(view["clipSeconds"], 30.0);
         assert_eq!(
@@ -1399,8 +1913,9 @@ mod tests {
         for _ in 0..MAX_ATTEMPTS {
             lost.skip().unwrap();
         }
-        let view = serde_json::to_value(DailyView::new(&lost, LAUNCH, &song)).unwrap();
+        let view = serde_json::to_value(view_of(&lost, &song)).unwrap();
         assert_eq!(view["status"], "lost");
+        assert_eq!(view["stats"]["played"], 1);
         assert_eq!(view["answer"]["title"], "Zanzibar Nights");
     }
 
@@ -1425,167 +1940,5 @@ mod tests {
         assert_eq!(parse(json!({ "skip": false })), None);
         assert_eq!(parse(json!({ "trackId": 7, "skip": true })), None);
         assert_eq!(parse(json!({ "track_id": 7 })), None);
-    }
-
-    #[test]
-    fn https_is_read_from_the_forwarding_header() {
-        let with = |value: &'static str| {
-            let mut headers = HeaderMap::new();
-            headers.insert("x-forwarded-proto", HeaderValue::from_static(value));
-            is_https(&headers)
-        };
-        assert!(with("https"));
-        assert!(with("HTTPS"));
-        assert!(with("https, http"));
-        assert!(!with("http"));
-        assert!(!with("http, https"));
-        assert!(!with(""));
-        assert!(!is_https(&HeaderMap::new()));
-    }
-
-    // --- the cookie ---------------------------------------------------------
-
-    /// The `Set-Cookie` header [`store_game`] produces.
-    fn set_cookie(key: &Key, game: &GameState, secure: bool) -> String {
-        let jar = store_game(PrivateCookieJar::new(key.clone()), game, secure).unwrap();
-        let response = jar.into_response();
-        response.headers()[header::SET_COOKIE]
-            .to_str()
-            .unwrap()
-            .to_owned()
-    }
-
-    /// A jar as the server sees it when the browser sends `set_cookie` back.
-    fn jar_from(key: &Key, set_cookie: &str) -> PrivateCookieJar {
-        let mut headers = HeaderMap::new();
-        let pair = set_cookie.split(';').next().unwrap();
-        headers.insert(header::COOKIE, pair.parse().unwrap());
-        PrivateCookieJar::from_headers(&headers, key.clone())
-    }
-
-    #[test]
-    fn the_game_survives_the_cookie_round_trip() {
-        let key = Key::generate();
-        let today = date(2026, 10, 1);
-        let mut game = GameState::new(today);
-        game.skip().unwrap();
-        game.guess(
-            &TrackMeta::new("A", "", "B"),
-            &TrackMeta::new("Señorita \"Live\"", "", "Beyoncé; x=y"),
-        )
-        .unwrap();
-
-        let jar = jar_from(&key, &set_cookie(&key, &game, false));
-        assert_eq!(load_game(&jar, today), game);
-    }
-
-    #[test]
-    fn yesterdays_cookie_is_a_fresh_game_today() {
-        let key = Key::generate();
-        let yesterday = date(2026, 10, 1);
-        let today = date(2026, 10, 2);
-        let mut game = GameState::new(yesterday);
-        for _ in 0..MAX_ATTEMPTS {
-            game.skip().unwrap();
-        }
-
-        let jar = jar_from(&key, &set_cookie(&key, &game, false));
-        assert_eq!(load_game(&jar, yesterday), game);
-        assert_eq!(load_game(&jar, today), GameState::new(today));
-    }
-
-    #[test]
-    fn the_largest_game_still_fits_in_a_cookie() {
-        // Seven wrong guesses whose titles and artists are as long as an
-        // attempt stores: 80 two-byte characters each.
-        let long = "é".repeat(200);
-        let answer = TrackMeta::new("A", "", "B");
-        let mut game = GameState::new(date(2026, 10, 1));
-        for _ in 0..MAX_ATTEMPTS {
-            game.guess(&answer, &TrackMeta::new(&long, "", &long))
-                .unwrap();
-        }
-        assert_eq!(game.status(), Status::Lost);
-
-        let key = Key::generate();
-        let header = set_cookie(&key, &game, true);
-        // Browsers refuse a cookie whose name and value exceed 4096 bytes;
-        // stay under that with the attributes counted too.
-        assert!(header.len() < 4096, "{} bytes", header.len());
-        assert_eq!(load_game(&jar_from(&key, &header), date(2026, 10, 1)), game);
-    }
-
-    // --- the cookie key -----------------------------------------------------
-
-    #[test]
-    fn hex_round_trips() {
-        let bytes: Vec<u8> = (0..=255).collect();
-        let text = encode_hex(&bytes);
-        assert_eq!(text.len(), 512);
-        assert!(text.starts_with("000102") && text.ends_with("fdfeff"));
-        assert_eq!(decode_hex(&text), Some(bytes.clone()));
-        assert_eq!(decode_hex(&text.to_uppercase()), Some(bytes));
-        assert_eq!(decode_hex(""), Some(Vec::new()));
-        assert_eq!(decode_hex("abc"), None);
-        assert_eq!(decode_hex("zz"), None);
-        assert_eq!(decode_hex("+1"), None);
-        assert_eq!(decode_hex("éé"), None);
-    }
-
-    #[test]
-    fn a_key_is_generated_once_and_kept_private() {
-        let dir = tempfile::tempdir().unwrap();
-        let data_dir = dir.path().join("data");
-
-        let first = session_key(None, &data_dir).unwrap();
-        let path = data_dir.join("secret.key");
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(text.trim().len(), 128);
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600);
-
-        // A restart reads the same key, so cookies survive it.
-        let second = session_key(None, &data_dir).unwrap();
-        assert_eq!(first.master(), second.master());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
-    }
-
-    #[test]
-    fn the_secret_variable_wins_and_writes_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-        let secret = "0123456789abcdef".repeat(8);
-        let key = session_key(Some(&secret), dir.path()).unwrap();
-        assert_eq!(encode_hex(key.master()), secret);
-        assert!(!dir.path().join("secret.key").exists());
-
-        // The key file's own format works as the variable, newline and all.
-        let generated = session_key(None, dir.path()).unwrap();
-        let text = std::fs::read_to_string(dir.path().join("secret.key")).unwrap();
-        let from_env = session_key(Some(&text), dir.path()).unwrap();
-        assert_eq!(generated.master(), from_env.master());
-    }
-
-    #[test]
-    fn an_unusable_secret_is_an_error_that_does_not_repeat_it() {
-        let dir = tempfile::tempdir().unwrap();
-        for secret in ["hunter2", &"ab".repeat(63), &"zz".repeat(64)] {
-            let error = session_key(Some(secret), dir.path()).unwrap_err();
-            let message = format!("{error:#}");
-            assert!(message.contains("GTS_SECRET"), "{message}");
-            assert!(message.contains("128 hexadecimal"), "{message}");
-            assert!(!message.contains(secret), "{message}");
-        }
-    }
-
-    #[test]
-    fn a_damaged_key_file_is_an_error_not_a_new_key() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("secret.key");
-        std::fs::write(&path, "truncated").unwrap();
-
-        let error = session_key(None, dir.path()).unwrap_err();
-        assert!(format!("{error:#}").contains("secret.key"), "{error:#}");
-        // Left alone for the operator to look at.
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "truncated");
     }
 }

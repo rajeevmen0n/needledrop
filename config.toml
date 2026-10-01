@@ -22,9 +22,10 @@ playlists = [
   5123717724,  # "Most Popular Songs of All Time: Greatest Hits [Upd…" — 501 tracks, 356 playable (71%)
 ]
 
-# Where the song pool is kept. "sqlite" (the default when this table is left
-# out) is one file, needledrop.db, under data_dir: the server creates it and
-# puts six seed songs into an empty pool. "memory" keeps nothing between starts.
+# Where the song pool and the players' games are kept. "sqlite" (the default
+# when this table is left out) is one file, needledrop.db, under data_dir: the
+# server creates it and puts six seed songs into an empty pool. "memory" keeps
+# nothing between starts, so every restart forgets every player's games.
 # This table stays at the end of the file, because every key written after a
 # table header belongs to that table.
 [store]

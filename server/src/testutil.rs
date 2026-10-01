@@ -1,5 +1,7 @@
-//! Test support: synthetic MP3 data and a local stand-in for the Deezer API,
-//! so handler and loader tests never touch the network.
+//! Test support: synthetic MP3 data, a local stand-in for the Deezer API, so
+//! handler and loader tests never touch the network, and the harness the
+//! handler tests share: the whole router, a browser that keeps its cookie, a
+//! store that always fails, and ready-made games.
 
 use std::{
     collections::HashMap,
@@ -9,17 +11,32 @@ use std::{
     },
 };
 
+use async_trait::async_trait;
 use axum::{
     Json, Router,
+    body::Body,
     extract::{Path, Query, State},
-    http::header::CONTENT_TYPE,
+    http::{
+        HeaderMap, Method, Request, StatusCode,
+        header::{self, CONTENT_TYPE},
+    },
     response::{IntoResponse, Response},
     routing::get,
 };
+use axum_extra::extract::cookie::{Cookie, Key, PrivateCookieJar};
+use jiff::civil::{Date, date};
 use serde_json::{Value, json};
 use tokio::{net::TcpListener, task::JoinHandle};
+use tower::ServiceExt;
 
-use crate::deezer::Deezer;
+use crate::{
+    daily::Daily,
+    deezer::Deezer,
+    game::{GameState, MAX_ATTEMPTS, Status, TrackMeta},
+    player,
+    routes::{AppState, router},
+    store::{Genres, MemoryStore, NewSong, PlayerId, PoolSong, Section, Store, StoreError},
+};
 
 /// Frames in a real Deezer preview (29.988 s).
 pub const PREVIEW_FRAMES: usize = 1148;
@@ -260,5 +277,320 @@ async fn preview(State(state): State<Arc<MockState>>, Path(id): Path<u64>) -> Re
             "<html><body>Access denied</body></html>",
         )
             .into_response(),
+    }
+}
+
+// --- games ----------------------------------------------------------------------
+
+/// A game on `day` that is still being played after `misses` skips (at most
+/// six: the seventh loses).
+pub fn playing_game(day: Date, misses: usize) -> GameState {
+    let mut game = GameState::new(day);
+    for _ in 0..misses {
+        game.skip().unwrap();
+    }
+    assert_eq!(
+        game.status(),
+        Status::Playing,
+        "{misses} misses end the game"
+    );
+    game
+}
+
+/// A game on `day` that was won after `misses` skips, so on try `misses + 1`.
+pub fn won_game(day: Date, misses: usize) -> GameState {
+    let mut game = playing_game(day, misses);
+    let song = TrackMeta::new("The Song", "", "Someone");
+    game.guess(&song, &song).unwrap();
+    game
+}
+
+/// A game on `day` that was lost: seven skips.
+pub fn lost_game(day: Date) -> GameState {
+    let mut game = playing_game(day, MAX_ATTEMPTS - 1);
+    game.skip().unwrap();
+    game
+}
+
+// --- the router under test ------------------------------------------------------
+
+/// Day 1 of the game in every [`Harness`].
+pub const LAUNCH: Date = date(2026, 10, 1);
+
+/// The whole router over a Deezer stand-in, a store the test can reach and a
+/// temporary data directory.
+pub struct Harness {
+    pub deezer: MockDeezer,
+    pub store: Arc<dyn Store>,
+    pub app: Router,
+    /// The cookie key, so a test can look inside a cookie or make one.
+    key: Key,
+    _data_dir: tempfile::TempDir,
+}
+
+impl Harness {
+    /// A server whose Deezer knows `tracks`, that plays `answer` and keeps
+    /// its data in an empty [`MemoryStore`].
+    pub async fn start(tracks: Vec<MockTrack>, answer: u64) -> Self {
+        Self::with_store(tracks, answer, Arc::new(MemoryStore::new())).await
+    }
+
+    /// The same over a store of the test's choosing.
+    pub async fn with_store(tracks: Vec<MockTrack>, answer: u64, store: Arc<dyn Store>) -> Self {
+        let deezer = MockDeezer::start(tracks).await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let client = deezer.client();
+        let daily = Daily::new(client.clone(), data_dir.path(), answer)
+            .with_retry_after(std::time::Duration::ZERO);
+        let key = Key::generate();
+        let state = AppState::new(client, daily, Arc::clone(&store), LAUNCH, key.clone());
+        Self {
+            deezer,
+            store,
+            app: router(state),
+            key,
+            _data_dir: data_dir,
+        }
+    }
+
+    /// A browser that has not been here before.
+    pub fn player(&self) -> Player {
+        Player {
+            app: self.app.clone(),
+            cookie: None,
+        }
+    }
+
+    /// A browser that already holds the cookie of the player `id`.
+    pub fn player_with_id(&self, id: &PlayerId) -> Player {
+        Player {
+            app: self.app.clone(),
+            cookie: Some(self.cookie_holding(player::COOKIE_NAME, id.as_str())),
+        }
+    }
+
+    /// `name=<value>` as a browser would send it back: `value` encrypted
+    /// with this server's key under the cookie `name`.
+    pub fn cookie_holding(&self, name: &str, value: &str) -> String {
+        let jar = PrivateCookieJar::new(self.key.clone())
+            .add(Cookie::new(name.to_owned(), value.to_owned()));
+        let response = jar.into_response();
+        let set_cookie = response.headers()[header::SET_COOKIE].to_str().unwrap();
+        set_cookie.split(';').next().unwrap().to_owned()
+    }
+
+    /// What is inside the player cookie the browser holds, decrypted, if it
+    /// holds one this server can read.
+    pub fn cookie_plaintext(&self, player: &Player) -> Option<String> {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, player.cookie.as_ref()?.parse().ok()?);
+        PrivateCookieJar::from_headers(&headers, self.key.clone())
+            .get(player::COOKIE_NAME)
+            .map(|cookie| cookie.value().to_owned())
+    }
+
+    /// Who the browser is to the server: the ID in its cookie.
+    pub fn player_id(&self, player: &Player) -> Option<PlayerId> {
+        PlayerId::parse(&self.cookie_plaintext(player)?)
+    }
+
+    /// Sends a request without a cookie.
+    pub async fn send(&self, request: Request<Body>) -> Reply {
+        self.player().send(request).await
+    }
+
+    pub async fn get(&self, uri: &str) -> Reply {
+        self.player().get(uri).await
+    }
+
+    pub async fn delete(&self, uri: &str) -> Reply {
+        self.send(Request::delete(uri).body(Body::empty()).unwrap())
+            .await
+    }
+}
+
+/// A browser: it keeps the player cookie between requests.
+pub struct Player {
+    pub app: Router,
+    /// `gts_player=<value>`, as last set by the server.
+    pub cookie: Option<String>,
+}
+
+impl Player {
+    pub async fn send(&mut self, mut request: Request<Body>) -> Reply {
+        if let Some(cookie) = &self.cookie {
+            request
+                .headers_mut()
+                .insert(header::COOKIE, cookie.parse().unwrap());
+        }
+        let response = self.app.clone().oneshot(request).await.unwrap();
+        let (parts, body) = response.into_parts();
+        let body = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        for set in parts.headers.get_all(header::SET_COOKIE) {
+            let pair = set.to_str().unwrap().split(';').next().unwrap();
+            if pair.starts_with(player::COOKIE_NAME) {
+                self.cookie = Some(pair.to_owned());
+            }
+        }
+        Reply {
+            status: parts.status,
+            headers: parts.headers,
+            body,
+        }
+    }
+
+    pub async fn get(&mut self, uri: &str) -> Reply {
+        self.send(Request::get(uri).body(Body::empty()).unwrap())
+            .await
+    }
+
+    /// `POST /api/daily/guess` with a JSON body.
+    pub async fn post(&mut self, body: Value) -> Reply {
+        self.post_raw("application/json", body.to_string()).await
+    }
+
+    pub async fn post_raw(&mut self, content_type: &str, body: impl Into<Body>) -> Reply {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/daily/guess")
+            .header(header::CONTENT_TYPE, content_type)
+            .body(body.into())
+            .unwrap();
+        self.send(request).await
+    }
+
+    pub async fn skip(&mut self) -> Reply {
+        self.post(json!({ "skip": true })).await
+    }
+
+    pub async fn guess(&mut self, track_id: u64) -> Reply {
+        self.post(json!({ "trackId": track_id })).await
+    }
+
+    /// `DELETE /api/player`: Clear my data.
+    pub async fn clear(&mut self) -> Reply {
+        self.send(Request::delete("/api/player").body(Body::empty()).unwrap())
+            .await
+    }
+}
+
+/// A response, read to the end.
+pub struct Reply {
+    pub status: StatusCode,
+    pub headers: HeaderMap,
+    pub body: bytes::Bytes,
+}
+
+impl Reply {
+    pub fn json(&self) -> Value {
+        serde_json::from_slice(&self.body)
+            .unwrap_or_else(|error| panic!("not JSON ({error}): {:?}", self.body))
+    }
+
+    pub fn header(&self, name: header::HeaderName) -> &str {
+        self.headers
+            .get(&name)
+            .unwrap_or_else(|| panic!("no {name} header"))
+            .to_str()
+            .unwrap()
+    }
+
+    pub fn content_length(&self) -> usize {
+        self.header(header::CONTENT_LENGTH).parse().unwrap()
+    }
+
+    /// Everything a client can see of this response, as text: the headers
+    /// (the cookie among them) and the body.
+    pub fn visible(&self) -> String {
+        format!(
+            "{:?}\n{}",
+            self.headers,
+            String::from_utf8_lossy(&self.body)
+        )
+    }
+
+    pub fn assert_no_store(&self) {
+        assert_eq!(
+            self.headers
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store"),
+            "{}",
+            self.visible()
+        );
+    }
+
+    /// The error body every route uses, with its status, and never cached.
+    pub fn assert_error(&self, status: StatusCode, code: &str) {
+        assert_eq!(self.status, status, "{}", self.visible());
+        let body = self.json();
+        assert_eq!(body["error"], code);
+        assert!(
+            body["message"].as_str().is_some_and(|m| !m.is_empty()),
+            "{body}"
+        );
+        self.assert_no_store();
+    }
+
+    /// Nothing a client can see of this response contains any of `secrets`.
+    pub fn assert_lacks(&self, secrets: &[&str]) {
+        let visible = self.visible();
+        for secret in secrets {
+            assert!(
+                !visible.contains(secret),
+                "{secret:?} leaked in:\n{visible}"
+            );
+        }
+    }
+}
+
+// --- a store that fails ---------------------------------------------------------
+
+/// A store whose every operation fails, with a message no client may see
+/// ("fire" and the file name are what the tests look for in a response).
+pub struct BrokenStore;
+
+const BROKEN: &str = "disk on fire at /var/lib/needledrop.db";
+
+fn broken<T>() -> Result<T, StoreError> {
+    Err(StoreError::new("pretending", BROKEN))
+}
+
+#[async_trait]
+impl Store for BrokenStore {
+    async fn songs(&self) -> Result<Vec<PoolSong>, StoreError> {
+        broken()
+    }
+    async fn song(&self, _: u64) -> Result<Option<PoolSong>, StoreError> {
+        broken()
+    }
+    async fn add_song(&self, _: NewSong, _: Genres) -> Result<PoolSong, StoreError> {
+        broken()
+    }
+    async fn set_song_genres(&self, _: u64, _: Genres) -> Result<Option<PoolSong>, StoreError> {
+        broken()
+    }
+    async fn remove_song(&self, _: u64) -> Result<bool, StoreError> {
+        broken()
+    }
+    async fn set_preview_failed_on(&self, _: u64, _: Option<Date>) -> Result<bool, StoreError> {
+        broken()
+    }
+    async fn game(
+        &self,
+        _: &PlayerId,
+        _: Section,
+        _: Date,
+    ) -> Result<Option<GameState>, StoreError> {
+        broken()
+    }
+    async fn save_game(&self, _: &PlayerId, _: Section, _: &GameState) -> Result<(), StoreError> {
+        broken()
+    }
+    async fn games(&self, _: &PlayerId, _: Section) -> Result<Vec<GameState>, StoreError> {
+        broken()
+    }
+    async fn delete_player(&self, _: &PlayerId) -> Result<usize, StoreError> {
+        broken()
     }
 }

@@ -1,4 +1,4 @@
-//! Persistent data behind one trait: the song pool today; picks, players, games and the day offset later.
+//! Persistent data behind one trait: the song pool and the players' games today; picks and the day offset later.
 //!
 //! [`Store`] is the only way the rest of the server touches persistent data.
 //! Handlers hold an `Arc<dyn Store>`, and no SQL, connection or database error
@@ -11,11 +11,11 @@
 //! - The methods are domain operations ("add this song", "remove it"), not
 //!   queries, and they take and return the plain types defined here.
 //! - Logic stays above the trait. A backend fetches and stores; anything that
-//!   decides (seeding only an empty pool, the order a list is shown in, and
-//!   later the daily pick and the stats) is Rust code that calls it.
+//!   decides (seeding only an empty pool, the order a list is shown in, the
+//!   stats, and later the daily pick) is Rust code that calls it.
 //! - A backend only has to be atomic for one record at a time. A song with its
-//!   genre tags is one record. Nothing here needs a transaction that spans
-//!   two kinds of record.
+//!   genre tags is one record, and so is one player's game in one section on
+//!   one day. Nothing here needs a transaction that spans two kinds of record.
 //!
 //! [`contract`] holds the test suite every backend has to pass.
 
@@ -30,10 +30,10 @@ use std::{collections::BTreeSet, fmt, path::Path, sync::Arc};
 
 use async_trait::async_trait;
 use jiff::civil::Date;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub use self::{memory::MemoryStore, seed::seed_if_empty, sqlite::SqliteStore};
-use crate::config::StoreKind;
+use crate::{config::StoreKind, game::GameState};
 
 /// The database file of the SQLite backend, under the data directory.
 const SQLITE_FILE: &str = "needledrop.db";
@@ -75,6 +75,126 @@ impl Genre {
 impl fmt::Display for Genre {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.slug())
+    }
+}
+
+/// A daily section: its own song of the day and its own seven-attempt game.
+///
+/// General draws on the whole pool; every other section is one [`Genre`] and
+/// draws on the songs tagged with it. The genre sits inside the section
+/// instead of the four names being listed a second time, so the two cannot
+/// drift apart: a genre is a section by construction, and "which songs may
+/// this section play" is [`genre`](Self::genre) and nothing else.
+///
+/// Serialized as its slug, the form used in URLs, the API and the database:
+/// `"general"`, `"pop"`, `"rock"` or `"hip-hop"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Section {
+    General,
+    Genre(Genre),
+}
+
+impl Section {
+    /// Every section, in the order they are shown: General first, then the
+    /// genres in [`Genre::ALL`]'s order.
+    pub const ALL: [Self; 4] = [
+        Self::General,
+        Self::Genre(Genre::Pop),
+        Self::Genre(Genre::Rock),
+        Self::Genre(Genre::HipHop),
+    ];
+
+    /// `"general"`, or the genre's slug.
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::General => "general",
+            Self::Genre(genre) => genre.slug(),
+        }
+    }
+
+    /// The section with this exact slug.
+    pub fn from_slug(slug: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|section| section.slug() == slug)
+    }
+
+    /// The genre whose songs this section plays; `None` for General, which
+    /// plays them all.
+    pub fn genre(self) -> Option<Genre> {
+        match self {
+            Self::General => None,
+            Self::Genre(genre) => Some(genre),
+        }
+    }
+}
+
+impl From<Genre> for Section {
+    fn from(genre: Genre) -> Self {
+        Self::Genre(genre)
+    }
+}
+
+impl fmt::Display for Section {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.slug())
+    }
+}
+
+impl Serialize for Section {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.slug())
+    }
+}
+
+impl<'de> Deserialize<'de> for Section {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let slug = String::deserialize(deserializer)?;
+        Self::from_slug(&slug).ok_or_else(|| {
+            serde::de::Error::unknown_variant(&slug, &["general", "pop", "rock", "hip-hop"])
+        })
+    }
+}
+
+/// Characters in a [`PlayerId`]: 128 bits as hexadecimal.
+const PLAYER_ID_CHARS: usize = 32;
+
+/// An anonymous player: the only thing the server knows about who is playing.
+///
+/// 128 random bits, written as 32 lowercase hexadecimal characters. There is
+/// no record of a player on its own: a player is the games stored under
+/// their ID. One who has never made a move takes up no space, and an ID the
+/// store has not seen is simply a player without games.
+///
+/// The ID alone opens nothing. It reaches a browser only inside the encrypted
+/// cookie, and a client cannot make a cookie for an ID of its choosing.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PlayerId(String);
+
+impl PlayerId {
+    /// A new ID that cannot be guessed: `rand`'s thread-local generator is a
+    /// cryptographic one, seeded by the operating system.
+    pub fn generate() -> Self {
+        Self(format!("{:032x}", rand::random::<u128>()))
+    }
+
+    /// `text` as an ID, if it has exactly the form [`generate`](Self::generate)
+    /// produces. Anything else was never issued by this server.
+    pub fn parse(text: &str) -> Option<Self> {
+        let well_formed = text.len() == PLAYER_ID_CHARS
+            && text
+                .bytes()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'));
+        well_formed.then(|| Self(text.to_owned()))
+    }
+
+    /// The 32 hexadecimal characters.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for PlayerId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
     }
 }
 
@@ -190,6 +310,83 @@ pub trait Store: Send + Sync {
         track_id: u64,
         day: Option<Date>,
     ) -> Result<bool, StoreError>;
+
+    /// The game `player` has in `section` on `day`, or `None` when they have
+    /// made no move there. A game is stored with its first move, never by a
+    /// visit, so "not there" means a fresh game.
+    ///
+    /// A stored game this server cannot read (see [`games`](Self::games)) is
+    /// `None` too.
+    async fn game(
+        &self,
+        player: &PlayerId,
+        section: Section,
+        day: Date,
+    ) -> Result<Option<GameState>, StoreError>;
+
+    /// Stores `game` as the player's game in `section` on the game's own day
+    /// ([`GameState::day`]), replacing the one stored there, if any. A player
+    /// has at most one game per section and day.
+    ///
+    /// The replacement is whole and unconditional: the last save wins. That a
+    /// save is based on the latest state is the caller's business (see
+    /// `player::MoveLocks`).
+    async fn save_game(
+        &self,
+        player: &PlayerId,
+        section: Section,
+        game: &GameState,
+    ) -> Result<(), StoreError>;
+
+    /// Every game `player` has in `section`, finished or not, by ascending
+    /// day. The stats are computed from this list.
+    ///
+    /// A stored game that cannot be read as a [`GameState`] is left out, here
+    /// and in [`game`](Self::game), and the backend says so in the log
+    /// instead of failing. Only something other than this server can have
+    /// written it (an edit by hand, a later version), and an error would lock
+    /// the player out of the day and of their stats until someone repaired
+    /// the database, where leaving it out costs them one game. The next
+    /// [`save_game`](Self::save_game) for that day replaces it.
+    async fn games(
+        &self,
+        player: &PlayerId,
+        section: Section,
+    ) -> Result<Vec<GameState>, StoreError>;
+
+    /// Deletes everything stored for `player`: their games in every section
+    /// and on every day. Returns how many games that was; 0 for a player the
+    /// store has never seen. Other players are not touched.
+    async fn delete_player(&self, player: &PlayerId) -> Result<usize, StoreError>;
+}
+
+/// Reads a game that a backend keeps as JSON ([`GameState`]'s own
+/// serialization), filed under `day`. For the backends that store it so.
+///
+/// `None`, with a warning in the log, when the text is not a possible game or
+/// is a game for another day than the one it is filed under: the "cannot be
+/// read" of [`Store::games`]. The checks are the ones [`GameState`] makes
+/// whenever it is deserialized, so a state that no sequence of moves produces
+/// (still playing after seven misses, say) is refused here as it was when the
+/// state lived in a cookie.
+fn decode_game(player: &PlayerId, section: Section, day: &str, json: &str) -> Option<GameState> {
+    match serde_json::from_str::<GameState>(json) {
+        Ok(game) if game.day().to_string() == day => Some(game),
+        Ok(game) => {
+            tracing::warn!(
+                %player, %section, day, stored_day = %game.day(),
+                "ignoring a stored game that is filed under another day than its own"
+            );
+            None
+        }
+        Err(error) => {
+            tracing::warn!(
+                %player, %section, day, %error,
+                "ignoring a stored game that cannot be read"
+            );
+            None
+        }
+    }
 }
 
 /// Opens the backend the config names. For SQLite that creates the data
@@ -235,6 +432,112 @@ mod tests {
                 serde_json::from_value::<Genre>(json!(slug)).is_err(),
                 "{slug:?}"
             );
+        }
+    }
+
+    #[test]
+    fn sections_serialize_as_their_slugs() {
+        assert_eq!(
+            serde_json::to_value(Section::ALL).unwrap(),
+            json!(["general", "pop", "rock", "hip-hop"])
+        );
+        for section in Section::ALL {
+            assert_eq!(
+                serde_json::to_value(section).unwrap(),
+                json!(section.slug())
+            );
+            assert_eq!(
+                serde_json::from_value::<Section>(json!(section.slug())).unwrap(),
+                section
+            );
+            assert_eq!(Section::from_slug(section.slug()), Some(section));
+            assert_eq!(section.to_string(), section.slug());
+        }
+    }
+
+    #[test]
+    fn only_the_exact_slugs_are_sections() {
+        for slug in ["", "General", "all", "hiphop", "hip_hop", " pop", "jazz"] {
+            assert_eq!(Section::from_slug(slug), None, "{slug:?}");
+            assert!(
+                serde_json::from_value::<Section>(json!(slug)).is_err(),
+                "{slug:?}"
+            );
+        }
+        assert!(serde_json::from_value::<Section>(json!(1)).is_err());
+        assert!(serde_json::from_value::<Section>(json!(null)).is_err());
+    }
+
+    #[test]
+    fn a_section_is_general_or_one_genre() {
+        assert_eq!(Section::General.genre(), None);
+        // Every genre is a section with the genre's own slug, and they follow
+        // General in the genres' order.
+        for (genre, section) in Genre::ALL.into_iter().zip(&Section::ALL[1..]) {
+            assert_eq!(Section::from(genre), *section);
+            assert_eq!(section.genre(), Some(genre));
+            assert_eq!(section.slug(), genre.slug());
+        }
+        assert_eq!(Section::ALL.len(), Genre::ALL.len() + 1);
+        assert_eq!(Section::ALL[0], Section::General);
+    }
+
+    #[test]
+    fn generated_player_ids_are_well_formed_and_never_the_same() {
+        let ids: BTreeSet<PlayerId> = (0..1000).map(|_| PlayerId::generate()).collect();
+        assert_eq!(ids.len(), 1000);
+        for id in &ids {
+            assert_eq!(id.as_str().len(), 32);
+            assert_eq!(PlayerId::parse(id.as_str()).as_ref(), Some(id));
+            assert_eq!(id.to_string(), id.as_str());
+        }
+    }
+
+    #[test]
+    fn only_thirty_two_lowercase_hex_characters_are_a_player_id() {
+        let good = "0123456789abcdef0123456789abcdef";
+        assert_eq!(PlayerId::parse(good).unwrap().as_str(), good);
+        // Leading zeros are part of it: the ID is text, not a number.
+        assert!(PlayerId::parse(&"0".repeat(32)).is_some());
+
+        for bad in [
+            "",
+            "0123456789abcdef",
+            "0123456789abcdef0123456789abcde",
+            "0123456789abcdef0123456789abcdef0",
+            "0123456789ABCDEF0123456789ABCDEF",
+            "0123456789abcdef0123456789abcdeg",
+            " 123456789abcdef0123456789abcdef",
+            "0123456789abcdef-0123456789abcde",
+            "éééééééééééééééé",
+            r#"{"day":"2026-10-01","attempts":[],"status":"playing"}"#,
+        ] {
+            assert_eq!(PlayerId::parse(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_stored_game_is_read_only_when_it_is_possible_and_filed_under_its_own_day() {
+        let player = PlayerId::generate();
+        let read = |day: &str, json: &str| decode_game(&player, Section::General, day, json);
+
+        let json = r#"{"day":"2026-10-01","attempts":[{"kind":"skip"}],"status":"playing"}"#;
+        let game = read("2026-10-01", json).unwrap();
+        assert_eq!(game.day(), jiff::civil::date(2026, 10, 1));
+        assert_eq!(game.attempts().len(), 1);
+
+        // The same game filed under another day is not that day's game.
+        assert_eq!(read("2026-10-02", json), None);
+        // A state no sequence of moves produces: lost without a miss.
+        assert_eq!(
+            read(
+                "2026-10-01",
+                r#"{"day":"2026-10-01","attempts":[],"status":"lost"}"#
+            ),
+            None
+        );
+        for garbage in ["", "{}", "null", "won", "{\"day\":\"2026-10-01\""] {
+            assert_eq!(read("2026-10-01", garbage), None, "{garbage:?}");
         }
     }
 

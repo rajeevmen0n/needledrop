@@ -54,7 +54,7 @@ pub struct Config {
     pub track_id: u64,
     /// The backend that keeps the song pool.
     pub store: StoreKind,
-    /// `GTS_SECRET` when set: the cookie key (see `routes::session_key` for
+    /// `GTS_SECRET` when set: the cookie key (see `player::session_key` for
     /// the format). Only ever taken from the environment, because
     /// `config.toml` is committed.
     pub secret: Option<String>,

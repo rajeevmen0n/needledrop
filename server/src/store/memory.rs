@@ -12,13 +12,21 @@ use std::{
 use async_trait::async_trait;
 use jiff::civil::Date;
 
-use super::{Genres, NewSong, PoolSong, Store, StoreError};
+use super::{Genres, NewSong, PlayerId, PoolSong, Section, Store, StoreError};
+use crate::game::GameState;
+
+/// What identifies a stored game. Ordered by player, then section, then day,
+/// so one player's games in one section sit together, oldest first: the
+/// order [`Store::games`] promises.
+type GameKey = (PlayerId, Section, Date);
 
 /// A [`Store`] that lives and dies with the process.
 #[derive(Debug, Default)]
 pub struct MemoryStore {
     /// The pool by track ID, which is also the order [`Store::songs`] promises.
     songs: Mutex<BTreeMap<u64, PoolSong>>,
+    /// Every game any player has made a move in.
+    games: Mutex<BTreeMap<GameKey, GameState>>,
 }
 
 impl MemoryStore {
@@ -31,6 +39,11 @@ impl MemoryStore {
     /// single map operation, so there is no half-finished state to find.
     fn pool(&self) -> MutexGuard<'_, BTreeMap<u64, PoolSong>> {
         self.songs.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Locks the games, on the same terms as [`pool`](Self::pool).
+    fn played(&self) -> MutexGuard<'_, BTreeMap<GameKey, GameState>> {
+        self.games.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -79,6 +92,46 @@ impl Store for MemoryStore {
             .map(|song| song.preview_failed_on = day)
             .is_some())
     }
+
+    async fn game(
+        &self,
+        player: &PlayerId,
+        section: Section,
+        day: Date,
+    ) -> Result<Option<GameState>, StoreError> {
+        Ok(self.played().get(&(player.clone(), section, day)).cloned())
+    }
+
+    async fn save_game(
+        &self,
+        player: &PlayerId,
+        section: Section,
+        game: &GameState,
+    ) -> Result<(), StoreError> {
+        self.played()
+            .insert((player.clone(), section, game.day()), game.clone());
+        Ok(())
+    }
+
+    async fn games(
+        &self,
+        player: &PlayerId,
+        section: Section,
+    ) -> Result<Vec<GameState>, StoreError> {
+        Ok(self
+            .played()
+            .iter()
+            .filter(|((of, in_section, _), _)| of == player && *in_section == section)
+            .map(|(_, game)| game.clone())
+            .collect())
+    }
+
+    async fn delete_player(&self, player: &PlayerId) -> Result<usize, StoreError> {
+        let mut games = self.played();
+        let before = games.len();
+        games.retain(|(of, _, _), _| of != player);
+        Ok(before - games.len())
+    }
 }
 
 #[cfg(test)]
@@ -104,9 +157,27 @@ mod tests {
             )
             .await
             .unwrap();
+        let player = PlayerId::generate();
+        let game = GameState::new(jiff::civil::date(2026, 10, 1));
+        first
+            .save_game(&player, Section::General, &game)
+            .await
+            .unwrap();
 
         // Nothing is shared between two stores, and nothing outlives one.
-        assert!(MemoryStore::new().songs().await.unwrap().is_empty());
+        let second = MemoryStore::new();
+        assert!(second.songs().await.unwrap().is_empty());
+        assert!(
+            second
+                .games(&player, Section::General)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(first.songs().await.unwrap().len(), 1);
+        assert_eq!(
+            first.games(&player, Section::General).await.unwrap(),
+            vec![game]
+        );
     }
 }

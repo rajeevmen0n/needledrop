@@ -6,7 +6,9 @@ mod daily;
 mod deezer;
 mod game;
 mod mp3;
+mod player;
 mod routes;
+mod stats;
 mod store;
 #[cfg(test)]
 mod testutil;
@@ -31,7 +33,7 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::load()?;
     tracing::info!(?config, "configuration loaded");
 
-    let key = routes::session_key(config.secret.as_deref(), &config.data_dir)?;
+    let key = player::session_key(config.secret.as_deref(), &config.data_dir)?;
     let deezer = Deezer::new().context("building the Deezer client")?;
     let daily = Daily::new(deezer.clone(), &config.data_dir, config.track_id);
 
