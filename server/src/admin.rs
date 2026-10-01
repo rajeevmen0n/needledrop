@@ -287,11 +287,144 @@ fn sort_for_display(songs: &mut [PoolSong]) {
     });
 }
 
-async fn list_songs(State(app): State<AppState>) -> Result<Response, ApiError> {
-    let mut songs = app.store().songs().await.map_err(store_failed)?;
+/// Songs sent per request when the query names no `limit`.
+const POOL_PAGE: usize = 25;
+
+/// The most songs one request is given, whatever `limit` it asks for.
+const POOL_PAGE_MAX: usize = 100;
+
+/// Longest pool query that is looked at; the rest is cut off.
+const POOL_QUERY_CHARS: usize = 100;
+
+/// The query string of `GET /api/admin/songs`. Everything is optional.
+#[derive(Debug, Default, Deserialize)]
+struct PoolParams {
+    /// Words that all have to be found in the song.
+    #[serde(default)]
+    q: String,
+    /// Only songs tagged with this genre.
+    genre: Option<Genre>,
+    /// `true`: only songs whose preview has failed the daily check.
+    #[serde(default)]
+    failed: bool,
+    #[serde(default)]
+    offset: usize,
+    limit: Option<usize>,
+}
+
+/// The body of `GET /api/admin/songs`: one page of the songs that match, and
+/// the size of the whole pool.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PoolPage {
+    /// How many songs match the filters, on every page together.
+    total: usize,
+    /// The offset and the limit that were applied.
+    offset: usize,
+    limit: usize,
+    songs: Vec<SongRow>,
+    /// The whole pool, whatever the filters.
+    counts: PoolCounts,
+}
+
+/// How many songs each section can draw on. `all` is the General pool.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PoolCounts {
+    all: usize,
+    pop: usize,
+    rock: usize,
+    hip_hop: usize,
+    /// Songs with a failed preview check on record.
+    preview_failed: usize,
+}
+
+impl PoolCounts {
+    fn of(songs: &[PoolSong]) -> Self {
+        let tagged = |genre| {
+            songs
+                .iter()
+                .filter(|song| song.genres.contains(&genre))
+                .count()
+        };
+        Self {
+            all: songs.len(),
+            pop: tagged(Genre::Pop),
+            rock: tagged(Genre::Rock),
+            hip_hop: tagged(Genre::HipHop),
+            preview_failed: songs
+                .iter()
+                .filter(|song| song.preview_failed_on.is_some())
+                .count(),
+        }
+    }
+}
+
+/// Whether every word of the query is somewhere in the song's title, artist,
+/// album or track ID. `words` are already folded ([`game::fold`]): case and
+/// accents do not count.
+fn matches_words(song: &PoolSong, words: &[String]) -> bool {
+    if words.is_empty() {
+        return true;
+    }
+    let text = game::fold(&format!(
+        "{} {} {} {}",
+        song.title, song.artist, song.album, song.track_id
+    ));
+    words.iter().all(|word| text.contains(word.as_str()))
+}
+
+/// The page of the pool that `params` asks for.
+///
+/// The pool is filtered, sorted and cut here rather than by the store: the
+/// store hands over the songs and nothing else (see [`crate::store`]), and
+/// what the admin page must never get is the whole pool at once, which is the
+/// cut made here.
+fn pool_page(mut songs: Vec<PoolSong>, params: &PoolParams) -> PoolPage {
+    let counts = PoolCounts::of(&songs);
+
+    let query: String = params.q.trim().chars().take(POOL_QUERY_CHARS).collect();
+    let words: Vec<String> = game::fold(&query)
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect();
+    songs.retain(|song| {
+        params
+            .genre
+            .is_none_or(|genre| song.genres.contains(&genre))
+            && (!params.failed || song.preview_failed_on.is_some())
+            && matches_words(song, &words)
+    });
     sort_for_display(&mut songs);
-    let rows: Vec<SongRow> = songs.into_iter().map(SongRow::from).collect();
-    Ok((no_store(), Json(rows)).into_response())
+
+    let total = songs.len();
+    let limit = params.limit.unwrap_or(POOL_PAGE).min(POOL_PAGE_MAX);
+    let songs = songs
+        .into_iter()
+        .skip(params.offset)
+        .take(limit)
+        .map(SongRow::from)
+        .collect();
+    PoolPage {
+        total,
+        offset: params.offset,
+        limit,
+        songs,
+        counts,
+    }
+}
+
+async fn list_songs(
+    State(app): State<AppState>,
+    params: Result<Query<PoolParams>, QueryRejection>,
+) -> Result<Response, ApiError> {
+    let Query(params) = params.map_err(|_| {
+        ApiError::BadRequest(
+            "The pool list takes `q`, `genre` (\"pop\", \"rock\" or \"hip-hop\"), `failed` (true or false), `offset` and `limit`.",
+        )
+    })?;
+    let songs = app.store().songs().await.map_err(store_failed)?;
+    Ok((no_store(), Json(pool_page(songs, &params))).into_response())
 }
 
 // --- POST /api/admin/songs ------------------------------------------------------
@@ -382,6 +515,7 @@ async fn remove_song(
 /// One result of the admin search: a player's autocomplete row plus whether
 /// the track can be played.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct AdminSearchHit {
     id: u64,
     /// Deezer's full title, version included.
@@ -393,22 +527,33 @@ struct AdminSearchHit {
     /// Whether Deezer has a preview of the track for this server: the check
     /// the page makes before it adds a song.
     playable: bool,
+    /// Whether this very track is in the pool already. Adding it again would
+    /// only replace its genres.
+    in_pool: bool,
+    /// The genres it has there; `null` for a track that is not in the pool.
+    genres: Option<Genres>,
 }
 
 /// Every track Deezer returned, in its order. Unlike the player's search this
 /// keeps all the releases of a song, because which release goes into the pool
-/// is the point: one may have a preview where another does not.
-fn admin_hits(tracks: &[Track]) -> Vec<AdminSearchHit> {
+/// is the point: one may have a preview where another does not. `pool` is the
+/// song pool, which is where `inPool` and `genres` come from.
+fn admin_hits(tracks: &[Track], pool: &[PoolSong]) -> Vec<AdminSearchHit> {
     tracks
         .iter()
         .filter(|track| !track.title.trim().is_empty())
-        .map(|track| AdminSearchHit {
-            id: track.id,
-            title: track.title.clone(),
-            artist: track.artist.name.clone(),
-            album: track.album.title.clone(),
-            cover: track.album.cover_small.clone(),
-            playable: track.is_playable(),
+        .map(|track| {
+            let pooled = pool.iter().find(|song| song.track_id == track.id);
+            AdminSearchHit {
+                id: track.id,
+                title: track.title.clone(),
+                artist: track.artist.name.clone(),
+                album: track.album.title.clone(),
+                cover: track.album.cover_small.clone(),
+                playable: track.is_playable(),
+                in_pool: pooled.is_some(),
+                genres: pooled.map(|song| song.genres.clone()),
+            }
         })
         .collect()
 }
@@ -418,7 +563,14 @@ async fn search(
     params: Result<Query<SearchParams>, QueryRejection>,
 ) -> Result<Response, ApiError> {
     let tracks = find_tracks(&app, params).await?;
-    Ok((no_store(), Json(admin_hits(&tracks))).into_response())
+    // The page says so before it adds a track that is already there, and it
+    // does not hold the pool itself.
+    let pool = if tracks.is_empty() {
+        Vec::new()
+    } else {
+        app.store().songs().await.map_err(store_failed)?
+    };
+    Ok((no_store(), Json(admin_hits(&tracks, &pool))).into_response())
 }
 
 #[cfg(test)]
@@ -483,7 +635,8 @@ mod tests {
         /// `POST /api/admin/songs` with a JSON body.
         async fn add(&self, body: Value) -> Reply;
         async fn add_raw(&self, content_type: &str, body: impl Into<Body>) -> Reply;
-        /// The pool as `GET /api/admin/songs` lists it.
+        /// The songs of the pool as `GET /api/admin/songs` lists them: one
+        /// page, which is all of it in these tests.
         async fn pool(&self) -> Value;
     }
 
@@ -503,9 +656,11 @@ mod tests {
         }
 
         async fn pool(&self) -> Value {
-            let reply = self.get("/api/admin/songs").await;
+            let reply = self.get("/api/admin/songs?limit=100").await;
             assert_eq!(reply.status, StatusCode::OK);
-            reply.json()
+            let mut page = reply.json();
+            assert_eq!(page["total"], page["songs"].as_array().unwrap().len());
+            page["songs"].take()
         }
     }
 
@@ -522,11 +677,20 @@ mod tests {
     // --- GET /api/admin/songs -----------------------------------------------
 
     #[tokio::test]
-    async fn an_empty_pool_is_an_empty_list() {
+    async fn an_empty_pool_is_an_empty_page() {
         let harness = start().await;
         let reply = harness.get("/api/admin/songs").await;
         assert_eq!(reply.status, StatusCode::OK);
-        assert_eq!(reply.json(), json!([]));
+        assert_eq!(
+            reply.json(),
+            json!({
+                "total": 0,
+                "offset": 0,
+                "limit": 25,
+                "songs": [],
+                "counts": { "all": 0, "pop": 0, "rock": 0, "hipHop": 0, "previewFailed": 0 },
+            })
+        );
         reply.assert_no_store();
     }
 
@@ -562,8 +726,16 @@ mod tests {
         let reply = harness.get("/api/admin/songs").await;
         assert_eq!(reply.status, StatusCode::OK);
         reply.assert_no_store();
+        let page = reply.json();
+        assert_eq!(page["total"], 5);
+        assert_eq!(page["offset"], 0);
+        assert_eq!(page["limit"], 25);
         assert_eq!(
-            reply.json(),
+            page["counts"],
+            json!({ "all": 5, "pop": 2, "rock": 2, "hipHop": 1, "previewFailed": 1 })
+        );
+        assert_eq!(
+            page["songs"],
             json!([
                 {
                     "trackId": 20,
@@ -923,6 +1095,8 @@ mod tests {
                     "album": "Hot Space",
                     "cover": cover(QUEEN),
                     "playable": true,
+                    "inPool": false,
+                    "genres": null,
                 },
                 {
                     "id": QUEEN_REMASTER,
@@ -931,6 +1105,8 @@ mod tests {
                     "album": "Greatest Hits",
                     "cover": cover(QUEEN_REMASTER),
                     "playable": true,
+                    "inPool": false,
+                    "genres": null,
                 },
                 {
                     "id": WITHDRAWN,
@@ -939,6 +1115,8 @@ mod tests {
                     "album": "Live Magic",
                     "cover": cover(WITHDRAWN),
                     "playable": false,
+                    "inPool": false,
+                    "genres": null,
                 },
             ])
         );
@@ -946,6 +1124,245 @@ mod tests {
         assert_eq!(player.as_array().unwrap().len(), 1);
         // Both searches were answered by one Deezer request.
         assert_eq!(harness.deezer.api_hits(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_admin_search_says_which_tracks_are_in_the_pool() {
+        let harness = start().await;
+        harness
+            .add(json!({ "trackId": QUEEN_REMASTER, "genres": ["rock", "pop"] }))
+            .await;
+        // In the pool without a genre: there, with an empty list.
+        harness.add(json!({ "trackId": WITHDRAWN })).await;
+
+        let rows = harness
+            .get("/api/admin/search?q=under+pressure")
+            .await
+            .json();
+        let row = |id: u64| {
+            rows.as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["id"] == id)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(row(QUEEN)["inPool"], false);
+        assert_eq!(row(QUEEN)["genres"], json!(null));
+        assert_eq!(row(QUEEN_REMASTER)["inPool"], true);
+        assert_eq!(row(QUEEN_REMASTER)["genres"], json!(["pop", "rock"]));
+        assert_eq!(row(WITHDRAWN)["inPool"], true);
+        assert_eq!(row(WITHDRAWN)["genres"], json!([]));
+    }
+
+    // --- GET /api/admin/songs: pages, search and filters ----------------------
+
+    /// The track IDs of the songs on a page, in the order they came.
+    fn ids(page: &Value) -> Vec<u64> {
+        page["songs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["trackId"].as_u64().unwrap())
+            .collect()
+    }
+
+    async fn page(harness: &Harness, query: &str) -> Value {
+        let reply = harness.get(&format!("/api/admin/songs{query}")).await;
+        assert_eq!(reply.status, StatusCode::OK, "{query}");
+        reply.assert_no_store();
+        reply.json()
+    }
+
+    #[tokio::test]
+    async fn the_pool_is_sent_a_page_at_a_time() {
+        let harness = start().await;
+        for n in 1..=30 {
+            harness
+                .store
+                .add_song(
+                    new_song(n, &format!("Song {n:02}"), "Artist"),
+                    Genres::new(),
+                )
+                .await
+                .unwrap();
+        }
+        let first: Vec<u64> = (1..=25).collect();
+        let rest: Vec<u64> = (26..=30).collect();
+        let all: Vec<u64> = (1..=30).collect();
+
+        // Without a limit: the first 25, and how many there are.
+        let body = page(&harness, "").await;
+        assert_eq!(ids(&body), first);
+        assert_eq!((&body["total"], &body["offset"]), (&json!(30), &json!(0)));
+        assert_eq!(body["limit"], 25);
+
+        let body = page(&harness, "?offset=25").await;
+        assert_eq!(ids(&body), rest);
+        assert_eq!((&body["total"], &body["offset"]), (&json!(30), &json!(25)));
+
+        let body = page(&harness, "?offset=10&limit=3").await;
+        assert_eq!(ids(&body), [11, 12, 13]);
+        assert_eq!(body["limit"], 3);
+
+        // No request gets more than a hundred songs, whatever it asks for.
+        let body = page(&harness, "?limit=100000").await;
+        assert_eq!(ids(&body), all);
+        assert_eq!(body["limit"], 100);
+
+        // A limit of nothing is a way to ask for the counts alone.
+        let body = page(&harness, "?limit=0").await;
+        assert_eq!(body["songs"], json!([]));
+        assert_eq!(body["total"], 30);
+        assert_eq!(body["counts"]["all"], 30);
+
+        // Past the end there is nothing, and the total is still right.
+        let body = page(&harness, "?offset=99").await;
+        assert_eq!(body["songs"], json!([]));
+        assert_eq!(body["total"], 30);
+    }
+
+    #[tokio::test]
+    async fn the_pool_is_searched_by_words_whatever_their_case_and_accents() {
+        let harness = start().await;
+        let store = &harness.store;
+        for (track_id, title, artist) in [
+            (1, "Déjà Vu", "Beyoncé"),
+            (2, "Halo", "Beyoncé"),
+            (3, "Deja Vu", "Olivia Rodrigo"),
+            (4_091_937_401, "Bohemian Rhapsody", "Queen"),
+        ] {
+            store
+                .add_song(new_song(track_id, title, artist), Genres::new())
+                .await
+                .unwrap();
+        }
+
+        for (query, found) in [
+            // The artist, without the accent and in any case.
+            ("?q=beyonce", vec![1, 2]),
+            ("?q=BEYONC%C3%89", vec![1, 2]),
+            // Part of a word is enough.
+            ("?q=rhaps", vec![4_091_937_401]),
+            // Every word has to be there, in the title, the artist or both.
+            ("?q=%20DEJA%20%20%20beyonce%20", vec![1]),
+            ("?q=deja+vu", vec![1, 3]),
+            ("?q=deja+queen", vec![]),
+            // The album counts too: `new_song` calls it "<title> (album)".
+            ("?q=halo+album", vec![2]),
+            // And so does the track ID.
+            ("?q=4091937401", vec![4_091_937_401]),
+            ("?q=40919", vec![4_091_937_401]),
+            ("?q=zanzibar", vec![]),
+            // Nothing to look for is no filter.
+            ("?q=", vec![1, 2, 3, 4_091_937_401]),
+            ("?q=%20%20", vec![1, 2, 3, 4_091_937_401]),
+        ] {
+            let body = page(&harness, query).await;
+            assert_eq!(ids(&body), found, "{query}");
+            assert_eq!(body["total"], found.len(), "{query}");
+            // The counts are about the pool, not about the search.
+            assert_eq!(body["counts"]["all"], 4, "{query}");
+        }
+
+        // A search is paged like the whole list.
+        let body = page(&harness, "?q=beyonce&offset=1&limit=1").await;
+        assert_eq!(ids(&body), [2]);
+        assert_eq!(body["total"], 2);
+    }
+
+    #[tokio::test]
+    async fn the_pool_is_filtered_by_genre_and_by_failed_previews() {
+        let harness = start().await;
+        let store = &harness.store;
+        for (track_id, title, genres) in [
+            (1, "Alpha", vec![Genre::Pop]),
+            (2, "Bravo", vec![Genre::Rock, Genre::Pop]),
+            (3, "Charlie", vec![Genre::HipHop]),
+            (4, "Delta", vec![]),
+        ] {
+            store
+                .add_song(
+                    new_song(track_id, title, "Artist"),
+                    genres.into_iter().collect(),
+                )
+                .await
+                .unwrap();
+        }
+        for track_id in [2, 4] {
+            store
+                .set_preview_failed_on(track_id, Some(date(2026, 10, 3)))
+                .await
+                .unwrap();
+        }
+
+        for (query, found) in [
+            ("?genre=pop", vec![1, 2]),
+            ("?genre=rock", vec![2]),
+            ("?genre=hip-hop", vec![3]),
+            ("?failed=true", vec![2, 4]),
+            ("?failed=false", vec![1, 2, 3, 4]),
+            ("?genre=pop&failed=true", vec![2]),
+            ("?genre=hip-hop&failed=true", vec![]),
+            ("?genre=pop&q=alpha", vec![1]),
+            ("?failed=true&q=delta", vec![4]),
+        ] {
+            let body = page(&harness, query).await;
+            assert_eq!(ids(&body), found, "{query}");
+            assert_eq!(body["total"], found.len(), "{query}");
+            assert_eq!(
+                body["counts"],
+                json!({ "all": 4, "pop": 2, "rock": 1, "hipHop": 1, "previewFailed": 2 }),
+                "{query}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pool_request_with_a_parameter_it_cannot_read_is_a_bad_request() {
+        let harness = start().await;
+        for query in [
+            "?genre=jazz",
+            "?genre=general",
+            "?genre=",
+            "?failed=maybe",
+            "?offset=-1",
+            "?offset=two",
+            "?limit=-5",
+            "?limit=many",
+        ] {
+            let reply = harness.get(&format!("/api/admin/songs{query}")).await;
+            reply.assert_error(StatusCode::BAD_REQUEST, "bad_request");
+            reply.assert_no_store();
+        }
+    }
+
+    #[test]
+    fn the_counts_are_of_the_whole_pool() {
+        assert_eq!(PoolCounts::of(&[]), PoolCounts::default());
+
+        let song = |track_id, genres: &[Genre], failed: bool| PoolSong {
+            preview_failed_on: failed.then_some(date(2026, 10, 3)),
+            ..PoolSong::new(
+                new_song(track_id, "Title", "Artist"),
+                genres.iter().copied().collect(),
+            )
+        };
+        let pool = [
+            song(1, &[Genre::Pop, Genre::Rock, Genre::HipHop], true),
+            song(2, &[Genre::Pop], false),
+            song(3, &[], true),
+        ];
+        assert_eq!(
+            PoolCounts::of(&pool),
+            PoolCounts {
+                all: 3,
+                pop: 2,
+                rock: 1,
+                hip_hop: 1,
+                preview_failed: 2,
+            }
+        );
     }
 
     #[tokio::test]
@@ -1027,10 +1444,20 @@ mod tests {
         // The retag is tried before Deezer is asked, so nothing was looked up.
         assert_eq!(harness.deezer.api_hits(), 0);
 
-        // What does not need the store carries on: the search.
+        // What does not need the store carries on: the player's search.
         assert_eq!(harness.get("/api/health").await.status, StatusCode::OK);
         assert_eq!(
-            harness.get("/api/admin/search?q=queen").await.status,
+            harness.get("/api/search?q=queen").await.status,
+            StatusCode::OK
+        );
+        // The admin's search says which results are in the pool, so it needs
+        // the store; a query too short to search for does not.
+        harness
+            .get("/api/admin/search?q=queen")
+            .await
+            .assert_error(StatusCode::INTERNAL_SERVER_ERROR, "internal");
+        assert_eq!(
+            harness.get("/api/admin/search?q=q").await.status,
             StatusCode::OK
         );
         // The day and its songs are in the store, so the game does fail.

@@ -1,0 +1,171 @@
+/* What the admin page's panels share. Everything is under .admin, and the
+   file is loaded with the admin page only, so nothing here reaches the game.
+   Plain on purpose: the game's tokens, no sky, no record. */
+
+.admin {
+  display: grid;
+  gap: var(--space-6);
+  max-width: 60rem;
+  margin: 0 auto;
+  padding: max(var(--space-5), env(safe-area-inset-top)) var(--gutter)
+    max(var(--space-7), env(safe-area-inset-bottom));
+}
+
+/* A panel is a heading over a hairline, not a card. */
+.admin .panel {
+  display: grid;
+  gap: var(--space-4);
+  min-width: 0;
+  padding-top: var(--space-5);
+  border-top: var(--line) solid var(--border);
+}
+
+.admin .panel-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2) var(--space-4);
+  min-height: var(--target);
+}
+
+.admin h2 {
+  font-size: var(--text-large);
+  font-weight: var(--weight-medium);
+  letter-spacing: -0.01em;
+  line-height: 1.2;
+}
+
+/* Admin buttons are the 44px size of the confirmation's, not the game's 56px. */
+.admin .button {
+  min-height: var(--target);
+  padding: 0 var(--space-4);
+  border-color: var(--control-border);
+  font-size: 0.875rem;
+}
+
+.admin .button.solid:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.admin .quiet-button {
+  font-size: var(--text-small);
+}
+
+.admin .hint {
+  color: var(--muted);
+  font-size: var(--text-small);
+}
+
+.admin .error {
+  font-size: 0.875rem;
+}
+
+/* What an action did: one ivory line with a champagne rule at its left. */
+.admin .news {
+  padding-left: var(--space-3);
+  border-left: 2px solid var(--accent);
+  font-size: 0.875rem;
+}
+
+.admin .news:empty {
+  display: none;
+}
+
+/* Something is on its way. */
+.admin .working {
+  color: var(--muted);
+  font-size: 0.875rem;
+  animation: admin-working 1.6s ease-in-out infinite;
+}
+
+@keyframes admin-working {
+  50% {
+    opacity: 0.55;
+  }
+}
+
+/* Figures on one line, parted by hairlines, as in the game's stats. */
+.admin .figures {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin: 0;
+}
+
+.admin .figures > * {
+  display: grid;
+  align-content: start;
+  gap: 0.125rem;
+  min-width: 0;
+  padding: 0 var(--space-3);
+  border-left: var(--line) solid var(--border);
+}
+
+.admin .figures > *:first-child {
+  padding-left: 0;
+  border-left: 0;
+}
+
+.admin .figures .value {
+  margin: 0;
+  font-size: var(--text-large);
+  font-weight: var(--weight-medium);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.2;
+  letter-spacing: -0.01em;
+}
+
+.admin .figures .label {
+  color: var(--muted);
+  font-size: 0.75rem;
+  line-height: 1.3;
+}
+
+/* A song as two lines: the title, then who and where. */
+.admin .song {
+  display: grid;
+  gap: 0.125rem;
+  min-width: 0;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.admin .song .title {
+  font-weight: var(--weight-medium);
+}
+
+.admin .song .meta {
+  color: var(--muted);
+  font-size: var(--text-small);
+}
+
+.admin a {
+  color: var(--paper);
+}
+
+.admin .meta a {
+  color: inherit;
+}
+
+@media (hover: hover) {
+  .admin .meta a:hover {
+    color: var(--paper);
+  }
+}
+
+@media (max-width: 30rem) {
+  .admin {
+    gap: var(--space-5);
+  }
+
+  /* Two by two on a phone: a date does not fit a quarter of the screen. */
+  .admin .figures.wide {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    row-gap: var(--space-3);
+  }
+
+  .admin .figures.wide > *:nth-child(odd) {
+    padding-left: 0;
+    border-left: 0;
+  }
+}

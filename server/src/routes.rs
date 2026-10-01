@@ -2591,13 +2591,11 @@ mod tests {
         // It stays in the pool, with the day it failed on for the owner.
         let song = harness.store.song(WITHDRAWN).await.unwrap().unwrap();
         assert_eq!(song.preview_failed_on, Some(TODAY));
-        let pool = harness.get("/api/admin/songs").await.json();
-        let row = pool
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|row| row["trackId"] == WITHDRAWN)
-            .unwrap();
+        let failed = harness.get("/api/admin/songs?failed=true").await.json();
+        assert_eq!(failed["total"], 1);
+        assert_eq!(failed["counts"]["previewFailed"], 1);
+        let row = &failed["songs"][0];
+        assert_eq!(row["trackId"], WITHDRAWN);
         assert_eq!(row["previewFailedOn"], "2026-10-03");
         // It is not asked about again that day.
         let hits = harness.deezer.api_hits();

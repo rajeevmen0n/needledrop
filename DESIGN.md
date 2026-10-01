@@ -136,6 +136,15 @@ A finished section shows its stats between the result and the history: four
 figures on one line parted by hairlines, then "Wins by try". No boxes, no
 tiles. While a game is open only the streak shows, in the history's heading.
 
+The admin page at `/admin` is a tool for one person and is plain on purpose:
+the same black, type and tokens, with no sky, no record and no sound. One
+column, at most 60rem wide, of panels that are a heading over a hairline, never
+a card. Its buttons are the 44px outlined ones of the confirmation dialog, and
+"Add to the pool" is its only champagne button. Numbers to read (the clock, the
+pool's totals) are text, not controls. It never lists the song pool: songs
+appear only as the results of a search, 25 at most, with a line saying how many
+more match.
+
 ## Elevation & Depth
 
 Static content sits directly on black. Borders quietly establish structure.
@@ -228,6 +237,17 @@ offers to check again. News the player did not cause (the song was replaced,
 the day changed) is one ivory line with a champagne rule at its left, above
 the game, and is announced once.
 
+SongCombobox owns the song search drop-down for the game and for the admin
+page alike; GuessInput is the game's form around it. On the admin page a row
+may carry a second line (artist and album) and a short outlined mark at its end
+("No preview", "In the pool"); a row that cannot be used is dimmed as well, and
+the mark says why in words.
+
+A genre tag is a tick box with its name: an ivory tick on graphite, never
+champagne, saved on the click and shown as "Saving…" beside the boxes. A
+result of an action ("Added …", "Pop now plays …", "Removed …") is the news
+line: ivory, with the champagne rule at its left.
+
 Search is transient game input, deliberately absent from URL state. It has a
 clear button, debounced requests, cancellation, IME safety, keyboard selection,
 and viewport-aware popup placement. Guess remains unavailable until a result
@@ -255,4 +275,6 @@ keeping game state and playback progress available.
 - Keep the tab row to one line of four at every width; do not add a fifth
   control to it.
 - Do not put the stats in cards or tiles, and do not colour more than one bar.
+- Do not list the song pool on the admin page, by tabs, pages or "show more":
+  the owner asked for a search box and its results only.
 - Verify sound quality by ear with the owner; a headless browser cannot do that.

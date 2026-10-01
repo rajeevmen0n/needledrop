@@ -335,7 +335,10 @@ fn fallback(original: &str) -> String {
 
 /// Compatibility-decomposes `text` (so "é" becomes "e" plus an accent and
 /// full-width "Ａ" becomes "A"), drops the accents and lowercases.
-fn fold(text: &str) -> String {
+///
+/// Also what the admin's pool search compares on, so that "beyonce" finds
+/// "Beyoncé" there as it does in a guess.
+pub(crate) fn fold(text: &str) -> String {
     text.nfkd()
         .filter(|&c| !is_diacritic(c))
         .collect::<String>()

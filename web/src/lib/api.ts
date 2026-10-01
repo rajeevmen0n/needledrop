@@ -107,7 +107,7 @@ async function errorFrom(res: Response): Promise<ApiError> {
 }
 
 /** Sends a request and hands back the response if the server said yes. */
-async function send(path: string, init?: RequestInit): Promise<Response> {
+export async function send(path: string, init?: RequestInit): Promise<Response> {
   let res: Response
   try {
     res = await fetch(path, init)
@@ -120,7 +120,8 @@ async function send(path: string, init?: RequestInit): Promise<Response> {
   return res
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+/** The same, read as JSON. The admin page's calls (lib/admin/api.ts) are built on these two as well. */
+export async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await send(path, init)
   try {
     return (await res.json()) as T
