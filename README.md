@@ -24,3 +24,5 @@ Both bind `127.0.0.1` only. To reach the game under a public hostname, put a TLS
 Other recipes: `just server`, `just web`, `just test`, `just check`, `just build`, `just fmt`. Run `just` to list them.
 
 Settings live in `config.toml`; one machine's own go in `config.local.toml` next to it, which wins and is git-ignored. `AGENTS.md` has the architecture, conventions and current progress.
+
+For a deployment, put the whole runtime data directory on persistent storage by setting `data_dir = "/mnt/needledrop"` in `config.local.toml`, or by setting `GTS_DATA_DIR=/mnt/needledrop` in the server environment. The environment variable wins over either config file. The server stores cached previews and its cookie key there, and uses `<data_dir>/needledrop.db` for SQLite when `[store] path` is blank. If `[store] path` or `GTS_STORE_PATH` names a database file, that file stays at its configured location. Keep the existing data when changing the directory so returning players retain their games.

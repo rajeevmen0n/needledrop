@@ -4,7 +4,7 @@
 //! committed and holds what every machine shares; `config.local.toml` next to
 //! it, which is git-ignored and holds what belongs to one machine (the public
 //! hostname, above all); and the environment, where `GTS_BIND`,
-//! `GTS_PUBLIC_URL`, `GTS_STORE_PATH` and `GTS_SECRET` override or add to
+//! `GTS_DATA_DIR`, `GTS_PUBLIC_URL`, `GTS_STORE_PATH` and `GTS_SECRET` override or add to
 //! what the files say.
 //! Keys the server does not know are
 //! ignored, which is what lets a config file from before the song database
@@ -25,6 +25,7 @@ const DEFAULT_PATH: &str = "config.toml";
 
 const ENV_CONFIG: &str = "GTS_CONFIG";
 const ENV_BIND: &str = "GTS_BIND";
+const ENV_DATA_DIR: &str = "GTS_DATA_DIR";
 const ENV_PUBLIC_URL: &str = "GTS_PUBLIC_URL";
 const ENV_STORE_PATH: &str = "GTS_STORE_PATH";
 
@@ -59,8 +60,9 @@ impl StoreKind {
 pub struct Config {
     /// Address to listen on, `host:port`.
     pub bind: String,
-    /// Directory for cached previews, the cookie key and the database.
-    /// Created on demand.
+    /// Directory for cached previews, the cookie key and, unless a separate
+    /// store path is configured, the database. `GTS_DATA_DIR` overrides
+    /// `data_dir` in the files. Created on demand.
     pub data_dir: PathBuf,
     /// Day 1 of the game, a UTC date.
     pub launch_date: Date,
@@ -75,9 +77,9 @@ pub struct Config {
     /// day offset.
     pub store: StoreKind,
     /// The database file of the SQLite backend: `[store] path` or
-    /// `GTS_STORE_PATH` when one is set, so a deployment can keep its data
-    /// where it wants, and otherwise `needledrop.db` under the data
-    /// directory, which the server creates and seeds on its first start.
+    /// `GTS_STORE_PATH` when one is set, and otherwise `needledrop.db` under
+    /// the effective data directory. The server creates and seeds it on its
+    /// first start.
     /// Relative paths are relative to the working directory, like
     /// `data_dir`. The in-memory backend does not use it.
     pub store_path: PathBuf,
@@ -217,6 +219,9 @@ impl Config {
         if bind.is_empty() {
             return Err(ConfigError::EmptyBind);
         }
+        let data_dir = env(ENV_DATA_DIR)
+            .map(|path| PathBuf::from(path.trim()))
+            .unwrap_or(file.data_dir);
 
         // Blank in the file means the same as leaving the key out: a server
         // that is only reached on loopback.
@@ -242,11 +247,11 @@ impl Config {
                 .store
                 .path
                 .filter(|path| !path.as_os_str().to_string_lossy().trim().is_empty()))
-            .unwrap_or_else(|| file.data_dir.join(DATABASE_FILE));
+            .unwrap_or_else(|| data_dir.join(DATABASE_FILE));
 
         Ok(Self {
             bind,
-            data_dir: file.data_dir,
+            data_dir,
             launch_date: file.launch_date,
             public_url,
             store,
@@ -616,7 +621,57 @@ mod tests {
         let config = Config::from_sources(MINIMAL, no_env).unwrap();
         assert_eq!(config.bind, "127.0.0.1:4810");
         assert_eq!(config.data_dir, PathBuf::from("data"));
+        assert_eq!(config.store_path, PathBuf::from("data/needledrop.db"));
         assert_eq!(config.launch_date, date(2026, 10, 1));
+    }
+
+    #[test]
+    fn data_dir_follows_file_local_and_environment_precedence() {
+        let committed = format!("{MINIMAL}data_dir = \"data\"\n[store]\npath = \"\"\n");
+        let local = "data_dir = \"/srv/needledrop\"\n";
+
+        let config = Config::from_layers(&committed, Some(local), no_env).unwrap();
+        assert_eq!(config.data_dir, PathBuf::from("/srv/needledrop"));
+        assert_eq!(config.store_path, config.data_dir.join("needledrop.db"));
+
+        let config = Config::from_layers(
+            &committed,
+            Some(local),
+            env_of(&[("GTS_DATA_DIR", " /mnt/persistent/needledrop ")]),
+        )
+        .unwrap();
+        assert_eq!(config.data_dir, PathBuf::from("/mnt/persistent/needledrop"));
+        assert_eq!(config.store_path, config.data_dir.join("needledrop.db"));
+
+        // Blank variables leave the local value in place.
+        let config =
+            Config::from_layers(&committed, Some(local), env_of(&[("GTS_DATA_DIR", "  ")]))
+                .unwrap();
+        assert_eq!(config.data_dir, PathBuf::from("/srv/needledrop"));
+        assert_eq!(config.store_path, config.data_dir.join("needledrop.db"));
+    }
+
+    #[test]
+    fn explicit_store_path_is_independent_of_the_data_dir_override() {
+        let committed = format!("{MINIMAL}[store]\npath = \"/srv/database/game.sqlite\"\n");
+        let env = env_of(&[("GTS_DATA_DIR", "/mnt/needledrop")]);
+        let config = Config::from_sources(&committed, env).unwrap();
+        assert_eq!(config.data_dir, PathBuf::from("/mnt/needledrop"));
+        assert_eq!(
+            config.store_path,
+            PathBuf::from("/srv/database/game.sqlite")
+        );
+
+        let env = env_of(&[
+            ("GTS_DATA_DIR", "/mnt/needledrop"),
+            ("GTS_STORE_PATH", "/mnt/database/game.sqlite"),
+        ]);
+        let config = Config::from_sources(&committed, env).unwrap();
+        assert_eq!(config.data_dir, PathBuf::from("/mnt/needledrop"));
+        assert_eq!(
+            config.store_path,
+            PathBuf::from("/mnt/database/game.sqlite")
+        );
     }
 
     #[test]

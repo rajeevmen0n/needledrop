@@ -9,7 +9,10 @@
 # `GTS_BIND` overrides this.
 bind = "127.0.0.1:4810"
 
-# Cached previews, the cookie key and the database live here (git-ignored).
+# Cached previews, the cookie key and, by default, the SQLite database live
+# here (git-ignored). Set this in config.local.toml or use `GTS_DATA_DIR` for
+# a persistent volume. Relative paths are relative to the server's working
+# directory; an absolute path is useful for deployments.
 data_dir = "data"
 
 # Day 1 of the game, as a UTC date; the day number counts from it, and the
@@ -37,10 +40,8 @@ public_url = ""
 [store]
 kind = "sqlite"
 
-# The SQLite file. Blank, as here, is needledrop.db under data_dir: the
-# database the server bootstraps for itself, which is what a local run uses.
-# A deployment names its own file, absolute or relative to the working
-# directory, in config.local.toml or with `GTS_STORE_PATH`; the server creates
-# the file and its directory if they are missing. The previews and the cookie
-# key stay under data_dir either way.
+# The SQLite file. Blank, as here, is needledrop.db under the effective
+# data_dir, including when `GTS_DATA_DIR` overrides it. Set this separately
+# in config.local.toml or with `GTS_STORE_PATH` only if the database should
+# live elsewhere. The previews and cookie key always stay under data_dir.
 path = ""
