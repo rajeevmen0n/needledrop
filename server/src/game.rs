@@ -4,9 +4,6 @@
 //! kept, so other modes (random, genre) can reuse it. No I/O and no clock:
 //! callers pass in today's date.
 
-// Task 3 removes this once the routes use the module.
-#![allow(dead_code)]
-
 use jiff::civil::Date;
 use serde::{Deserialize, Serialize};
 use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
@@ -203,12 +200,6 @@ impl GameState {
     /// Whether the game is won or lost, which is when the answer may be shown.
     pub fn is_finished(&self) -> bool {
         self.status != Status::Playing
-    }
-
-    /// The 1-based turn the player is on, or the one the game ended on:
-    /// 1 before any miss, 7 at most.
-    pub fn turn(&self) -> usize {
-        (self.attempts.len() + 1).min(MAX_ATTEMPTS)
     }
 
     /// How much of the preview the player may hear, in milliseconds: the
@@ -906,7 +897,6 @@ mod tests {
         assert_eq!(state.status(), Status::Playing);
         assert!(state.attempts().is_empty());
         assert!(!state.is_finished());
-        assert_eq!(state.turn(), 1);
         assert_eq!(state.unlocked_ms(), 100);
     }
 
@@ -918,7 +908,6 @@ mod tests {
         assert!(state.is_finished());
         // The winning guess is not an attempt.
         assert!(state.attempts().is_empty());
-        assert_eq!(state.turn(), 1);
         assert_eq!(state.unlocked_ms(), 30_000);
     }
 
@@ -935,7 +924,6 @@ mod tests {
         for (misses, ms) in LADDER_MS.into_iter().enumerate() {
             assert_eq!(state.status(), Status::Playing);
             assert_eq!(state.attempts().len(), misses);
-            assert_eq!(state.turn(), misses + 1);
             assert_eq!(state.unlocked_ms(), ms);
 
             // Alternate skips and wrong guesses.
@@ -953,7 +941,6 @@ mod tests {
         }
         assert_eq!(state.status(), Status::Lost);
         assert_eq!(state.attempts().len(), 7);
-        assert_eq!(state.turn(), 7);
         assert_eq!(state.unlocked_ms(), 30_000);
     }
 
@@ -963,12 +950,10 @@ mod tests {
         for _ in 0..6 {
             assert_eq!(state.skip(), Ok(Status::Playing));
         }
-        assert_eq!(state.turn(), 7);
         assert_eq!(state.unlocked_ms(), 30_000);
         assert_eq!(state.guess(&answer(), &answer()), Ok(Status::Won));
         assert_eq!(state.status(), Status::Won);
         assert_eq!(state.attempts().len(), 6);
-        assert_eq!(state.turn(), 7);
         assert_eq!(state.unlocked_ms(), 30_000);
     }
 

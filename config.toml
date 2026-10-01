@@ -1,16 +1,22 @@
-# Needledrop server settings. `GTS_BIND` overrides `bind`.
+# Needledrop server settings. The file is read from the working directory;
+# `GTS_CONFIG` points the server at another path.
 
+# `GTS_BIND` overrides this.
 bind = "127.0.0.1:4810"
 
-# Daily pick history, cached previews and the cookie key live here (git-ignored).
+# Cached previews and the cookie key live here (git-ignored).
 data_dir = "data"
 
 # Day 1 of the game, as a UTC date; the day number counts from it.
 launch_date = "2026-10-01"
 
-# Public Deezer playlists the daily song is drawn from. Tracks that are not
-# readable or have no preview are dropped when the pool is loaded.
-# Counts checked on 2026-10-01 from this server (Deezer sees it as US).
+# The one song the server plays, every day, until the daily pick from the
+# playlists below is built. A Deezer track ID; `GTS_TRACK_ID` overrides it.
+track_id = 136889400
+
+# Public Deezer playlists the daily song will be drawn from. Not read yet.
+# Tracks that are not readable or have no preview are dropped when the pool is
+# loaded. Counts checked on 2026-10-01 from this server (Deezer sees it as US).
 playlists = [
   11535307124, # "Rolling Stone: Best Songs of All Time" — 493 tracks, 290 playable (59%)
   5123717724,  # "Most Popular Songs of All Time: Greatest Hits [Upd…" — 501 tracks, 356 playable (71%)

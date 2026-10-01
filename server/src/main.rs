@@ -1,4 +1,4 @@
-//! Needledrop server: config load, shared state, router, static file serving, tracing.
+//! Needledrop server: config load, shared state, router, tracing.
 
 mod config;
 mod daily;
@@ -6,14 +6,15 @@ mod deezer;
 mod game;
 mod mp3;
 mod routes;
+#[cfg(test)]
+mod testutil;
 
 use anyhow::Context;
 use tokio::net::TcpListener;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
-/// Address the server listens on unless `GTS_BIND` says otherwise.
-const DEFAULT_BIND: &str = "127.0.0.1:4810";
+use crate::{config::Config, daily::Daily, deezer::Deezer, routes::AppState};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -25,14 +26,27 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let bind = std::env::var("GTS_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_owned());
+    let config = Config::load()?;
+    tracing::info!(?config, "configuration loaded");
 
-    let app = routes::router().layer(TraceLayer::new_for_http());
+    let key = routes::session_key(config.secret.as_deref(), &config.data_dir)?;
+    let deezer = Deezer::new().context("building the Deezer client")?;
+    let daily = Daily::new(deezer.clone(), &config.data_dir, config.track_id);
+    let state = AppState::new(deezer, daily, config.launch_date, key);
 
-    let listener = TcpListener::bind(&bind)
+    let listener = TcpListener::bind(&config.bind)
         .await
-        .with_context(|| format!("binding {bind}"))?;
+        .with_context(|| format!("binding {}", config.bind))?;
     tracing::info!("listening on http://{}", listener.local_addr()?);
 
+    // Load the song now rather than on the first player's request. A failure
+    // is not fatal: it is logged where it happens and the next request tries
+    // again, so a Deezer hiccup at startup does not need a restart.
+    let warm_up = state.clone();
+    tokio::spawn(async move {
+        let _ = warm_up.song(daily::today_utc()).await;
+    });
+
+    let app = routes::router(state).layer(TraceLayer::new_for_http());
     axum::serve(listener, app).await.context("serving")
 }

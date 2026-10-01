@@ -8,9 +8,6 @@
 //!
 //! Nothing here touches the network or the disk.
 
-// Task 3 removes this once the routes use the module.
-#![allow(dead_code)]
-
 use bytes::Bytes;
 
 /// Extra frames [`Mp3::prefix`] sends beyond the requested duration.
@@ -111,6 +108,7 @@ impl Mp3 {
     }
 
     /// Samples each frame decodes to: 1152 for MPEG-1, 576 for MPEG-2 and 2.5.
+    #[cfg(test)]
     pub fn samples_per_frame(&self) -> u32 {
         self.samples_per_frame
     }
@@ -123,6 +121,7 @@ impl Mp3 {
 
     /// Every audio frame, without tags. Same as a [`prefix`](Self::prefix)
     /// longer than the stream.
+    #[cfg(test)]
     pub fn audio(&self) -> Bytes {
         self.audio.clone()
     }
