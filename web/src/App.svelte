@@ -1,8 +1,8 @@
 <script lang="ts">
-  import { onMount } from 'svelte'
-  // The game page: the four sections as tabs, and the game of the one on
-  // screen. Which section that is comes from the address (see main.ts) and
-  // goes back into it: opening a tab is an entry in the browser's history.
+  import { onMount, tick } from 'svelte'
+  // The game page: the four sections and random mode as tabs, and the game of
+  // the one on screen. Which tab that is comes from the address (see main.ts)
+  // and goes back into it: opening a tab is an entry in the browser's history.
   import Atmosphere from './lib/components/Atmosphere.svelte'
   import Attempts from './lib/components/Attempts.svelte'
   import ClearData from './lib/components/ClearData.svelte'
@@ -10,22 +10,24 @@
   import Play from './lib/components/Play.svelte'
   import Record from './lib/components/Record.svelte'
   import Reveal from './lib/components/Reveal.svelte'
+  import Score from './lib/components/Score.svelte'
   import SectionTabs from './lib/components/SectionTabs.svelte'
   import Skip from './lib/components/Skip.svelte'
   import Stats from './lib/components/Stats.svelte'
   import { game } from './lib/game.svelte'
+  import { songLine } from './lib/random'
   import {
     pageTitle,
     routeFor,
-    sectionLabel,
-    sectionPath,
     tabId,
+    tabLabel,
+    tabPath,
   } from './lib/sections'
-  import type { Section } from './lib/sections'
+  import type { Tab } from './lib/sections'
   import { winningTry } from './lib/stats'
 
-  /** The section the address asked for when the page loaded. */
-  let { section }: { section: Section } = $props()
+  /** The tab the address asked for when the page loaded. */
+  let { tab }: { tab: Tab } = $props()
 
   const PANEL = 'game-panel'
 
@@ -33,16 +35,18 @@
 
   let motionPaused = $state(false)
   let gameRegion: HTMLElement
+  /** The play button of a game in progress. */
+  let play = $state<Play>()
   /** Clear my data went through, and nothing has been played since. */
   let cleared = $state(false)
 
-  const label = $derived(sectionLabel(game.section))
+  const label = $derived(tabLabel(game.tab))
   /** Another section still has a game to play today. */
   const more = $derived(
     game.tabs.some(
-      (tab) =>
-        tab.section !== game.section &&
-        (tab.state === 'unplayed' || tab.state === 'playing'),
+      (mark) =>
+        mark.tab !== game.tab &&
+        (mark.state === 'unplayed' || mark.state === 'playing'),
     ),
   )
   // One sentence at a time for a screen reader: news the player did not cause, else what the last move did.
@@ -58,20 +62,32 @@
 
   // The line that says so stays until the new player has a game on record.
   $effect(() => {
-    if (game.tabs.some((tab) => tab.state !== 'unknown' && tab.state !== 'unplayed' && tab.state !== 'none'))
+    if (game.tabs.some((mark) => mark.state === 'playing' || mark.state === 'won' || mark.state === 'lost'))
       cleared = false
   })
 
   /** A tab was chosen on the page: the address follows it. */
-  function choose(next: Section) {
-    if (next === game.section) return
+  function choose(next: Tab) {
+    if (next === game.tab) return
     gameRegion.scrollTop = 0
-    history.pushState(null, '', sectionPath(next))
+    history.pushState(null, '', tabPath(next))
     game.select(next)
   }
 
+  /** Random mode: on to the next song. */
+  async function next() {
+    if (!(await game.next())) return
+    gameRegion.scrollTop = 0
+    // The button that was pressed is gone, and the keyboard focus with it.
+    // Playing continues at the play button, once the new clip can be played.
+    await game.clipSettled()
+    await tick()
+    const lost = document.activeElement === null || document.activeElement === document.body
+    if (game.random && lost) play?.focus()
+  }
+
   onMount(() => {
-    game.open(section)
+    game.open(tab)
     const onvisible = () => {
       if (document.visibilityState === 'visible') game.refresh()
     }
@@ -80,7 +96,7 @@
       const route = routeFor(location.pathname)
       if (route.page === 'game') {
         gameRegion.scrollTop = 0
-        game.select(route.section)
+        game.select(route.tab)
       }
       else location.reload()
     }
@@ -93,15 +109,15 @@
   })
 
   $effect(() => {
-    document.title = pageTitle(game.section)
+    document.title = pageTitle(game.tab)
   })
 </script>
 
 <Atmosphere
   playing={game.playing}
   paused={motionPaused}
-  status={game.daily ? game.status : 'loading'}
-  scene={game.section}
+  status={game.view ? game.status : 'loading'}
+  scene={game.scene}
   analyser={() => game.player.analyser}
 />
 <div class="page" class:still={motionPaused}>
@@ -120,15 +136,20 @@
       Needledrop<span class="brand-note">The daily listening game</span>
     </h1>
     <p class="number numeric" data-sky-calm>
-      <span>Daily pressing</span>{game.number !== null
-        ? `No. ${String(game.number).padStart(3, '0')}`
-        : 'No. —'}
+      {#if game.random}
+        <!-- No day here: the pressing is numbered by its place in the session. -->
+        <span>Random pressing</span>{songLine(game.song) || 'Song —'}
+      {:else}
+        <span>Daily pressing</span>{game.number !== null
+          ? `No. ${String(game.number).padStart(3, '0')}`
+          : 'No. —'}
+      {/if}
     </p>
   </header>
   <div class="sections">
     <SectionTabs
       tabs={game.tabs}
-      selected={game.section}
+      selected={game.tab}
       panel={PANEL}
       onselect={choose}
     />
@@ -146,29 +167,80 @@
   <main bind:this={gameRegion} data-sky-calm>
     <!-- Always there, so that what it comes to say is announced. -->
     <p class="sr-only" role="status">{spoken}</p>
-    {#key game.section}
+    {#key game.tab}
       <div
         class="panel"
         id={PANEL}
         role="tabpanel"
-        aria-labelledby={tabId(game.section)}
+        aria-labelledby={tabId(game.tab)}
       >
         {#if game.info}<p class="info" aria-hidden="true">{game.info}</p>{/if}
-        {#if game.daily}
+        {#if game.noSong}
+          <div class="empty">
+            {#if game.random}
+              <h2>No song to play</h2>
+              <p>
+                Random has nothing it can play right now. Check again in a
+                moment, or play today's sections.
+              </p>
+            {:else}
+              <h2>No song today</h2>
+              <p>
+                {label} has nothing to play today. Try another section, or come
+                back tomorrow.
+              </p>
+            {/if}
+            {#if game.loadError ?? game.moveError}<p class="error" role="alert">
+                {game.loadError ?? game.moveError}
+              </p>{/if}
+            <button
+              class="button outline"
+              type="button"
+              onclick={() => game.load()}
+              disabled={game.loading || game.submitting}
+              >{game.loading || game.drawing
+                ? 'Checking…'
+                : 'Check again'}</button
+            >
+          </div>
+        {:else if game.view}
           {#if game.finished}
-            <Reveal {game} />
+            {#if game.random}
+              <Reveal {game}>
+                <button
+                  class="button solid next"
+                  type="button"
+                  onclick={next}
+                  disabled={game.submitting}
+                  >{game.drawing ? 'Finding…' : 'Next song'}</button
+                >
+              </Reveal>
+              {#if game.moveError}<p class="error" role="alert">
+                  {game.moveError}
+                </p>{/if}
+            {:else}
+              <Reveal {game} />
+            {/if}
             {#if game.stats}
               <Stats
                 stats={game.stats}
                 title="Your {label} stats"
                 todaysTry={winningTry(game.status, game.attempts.length)}
               />
+            {:else if game.score}
+              <Score score={game.score} />
             {/if}
           {:else}
             <div class="intro">
-              <p class="eyebrow">Put your music memory to the test</p>
+              <p class="eyebrow">
+                {game.random
+                  ? 'As many songs as you like'
+                  : 'Put your music memory to the test'}
+              </p>
               <h2>Know it from <br /><span>the first note?</span></h2>
-              <p>Listen closely. Name today's mystery song.</p>
+              <p>
+                Listen closely. Name {game.random ? 'the' : "today's"} mystery song.
+              </p>
             </div>
             <div class="clip-steps" aria-hidden="true">
               {#each game.ladder as seconds, i}<div
@@ -180,7 +252,7 @@
                   >
                 </div>{/each}
             </div>
-            <Play {game} />
+            <Play {game} bind:this={play} />
             <GuessInput
               onguess={(track) => game.guess(track)}
               busy={game.submitting}
@@ -194,30 +266,15 @@
           <p class="rules">
             {#if !game.finished}
               Each skip or wrong guess unlocks a longer clip.
+            {:else if game.random}
+              A miss ends the run. Closing this tab ends the session; your best
+              run is kept.
             {:else if more}
               {label} is back tomorrow. Today's other sections are still open.
             {:else}
               Come back tomorrow for four fresh games.
             {/if}
           </p>
-        {:else if game.noSong}
-          <div class="empty">
-            <h2>No song today</h2>
-            <p>
-              {label} has nothing to play today. Try another section, or come
-              back tomorrow.
-            </p>
-            {#if game.loadError}<p class="error" role="alert">
-                {game.loadError}
-              </p>{/if}
-            <button
-              class="button outline"
-              type="button"
-              onclick={() => game.load()}
-              disabled={game.loading}
-              >{game.loading ? 'Checking…' : 'Check again'}</button
-            >
-          </div>
         {:else if game.loadError}
           <div class="failed" role="alert">
             <p class="error">{game.loadError}</p>
@@ -227,7 +284,9 @@
               onclick={() => game.load()}>Try again</button
             >
           </div>
-        {:else}<p class="loading" role="status">Loading today's song…</p>{/if}
+        {:else}<p class="loading" role="status">
+            {game.random ? 'Finding a song…' : "Loading today's song…"}
+          </p>{/if}
       </div>
     {/key}
   </main>
@@ -433,7 +492,7 @@
     padding: 0.5rem 0 1rem;
     min-width: 0;
   }
-  /* One section's game. A tab that is opened fades in; nothing slides. */
+  /* One tab's game. A tab that is opened fades in; nothing slides. */
   .panel {
     display: grid;
     gap: 1.25rem;
@@ -558,6 +617,10 @@
   .unit {
     margin-left: 0.15em;
     font-size: 0.625rem;
+  }
+  /* Random mode's way on. Fixed in width, so it does not move while the next song is found. */
+  .next {
+    min-width: 8.5rem;
   }
   .rules {
     color: var(--muted);

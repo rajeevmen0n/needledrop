@@ -8,6 +8,7 @@
   import { onMount } from 'svelte'
   import { ladderFraction } from '../clip'
   import type { Game } from '../game.svelte'
+  import { songLine } from '../random'
   import { RecordPainter } from '../record'
   import type { Palette, RecordView } from '../record'
 
@@ -45,6 +46,7 @@
   let delays: number[] = []
   let labels: string[] = []
   let printed = 0
+  let series = ''
   let stamp = ''
 
   let cover: HTMLImageElement | null = null
@@ -54,7 +56,7 @@
   /** False until the first state of the game on screen has been shown; that one appears without animation. */
   let shown = false
   let wasFinished = false
-  /** The game the record is showing: a section on a day. Another one is put on without ceremony. */
+  /** The game the record is showing: a section on a day, or one random song. Another one is put on without ceremony. */
   let scene = ''
 
   let still = false
@@ -211,6 +213,7 @@
       rotation,
       needle,
       wave,
+      series,
       stamp,
       cover: coverReady ? cover : null,
       printed,
@@ -300,15 +303,16 @@
     const ladder = game.ladder
     const unlocked = game.clipSeconds
     const finished = game.finished
-    const day = game.day ?? undefined
-    const now = `${game.section} ${day}`
+    const now = game.scene
     if (now !== scene) {
-      // Another tab or another day: a different record, not this one changing.
+      // Another tab, another day or the next random song: a different record, not this one changing.
       scene = now
       shown = false
       reveal = null
     }
-    stamp = dayStamp(day)
+    // A daily pressing is stamped with its day, a random one with its place in the session.
+    series = game.random ? 'THE RANDOM PRESSING' : 'THE DAILY PRESSING'
+    stamp = game.random ? songLine(game.song) : dayStamp(game.day ?? undefined)
     if (ladder.length === 0) {
       // Nothing is known of this game yet (or it has no song): a blank side.
       lit = lit.map(() => 0)

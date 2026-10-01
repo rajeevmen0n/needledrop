@@ -25,16 +25,18 @@ use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
 use super::{
     Genre, Genres, NewSong, Pick, PlayerId, PoolSong, Section, Store, StoreError, decode_game,
+    decode_random_game,
 };
-use crate::game::GameState;
+use crate::{game::GameState, random::RandomGame};
 
 /// The script that brings the schema to each version, in order. Version 0 is
 /// a database without a schema version: a new file, or the one that was built
 /// by hand before the server made its own (see the first script).
-const MIGRATIONS: [(i64, &str); 3] = [
+const MIGRATIONS: [(i64, &str); 4] = [
     (1, include_str!("sqlite/001_songs.sql")),
     (2, include_str!("sqlite/002_games.sql")),
     (3, include_str!("sqlite/003_picks_and_clock.sql")),
+    (4, include_str!("sqlite/004_random_games.sql")),
 ];
 
 /// The version this server reads and writes.
@@ -159,6 +161,7 @@ fn check_schema(connection: &Connection) -> Result<(), Failure> {
         "SELECT player, section, day, state FROM games".to_owned(),
         "SELECT day, section, track_id FROM picks".to_owned(),
         "SELECT id, day_offset FROM clock".to_owned(),
+        "SELECT player, state FROM random_games".to_owned(),
     ] {
         connection.prepare(&sql).map_err(|error| {
             Failure::Data(format!(
@@ -256,9 +259,9 @@ fn load_song(connection: &Connection, id: i64) -> Result<Option<PoolSong>, Failu
 
 /// A text column of the current row, or `""` when what is stored there is not
 /// text (a blob, bytes that are not UTF-8). Nothing this server writes is
-/// like that, and the empty string then fails [`decode_game`]'s checks, which
-/// is how a game that cannot be read is meant to be treated: left out and
-/// logged, not an error.
+/// like that, and the empty string then fails [`decode_game`]'s checks (and
+/// [`decode_random_game`]'s), which is how a game that cannot be read is
+/// meant to be treated: left out and logged, not an error.
 fn text_or_empty<'row>(row: &'row Row<'_>, column: usize) -> Result<&'row str, Failure> {
     Ok(row.get_ref(column)?.as_str().unwrap_or_default())
 }
@@ -479,10 +482,56 @@ impl Store for SqliteStore {
         .await
     }
 
+    async fn random_game(&self, player: &PlayerId) -> Result<Option<RandomGame>, StoreError> {
+        let player = player.clone();
+        self.run("reading a random game", move |connection| {
+            let mut statement =
+                connection.prepare("SELECT state FROM random_games WHERE player = ?1")?;
+            let mut rows = statement.query([player.as_str()])?;
+            let Some(row) = rows.next()? else {
+                return Ok(None);
+            };
+            Ok(decode_random_game(&player, text_or_empty(row, 0)?))
+        })
+        .await
+    }
+
+    async fn save_random_game(
+        &self,
+        player: &PlayerId,
+        game: &RandomGame,
+    ) -> Result<(), StoreError> {
+        const WHAT: &str = "saving a random game";
+        // Kept as the JSON `RandomGame` writes and checks itself, as a daily
+        // game is.
+        let state = serde_json::to_string(game).map_err(|error| StoreError::new(WHAT, error))?;
+        let player = player.clone();
+        self.run(WHAT, move |connection| {
+            // One statement, so the row is replaced whole or not at all.
+            connection.execute(
+                "INSERT INTO random_games (player, state) VALUES (?1, ?2) \
+                 ON CONFLICT (player) DO UPDATE SET state = excluded.state",
+                params![player.as_str(), state],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
     async fn delete_player(&self, player: &PlayerId) -> Result<usize, StoreError> {
         let player = player.clone();
         self.run("deleting a player's games", move |connection| {
-            Ok(connection.execute("DELETE FROM games WHERE player = ?1", [player.as_str()])?)
+            // SQLite can do both at once, which is more than the trait asks.
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute(
+                "DELETE FROM random_games WHERE player = ?1",
+                [player.as_str()],
+            )?;
+            let games =
+                transaction.execute("DELETE FROM games WHERE player = ?1", [player.as_str()])?;
+            transaction.commit()?;
+            Ok(games)
         })
         .await
     }
@@ -587,10 +636,11 @@ impl Store for SqliteStore {
 
     async fn wipe_games_and_picks(&self) -> Result<(), StoreError> {
         self.run("wiping the games and the picks", |connection| {
-            // SQLite can do both at once, which is more than the trait asks.
+            // SQLite can do it all at once, which is more than the trait asks.
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             transaction.execute("DELETE FROM games", [])?;
+            transaction.execute("DELETE FROM random_games", [])?;
             transaction.execute("DELETE FROM picks", [])?;
             transaction.commit()?;
             Ok(())
@@ -1390,5 +1440,167 @@ mod tests {
             .unwrap();
         assert_eq!(stored.track_id, largest);
         assert_eq!(store.song(largest).await.unwrap(), Some(stored));
+    }
+
+    // --- random games ---------------------------------------------------------------
+
+    /// A random game on its second song: the first won on the first try, the
+    /// second skipped once.
+    fn random_game() -> RandomGame {
+        let song = crate::game::TrackMeta::new("The Song", "", "Someone");
+        let mut game = RandomGame::start(None, 916_424, date(2026, 10, 1));
+        game.guess(&song, &song).unwrap();
+        let mut game = game.next(3_135_556, date(2026, 10, 1)).unwrap();
+        game.skip().unwrap();
+        game
+    }
+
+    /// The `state` of every row of `random_games`, read with a connection of
+    /// the test's own.
+    fn random_rows(path: &Path) -> Vec<(String, String)> {
+        Connection::open(path)
+            .unwrap()
+            .prepare("SELECT player, state FROM random_games")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_random_game_is_stored_as_the_documented_row_and_survives_reopening() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("random.db");
+        let player = PlayerId::generate();
+        let game = random_game();
+
+        let store = SqliteStore::open(&path).unwrap();
+        // Saved twice: one row per player, however often it is replaced.
+        store
+            .save_random_game(&player, &RandomGame::start(None, 7, date(2026, 10, 1)))
+            .await
+            .unwrap();
+        store.save_random_game(&player, &game).await.unwrap();
+        drop(store);
+
+        assert_eq!(
+            random_rows(&path),
+            vec![(
+                player.to_string(),
+                concat!(
+                    r#"{"round":2,"track_id":3135556,"#,
+                    r#""game":{"day":"2026-10-01","attempts":[{"kind":"skip"}],"status":"playing"},"#,
+                    r#""run":1,"played":1,"won":1,"best_run":1,"recent":[916424,3135556]}"#
+                )
+                .to_owned()
+            )]
+        );
+
+        // A restart: the same file, a new connection.
+        let reopened = SqliteStore::open(&path).unwrap();
+        assert_eq!(reopened.random_game(&player).await.unwrap(), Some(game));
+    }
+
+    #[tokio::test]
+    async fn a_stored_random_game_that_cannot_be_read_counts_as_not_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("random.db");
+        let store = SqliteStore::open(&path).unwrap();
+        let good = PlayerId::generate();
+        let game = random_game();
+        store.save_random_game(&good, &game).await.unwrap();
+
+        // Rows this server would never write: not JSON, a game whose song is
+        // not the latest of its recent ones, a run without the wins for it,
+        // a daily game that cannot be, and a blob where the text should be.
+        let odd: Vec<PlayerId> = (0..5).map(|_| PlayerId::generate()).collect();
+        execute(
+            &path,
+            &format!(
+                r#"INSERT INTO random_games (player, state) VALUES
+                     ('{}', 'not json at all'),
+                     ('{}', '{{"round":1,"track_id":7,"game":{{"day":"2026-10-01","attempts":[],"status":"playing"}},"run":0,"played":0,"won":0,"best_run":0,"recent":[8]}}'),
+                     ('{}', '{{"round":4,"track_id":7,"game":{{"day":"2026-10-01","attempts":[],"status":"playing"}},"run":3,"played":1,"won":1,"best_run":3,"recent":[7]}}'),
+                     ('{}', '{{"round":1,"track_id":7,"game":{{"day":"2026-10-01","attempts":[],"status":"lost"}},"run":0,"played":1,"won":0,"best_run":0,"recent":[7]}}'),
+                     ('{}', x'00ff00');"#,
+                odd[0], odd[1], odd[2], odd[3], odd[4]
+            ),
+        );
+
+        // None of them is an error: the player has no random game, and the
+        // page starts one.
+        for player in &odd {
+            assert_eq!(store.random_game(player).await.unwrap(), None, "{player}");
+        }
+        // The readable one is untouched by its neighbours.
+        assert_eq!(store.random_game(&good).await.unwrap(), Some(game.clone()));
+
+        // The next save replaces the row, and clearing the data removes one
+        // that was never replaced.
+        store.save_random_game(&odd[0], &game).await.unwrap();
+        assert_eq!(store.random_game(&odd[0]).await.unwrap(), Some(game));
+        assert_eq!(store.delete_player(&odd[1]).await.unwrap(), 0);
+        let rows: i64 = Connection::open(&path)
+            .unwrap()
+            .query_row("SELECT count(*) FROM random_games", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 5);
+    }
+
+    #[tokio::test]
+    async fn a_database_from_before_random_mode_gains_its_table_and_keeps_its_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("needledrop.db");
+        // A database as the previous version of the server left it: schema
+        // version 3, with songs, a game, a pick and a day offset.
+        execute(&path, HAND_BUILT);
+        execute(&path, MIGRATIONS[1].1);
+        execute(&path, MIGRATIONS[2].1);
+        execute(&path, "PRAGMA user_version = 3");
+        let player = PlayerId::generate();
+        execute(
+            &path,
+            &format!(
+                r#"INSERT INTO games (player, section, day, state) VALUES
+                     ('{player}', 'general', '2026-10-01',
+                      '{{"day":"2026-10-01","attempts":[],"status":"won"}}');
+                   INSERT INTO picks (day, section, track_id) VALUES ('2026-10-01', 'general', 4603408);
+                   INSERT INTO clock (id, day_offset) VALUES (1, 2);"#
+            ),
+        );
+
+        let store = SqliteStore::open(&path).unwrap();
+        assert_eq!(user_version(&path), SCHEMA_VERSION);
+        // What was there is as it was.
+        assert_eq!(store.songs().await.unwrap().len(), 2);
+        assert_eq!(
+            store.games(&player, Section::General).await.unwrap(),
+            vec![won_game(date(2026, 10, 1), 0)]
+        );
+        assert_eq!(store.picks_on(date(2026, 10, 1)).await.unwrap().len(), 1);
+        assert_eq!(store.day_offset().await.unwrap(), 2);
+
+        // And the new record starts empty and works.
+        assert_eq!(store.random_game(&player).await.unwrap(), None);
+        let game = random_game();
+        store.save_random_game(&player, &game).await.unwrap();
+        assert_eq!(store.random_game(&player).await.unwrap(), Some(game));
+    }
+
+    #[test]
+    fn a_random_games_table_of_another_shape_is_refused_and_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool.db");
+        execute(&path, HAND_BUILT);
+        execute(&path, MIGRATIONS[1].1);
+        execute(&path, MIGRATIONS[2].1);
+        execute(&path, "PRAGMA user_version = 3");
+        execute(&path, "CREATE TABLE random_games (id INTEGER PRIMARY KEY)");
+
+        // The script that creates the table fails on the one in its way.
+        let error = SqliteStore::open(&path).err().unwrap().to_string();
+        assert!(error.contains("pool.db"), "{error}");
+        assert_eq!(user_version(&path), 3);
     }
 }

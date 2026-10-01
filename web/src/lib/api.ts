@@ -3,10 +3,11 @@
 // Who is playing is an HttpOnly cookie the server sets. Same-origin `fetch`
 // sends it by itself, so nothing here handles it.
 
+import type { RandomScore } from './random'
 import type { Section, TabInfo } from './sections'
 import type { Stats } from './stats'
 
-export type { Section, Stats }
+export type { RandomScore, Section, Stats }
 
 export type Status = 'playing' | 'won' | 'lost'
 
@@ -23,13 +24,8 @@ export interface Answer {
   link: string
 }
 
-/** One section's game today. */
-export interface Daily {
-  /** The server's day, "2026-10-01". */
-  day: string
-  /** 1 on launch day. */
-  number: number
-  section: Section
+/** What a section's game and a random song have in common: all the record, the rail and the tries need. */
+export interface GameView {
   /** Clip length in seconds for each turn. */
   ladder: number[]
   attempts: Attempt[]
@@ -37,8 +33,32 @@ export interface Daily {
   /** The clip length unlocked right now; the last ladder step once finished. */
   clipSeconds: number
   answer: Answer | null
+}
+
+/** One section's game today. */
+export interface Daily extends GameView {
+  /** The server's day, "2026-10-01". */
+  day: string
+  /** 1 on launch day. */
+  number: number
+  section: Section
   /** The player's record in this section, in every state. */
   stats: Stats
+}
+
+/** The song random mode is playing for this browser, with the session's score. */
+export interface RandomSong extends GameView, RandomScore {
+  /**
+   * Names the song: it goes up with every song drawn for this player. A move
+   * says which round it is for, so one made for a song that another tab has
+   * left behind is refused instead of landing on the next song.
+   */
+  round: number
+}
+
+/** Whether a game on screen is random mode's and not a section's. */
+export function isRandomSong(view: Daily | RandomSong): view is RandomSong {
+  return 'round' in view
 }
 
 /** One section in the overview: where the player stands there today, and whether it has a song. */
@@ -68,8 +88,8 @@ export type Move = { trackId: number } | { skip: true }
 
 /**
  * A failed request. `code` is the server's `error` field (`bad_request`,
- * `unknown_track`, `not_found`, `no_song`, `finished`, `changed`, `upstream`,
- * `internal`) or one made up here: `network` when nothing answered,
+ * `unknown_track`, `not_found`, `no_song`, `no_game`, `finished`, `unfinished`,
+ * `changed`, `upstream`, `internal`) or one made up here: `network` when nothing answered,
  * `bad_response` when the answer was not the expected JSON. `message` is a
  * sentence fit to show the player.
  */
@@ -166,11 +186,53 @@ export function searchTracks(query: string, signal?: AbortSignal): Promise<Track
   return request<Track[]>(`/api/search?q=${encodeURIComponent(query)}`, { signal })
 }
 
+// --- random mode -----------------------------------------------------------------
+
+function post<T>(path: string, body?: object): Promise<T> {
+  return request<T>(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined,
+  })
+}
+
+/**
+ * The random song this browser is on. Fails with `no_game` when the server
+ * has none for it: nothing was started yet, or the data was cleared.
+ */
+export function getRandom(): Promise<RandomSong> {
+  return request<RandomSong>('/api/random', { cache: 'no-store' })
+}
+
+/**
+ * Starts a random session: the run and the totals are back to zero, whatever
+ * song was being played is left behind, and a song is drawn. Can take as long
+ * as a download.
+ */
+export function startRandom(): Promise<RandomSong> {
+  return post<RandomSong>('/api/random/start')
+}
+
+/** Skip or guess on the random song of `round`. Resolves with the song after the move. */
+export function postRandomGuess(round: number, move: Move): Promise<RandomSong> {
+  return post<RandomSong>('/api/random/guess', { round, ...move })
+}
+
+/** Draws the session's next song, once the song of `round` is over. */
+export function postRandomNext(round: number): Promise<RandomSong> {
+  return post<RandomSong>('/api/random/next', { round })
+}
+
+// --- the clip --------------------------------------------------------------------
+
 /**
  * Where a game's currently unlocked clip is. The audio changes after every
- * move and every midnight while the path stays the same, so the query, which
- * the server ignores, makes each state its own URL.
+ * move, every midnight and every new random song while the path stays the
+ * same, so the query, which the server ignores, makes each state its own URL.
  */
-export function audioUrl(daily: Daily): string {
-  return `/api/daily/${daily.section}/audio?t=${daily.day}-${daily.attempts.length}-${daily.status}`
+export function audioUrl(view: Daily | RandomSong): string {
+  if (isRandomSong(view)) {
+    return `/api/random/audio?t=${view.round}-${view.attempts.length}-${view.status}`
+  }
+  return `/api/daily/${view.section}/audio?t=${view.day}-${view.attempts.length}-${view.status}`
 }

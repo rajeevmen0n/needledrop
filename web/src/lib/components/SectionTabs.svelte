@@ -1,33 +1,34 @@
 <script lang="ts">
-  // The four sections as WAI-ARIA tabs with manual activation: the arrows,
-  // Home and End move the focus, Enter or Space opens the tab. Opening a tab
-  // stops the clip and may wait for the server, so it never follows the focus.
+  // The four sections and random mode as WAI-ARIA tabs with manual
+  // activation: the arrows, Home and End move the focus, Enter or Space opens
+  // the tab. Opening a tab stops the clip and may wait for the server, so it
+  // never follows the focus.
   //
-  // Each tab is a real link to the section's own address, so it can be opened
-  // in a new browser tab or copied; a plain click is handed to `onselect`.
-  // Every state has its own mark and words, so none is told apart by colour.
+  // Each tab is a real link to its own address, so it can be opened in a new
+  // browser tab or copied; a plain click is handed to `onselect`. Every state
+  // has its own mark and words, so none is told apart by colour.
   import {
-    sectionLabel,
-    sectionPath,
     tabForKey,
     tabId,
+    tabLabel,
+    tabPath,
     tabStateWords,
   } from '../sections'
-  import type { Section, TabState } from '../sections'
+  import type { Tab, TabState } from '../sections'
 
   interface Props {
-    tabs: { section: Section; state: TabState }[]
-    selected: Section
+    tabs: { tab: Tab; state: TabState }[]
+    selected: Tab
     /** The `id` of the tab panel these tabs control. */
     panel: string
-    onselect: (section: Section) => void
+    onselect: (tab: Tab) => void
   }
 
   let { tabs, selected, panel, onselect }: Props = $props()
 
   let list = $state<HTMLElement>()
 
-  function onclick(event: MouseEvent, section: Section) {
+  function onclick(event: MouseEvent, tab: Tab) {
     // A modified click is the browser's: a new tab, a new window, a download.
     if (
       event.button !== 0 ||
@@ -38,14 +39,14 @@
     )
       return
     event.preventDefault()
-    onselect(section)
+    onselect(tab)
   }
 
   function onkeydown(event: KeyboardEvent, index: number) {
     if (event.key === ' ') {
       // A link opens on Enter by itself; a tab also opens on Space.
       event.preventDefault()
-      onselect(tabs[index].section)
+      onselect(tabs[index].tab)
       return
     }
     if (event.metaKey || event.ctrlKey || event.altKey) return
@@ -59,43 +60,48 @@
 <div
   class="tabs"
   role="tablist"
-  aria-label="Today's games"
+  aria-label="Games"
   bind:this={list}
   data-sky-calm
 >
-  {#each tabs as tab, i (tab.section)}
-    {@const words = tabStateWords(tab.state)}
+  {#each tabs as { tab, state }, i (tab)}
+    {@const words = tabStateWords(state)}
     <a
       role="tab"
-      id={tabId(tab.section)}
-      href={sectionPath(tab.section)}
-      class={tab.state}
-      aria-selected={tab.section === selected}
+      id={tabId(tab)}
+      href={tabPath(tab)}
+      class={state}
+      aria-selected={tab === selected}
       aria-controls={panel}
-      tabindex={tab.section === selected ? 0 : -1}
-      title={words ? `${sectionLabel(tab.section)}: ${words}` : undefined}
+      tabindex={tab === selected ? 0 : -1}
+      title={words ? `${tabLabel(tab)}: ${words}` : undefined}
       draggable="false"
-      onclick={(event) => onclick(event, tab.section)}
+      onclick={(event) => onclick(event, tab)}
       onkeydown={(event) => onkeydown(event, i)}
     >
       <span class="mark" aria-hidden="true">
         <svg viewBox="0 0 16 16" width="14" height="14">
-          {#if tab.state === 'won'}
+          {#if state === 'won'}
             <path d="m3.5 8.5 3 3 6-7" />
-          {:else if tab.state === 'lost'}
+          {:else if state === 'lost'}
             <path d="m4 4 8 8m0-8-8 8" />
-          {:else if tab.state === 'playing'}
+          {:else if state === 'playing'}
             <circle cx="8" cy="8" r="5.5" />
             <circle class="dot" cx="8" cy="8" r="2.5" />
-          {:else if tab.state === 'unplayed'}
+          {:else if state === 'unplayed'}
             <circle cx="8" cy="8" r="5.5" />
-          {:else if tab.state === 'none'}
+          {:else if state === 'none'}
             <path d="M3.5 8h9" />
+          {:else if state === 'endless'}
+            <!-- A loop with no end: random mode is never won or lost. -->
+            <path
+              d="M8 8C6.6 6.2 5.6 5.25 4.4 5.25a2.75 2.75 0 0 0 0 5.5C5.6 10.75 6.6 9.8 8 8s2.4-2.75 3.6-2.75a2.75 2.75 0 0 1 0 5.5C10.4 10.75 9.4 9.8 8 8Z"
+            />
           {/if}
         </svg>
       </span>
       <!-- No space before the comma: the two spans are one name to a screen reader. -->
-      <span class="name">{sectionLabel(tab.section)}</span
+      <span class="name">{tabLabel(tab)}</span
       >{#if words}<span class="sr-only">, {words}</span>{/if}
     </a>
   {/each}
@@ -104,22 +110,26 @@
 <style>
   .tabs {
     display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(5, minmax(0, 1fr));
     border-bottom: var(--line) solid var(--border);
   }
 
+  /* On a phone five tabs share the row, so the mark sits above the word and
+     the longest word has a whole column to itself. */
   a {
     position: relative;
     display: flex;
+    flex-direction: column;
     align-items: center;
     justify-content: center;
-    gap: 0.375rem;
+    gap: 0.125rem;
     min-width: 0;
     min-height: var(--target);
-    padding: 0 0.25rem;
+    padding: 0 0.125rem;
     color: var(--muted);
     font-size: var(--text-small);
     font-weight: var(--weight-medium);
+    line-height: 1.15;
     text-decoration: none;
     white-space: nowrap;
     touch-action: manipulation;
@@ -202,7 +212,6 @@
 
   @media (max-width: 22.5rem) {
     a {
-      gap: 0.25rem;
       padding: 0;
       font-size: 0.75rem;
     }
@@ -223,7 +232,8 @@
     }
   }
 
-  /* With room to spare the tabs keep to their own width, at the page's left edge. */
+  /* With room to spare the mark goes back beside the word, and the tabs keep
+     to their own width, at the page's left edge. */
   @media (min-width: 40rem) {
     .tabs {
       display: flex;
@@ -231,6 +241,8 @@
     }
 
     a {
+      flex-direction: row;
+      gap: 0.375rem;
       padding: 0 1rem;
       font-size: 0.875rem;
     }

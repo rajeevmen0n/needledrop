@@ -2,11 +2,16 @@
   // The end of the game: the result, the song printed large, and the whole
   // clip to play. After a move the lines print in one after another; on a
   // reload they are simply there.
+  //
+  // What it is given as children is the way on, random mode's "Next song". It
+  // comes straight after the song, so that on a phone it is reached without
+  // scrolling past the cover; in the side layout it sits beside the play button.
   import { onMount } from 'svelte'
+  import type { Snippet } from 'svelte'
   import type { Game } from '../game.svelte'
   import Play from './Play.svelte'
 
-  let { game }: { game: Game } = $props()
+  let { game, children }: { game: Game; children?: Snippet } = $props()
 
   /** Titles longer than this are set a size down, so they do not fill the screen. */
   const LONG_TITLE = 22
@@ -29,7 +34,12 @@
   })
 </script>
 
-<section class="reveal" class:fresh aria-labelledby="reveal-heading">
+<section
+  class="reveal"
+  class:fresh
+  class:onwards={!!children}
+  aria-labelledby="reveal-heading"
+>
   <h2 id="reveal-heading" tabindex="-1" bind:this={heading}>
     <span class="mark" class:won={game.status === 'won'} aria-hidden="true">
       <svg viewBox="0 0 16 16" width="16" height="16">
@@ -49,6 +59,12 @@
       <p class="title print" class:long={answer.title.length > LONG_TITLE}>{answer.title}</p>
       <p class="artist print">{answer.artist}</p>
     </div>
+  {/if}
+  {#if children}
+    <div class="onward print">{@render children()}</div>
+  {/if}
+  {#if game.answer}
+    {@const answer = game.answer}
     <div class="release print">
       {#if answer.cover}
         <img src={answer.cover} alt="Cover of {answer.album}" width="112" height="112" />
@@ -60,7 +76,7 @@
     </div>
   {/if}
 
-  <div class="print">
+  <div class="listen print">
     <Play {game} />
   </div>
 </section>
@@ -167,6 +183,32 @@
     font-weight: var(--weight-medium);
   }
 
+  .onward {
+    display: flex;
+  }
+
+  /* Beside the record there is room: the way on moves down, next to listening again. */
+  @media (min-width: 40rem) and (min-aspect-ratio: 6/5) {
+    .onwards {
+      grid-template-columns: minmax(0, 1fr) auto;
+    }
+
+    .onwards > * {
+      grid-column: 1 / -1;
+    }
+
+    .onwards > .listen {
+      grid-column: 1;
+      grid-row: 4;
+    }
+
+    .onwards > .onward {
+      grid-column: 2;
+      grid-row: 4;
+      align-self: center;
+    }
+  }
+
   /* The reveal is uncovered in sequence as the artwork arrives on the label. */
   .fresh .print {
     animation: print 700ms var(--ease-out) both;
@@ -181,11 +223,16 @@
     animation-delay: calc(var(--reveal-step) * 7);
   }
 
+  /* The way on follows the song it comes after, so it can be pressed without waiting for the rest. */
+  .fresh .onward {
+    animation-delay: calc(var(--reveal-step) * 8);
+  }
+
   .fresh .release {
     animation-delay: calc(var(--reveal-step) * 9);
   }
 
-  .fresh div.print:last-child {
+  .fresh .listen {
     animation-delay: calc(var(--reveal-step) * 11);
   }
 

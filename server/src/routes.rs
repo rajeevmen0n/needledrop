@@ -1,13 +1,15 @@
 //! The game's HTTP handlers and the state every handler shares.
 //!
-//! The admin routes live in [`crate::admin`] and the player cookie and Clear
-//! my data in [`crate::player`]; [`router`] mounts them all.
+//! The admin routes live in [`crate::admin`], random mode in
+//! [`crate::random`] and the player cookie and Clear my data in
+//! [`crate::player`]; [`router`] mounts them all.
 //!
 //! The rule every handler here keeps: while a section's game is `playing`,
 //! nothing that identifies that section's song leaves the server. The answer
-//! goes out through one place only ([`DailyView::new`]), error messages are
-//! fixed sentences, the cookie holds an anonymous ID and nothing about the
-//! game, and the audio is the clip the player has unlocked and no more.
+//! goes out through one place only ([`DailyView::new`]; random mode has one of
+//! its own), error messages are fixed sentences, the cookie holds an
+//! anonymous ID and nothing about the game, and the audio is the clip the
+//! player has unlocked and no more.
 //!
 //! There are four games a day, one per [`Section`], each with its own song
 //! ([`crate::daily`]). A game is kept in the store under the player's ID, its
@@ -44,6 +46,7 @@ use crate::{
     game::{self, Attempt, GameError, GameState, MAX_ATTEMPTS, Status, TrackMeta},
     pick,
     player::{self, MoveLocks},
+    random,
     stats::Stats,
     store::{PlayerId, Section, Store, StoreError},
 };
@@ -163,6 +166,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/daily/{section}/guess", post(guess))
         .route("/api/player", delete(player::clear))
         .route("/api/search", get(search))
+        .merge(random::routes())
         .merge(admin::routes())
         .fallback(not_found)
         .with_state(state)
@@ -187,12 +191,30 @@ pub enum ApiError {
     /// 404: the section has no song to play today. The client shows it as
     /// "No song today"; it is not a failure that a retry would mend.
     NoSong,
+    /// 404, with the same code: random mode has nothing to draw. Its pool is
+    /// empty, or everything in it plays in a section today or failed the
+    /// preview check today.
+    NothingToDraw,
+    /// 404: the player has no random game: none was ever started under
+    /// their ID, or it was cleared since.
+    NoGame,
     /// 409: a move on a game that is already won or lost.
     Finished,
+    /// 409, with the same code: a move on a random song that is already won
+    /// or lost.
+    SongOver,
+    /// 409: the next random song was asked for while the current one is
+    /// still being played.
+    Unfinished,
     /// 409: the section's song was replaced (a re-roll, a reset) while the
     /// request was under way, so what the player was answering is gone. The
     /// move was not made; the client loads the game again.
     Changed,
+    /// 409, with the same code: a move or a "next song" in random mode that
+    /// names another song than the one the player is on, because another
+    /// tab has moved on or started over. Nothing was changed; the client
+    /// loads the game again.
+    Moved,
     /// 502: Deezer failed, or this server is holding back to stay under
     /// Deezer's rate limit.
     Upstream(&'static str),
@@ -221,15 +243,40 @@ impl ApiError {
                 "no_song",
                 "There is no song in this section today.",
             ),
+            Self::NothingToDraw => (
+                StatusCode::NOT_FOUND,
+                "no_song",
+                "There is no song to play in random mode right now.",
+            ),
+            Self::NoGame => (
+                StatusCode::NOT_FOUND,
+                "no_game",
+                "No random game has been started.",
+            ),
             Self::Finished => (
                 StatusCode::CONFLICT,
                 "finished",
                 "Today's game is already over.",
             ),
+            Self::SongOver => (
+                StatusCode::CONFLICT,
+                "finished",
+                "This song is already over.",
+            ),
+            Self::Unfinished => (
+                StatusCode::CONFLICT,
+                "unfinished",
+                "Finish this song first.",
+            ),
             Self::Changed => (
                 StatusCode::CONFLICT,
                 "changed",
                 "Today's song has just been changed. Load the game again.",
+            ),
+            Self::Moved => (
+                StatusCode::CONFLICT,
+                "changed",
+                "That song is no longer the one being played. Load the game again.",
             ),
             Self::Upstream(message) => (StatusCode::BAD_GATEWAY, "upstream", message),
             Self::Internal => (
@@ -274,6 +321,7 @@ pub(crate) fn store_failed(error: StoreError) -> ApiError {
 pub(crate) fn daily_failed(error: DailyError) -> ApiError {
     match error {
         DailyError::NoSong { .. } => ApiError::NoSong,
+        DailyError::NoRandomSong { .. } => ApiError::NothingToDraw,
         DailyError::Store(error) => store_failed(error),
         DailyError::Clock(_) => {
             tracing::error!(%error, "the day cannot be worked out");
@@ -673,7 +721,7 @@ impl GuessRequest {
 
 /// What a guessed track is, asked of Deezer by its ID: the title and artist
 /// never come from the client, so a guess cannot be forged.
-async fn guessed_track(app: &AppState, track_id: u64) -> Result<TrackMeta, ApiError> {
+pub(crate) async fn guessed_track(app: &AppState, track_id: u64) -> Result<TrackMeta, ApiError> {
     match app.deezer().track_meta(track_id).await {
         Ok(guessed) if !guessed.title.trim().is_empty() => Ok(guessed),
         Ok(_) | Err(DeezerError::NotFound) => Err(ApiError::UnknownTrack),
@@ -864,10 +912,11 @@ mod tests {
     use crate::{
         game::{FULL_CLIP_MS, LADDER_MS},
         mp3::Mp3,
+        random::RandomGame,
         store::{Genre, Genres, MemoryStore, NewSong, Pick, PoolSong, SqliteStore},
         testutil::{
             BrokenStore, Harness, ID3_MARKER, LAUNCH, MockTrack, PREVIEW_FRAMES, Preview, Reply,
-            TODAY, lost_game, playing_game, synthetic_mp3, won_game,
+            TODAY, Unhurried, lost_game, playing_game, synthetic_mp3, won_game,
         },
     };
     use async_trait::async_trait;
@@ -1382,102 +1431,6 @@ mod tests {
     }
 
     // --- two moves at once --------------------------------------------------
-
-    /// A store that gives way to other tasks in the middle of every game
-    /// operation, as a database on the network would: between a handler's
-    /// read and its write, every other request gets to run.
-    struct Unhurried(MemoryStore);
-
-    #[async_trait]
-    impl Store for Unhurried {
-        async fn songs(&self) -> Result<Vec<PoolSong>, StoreError> {
-            self.0.songs().await
-        }
-        async fn song(&self, track_id: u64) -> Result<Option<PoolSong>, StoreError> {
-            self.0.song(track_id).await
-        }
-        async fn add_song(&self, song: NewSong, genres: Genres) -> Result<PoolSong, StoreError> {
-            self.0.add_song(song, genres).await
-        }
-        async fn set_song_genres(
-            &self,
-            track_id: u64,
-            genres: Genres,
-        ) -> Result<Option<PoolSong>, StoreError> {
-            self.0.set_song_genres(track_id, genres).await
-        }
-        async fn remove_song(&self, track_id: u64) -> Result<bool, StoreError> {
-            self.0.remove_song(track_id).await
-        }
-        async fn set_preview_failed_on(
-            &self,
-            track_id: u64,
-            day: Option<Date>,
-        ) -> Result<bool, StoreError> {
-            self.0.set_preview_failed_on(track_id, day).await
-        }
-        async fn game(
-            &self,
-            player: &PlayerId,
-            section: Section,
-            day: Date,
-        ) -> Result<Option<GameState>, StoreError> {
-            let game = self.0.game(player, section, day).await;
-            tokio::task::yield_now().await;
-            game
-        }
-        async fn save_game(
-            &self,
-            player: &PlayerId,
-            section: Section,
-            game: &GameState,
-        ) -> Result<(), StoreError> {
-            tokio::task::yield_now().await;
-            self.0.save_game(player, section, game).await
-        }
-        async fn games(
-            &self,
-            player: &PlayerId,
-            section: Section,
-        ) -> Result<Vec<GameState>, StoreError> {
-            let games = self.0.games(player, section).await;
-            tokio::task::yield_now().await;
-            games
-        }
-        async fn delete_player(&self, player: &PlayerId) -> Result<usize, StoreError> {
-            tokio::task::yield_now().await;
-            self.0.delete_player(player).await
-        }
-        async fn delete_games(&self, section: Section, day: Date) -> Result<usize, StoreError> {
-            tokio::task::yield_now().await;
-            self.0.delete_games(section, day).await
-        }
-        async fn picks_on(&self, day: Date) -> Result<Vec<Pick>, StoreError> {
-            let picks = self.0.picks_on(day).await;
-            tokio::task::yield_now().await;
-            picks
-        }
-        async fn pick_history(&self, section: Section) -> Result<Vec<Pick>, StoreError> {
-            self.0.pick_history(section).await
-        }
-        async fn save_pick(&self, pick: Pick) -> Result<Pick, StoreError> {
-            self.0.save_pick(pick).await
-        }
-        async fn remove_pick(&self, day: Date, section: Section) -> Result<bool, StoreError> {
-            tokio::task::yield_now().await;
-            self.0.remove_pick(day, section).await
-        }
-        async fn day_offset(&self) -> Result<i64, StoreError> {
-            self.0.day_offset().await
-        }
-        async fn set_day_offset(&self, days: i64) -> Result<(), StoreError> {
-            self.0.set_day_offset(days).await
-        }
-        async fn wipe_games_and_picks(&self) -> Result<(), StoreError> {
-            tokio::task::yield_now().await;
-            self.0.wipe_games_and_picks().await
-        }
-    }
 
     /// Sends every request in `moves` at the same moment, each from its own
     /// task and all as the player `id`, and returns the replies in order.
@@ -2909,6 +2862,16 @@ mod tests {
             let games = self.store.games(player, section).await;
             self.pass(Point::GamesRead).await;
             games
+        }
+        async fn random_game(&self, player: &PlayerId) -> Result<Option<RandomGame>, StoreError> {
+            self.store.random_game(player).await
+        }
+        async fn save_random_game(
+            &self,
+            player: &PlayerId,
+            game: &RandomGame,
+        ) -> Result<(), StoreError> {
+            self.store.save_random_game(player, game).await
         }
         async fn delete_player(&self, player: &PlayerId) -> Result<usize, StoreError> {
             self.store.delete_player(player).await

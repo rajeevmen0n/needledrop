@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use jiff::civil::Date;
 
 use super::{Genres, NewSong, Pick, PlayerId, PoolSong, Section, Store, StoreError};
-use crate::game::GameState;
+use crate::{game::GameState, random::RandomGame};
 
 /// What identifies a stored game. Ordered by player, then section, then day,
 /// so one player's games in one section sit together, oldest first: the
@@ -27,6 +27,8 @@ pub struct MemoryStore {
     songs: Mutex<BTreeMap<u64, PoolSong>>,
     /// Every game any player has made a move in.
     games: Mutex<BTreeMap<GameKey, GameState>>,
+    /// The random game of every player who has started one.
+    random_games: Mutex<BTreeMap<PlayerId, RandomGame>>,
     /// The track picked for each day and section. Ordered by day, then
     /// section, which gives [`Store::picks_on`] and [`Store::pick_history`]
     /// their orders.
@@ -50,6 +52,13 @@ impl MemoryStore {
     /// Locks the games, on the same terms as [`pool`](Self::pool).
     fn played(&self) -> MutexGuard<'_, BTreeMap<GameKey, GameState>> {
         self.games.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Locks the random games, on the same terms as [`pool`](Self::pool).
+    fn random(&self) -> MutexGuard<'_, BTreeMap<PlayerId, RandomGame>> {
+        self.random_games
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Locks the picks, on the same terms as [`pool`](Self::pool).
@@ -153,7 +162,21 @@ impl Store for MemoryStore {
             .collect())
     }
 
+    async fn random_game(&self, player: &PlayerId) -> Result<Option<RandomGame>, StoreError> {
+        Ok(self.random().get(player).cloned())
+    }
+
+    async fn save_random_game(
+        &self,
+        player: &PlayerId,
+        game: &RandomGame,
+    ) -> Result<(), StoreError> {
+        self.random().insert(player.clone(), game.clone());
+        Ok(())
+    }
+
     async fn delete_player(&self, player: &PlayerId) -> Result<usize, StoreError> {
+        self.random().remove(player);
         let mut games = self.played();
         let before = games.len();
         games.retain(|(of, _, _), _| of != player);
@@ -209,6 +232,7 @@ impl Store for MemoryStore {
     async fn wipe_games_and_picks(&self) -> Result<(), StoreError> {
         // Games first: see the trait.
         self.played().clear();
+        self.random().clear();
         self.picked().clear();
         Ok(())
     }

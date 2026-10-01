@@ -13,6 +13,7 @@ use jiff::civil::{Date, date};
 use super::{Genre, Genres, NewSong, Pick, PlayerId, PoolSong, Section, Store};
 use crate::{
     game::{GameState, Status, TrackMeta},
+    random::RandomGame,
     testutil::{lost_game, playing_game, won_game},
 };
 
@@ -88,6 +89,13 @@ macro_rules! contract_tests {
             the_day_offset_is_zero_until_it_is_set_and_then_what_was_set,
             wiping_deletes_every_game_and_every_pick,
             wiping_leaves_the_song_pool_and_the_day_offset_alone,
+            a_new_store_has_no_random_game,
+            a_saved_random_game_is_loaded_as_it_was_saved_and_replaced_by_the_next,
+            random_games_are_kept_apart_by_player,
+            saving_the_same_random_game_twice_at_once_keeps_one_of_them_whole,
+            deleting_a_player_removes_their_random_game_and_counts_only_the_daily_games,
+            random_games_daily_games_and_the_song_pool_do_not_touch_each_other,
+            wiping_deletes_every_random_game,
         );
     };
     (@cases $fixture:expr; $($case:ident),+ $(,)?) => {
@@ -1157,4 +1165,180 @@ pub async fn wiping_leaves_the_song_pool_and_the_day_offset_alone(store: &dyn St
     assert_eq!(pool[1].preview_failed_on, Some(date(2026, 10, 3)));
     // Where the day goes after a reset is the caller's decision.
     assert_eq!(store.day_offset().await.unwrap(), 12);
+}
+
+// --- random games ---------------------------------------------------------------
+
+/// A random game in its `songs`th song of a first session, every earlier one
+/// won on the first try and the current one skipped once. The tracks are
+/// 1000, 1001, …
+fn random_game(songs: u64) -> RandomGame {
+    let song = TrackMeta::new("The Song", "", "Someone");
+    let mut game = RandomGame::start(None, 1000, DAY);
+    for track_id in 1001..1000 + songs {
+        game.guess(&song, &song).unwrap();
+        game = game.next(track_id, DAY).unwrap();
+    }
+    game.skip().unwrap();
+    game
+}
+
+pub async fn a_new_store_has_no_random_game(store: &dyn Store) {
+    let player = PlayerId::generate();
+    assert_eq!(store.random_game(&player).await.unwrap(), None);
+    // And there is nothing of the kind to delete.
+    assert_eq!(store.delete_player(&player).await.unwrap(), 0);
+    assert_eq!(store.random_game(&player).await.unwrap(), None);
+}
+
+pub async fn a_saved_random_game_is_loaded_as_it_was_saved_and_replaced_by_the_next(
+    store: &dyn Store,
+) {
+    let player = PlayerId::generate();
+    let mut game = random_game(3);
+    store.save_random_game(&player, &game).await.unwrap();
+    let loaded = store.random_game(&player).await.unwrap().unwrap();
+    assert_eq!(loaded, game);
+    // All of it: the song, the tries, the score and what outlasts a session.
+    assert_eq!(loaded.round(), 3);
+    assert_eq!(loaded.track_id(), 1002);
+    assert_eq!(loaded.game().attempts().len(), 1);
+    assert_eq!((loaded.run(), loaded.played(), loaded.won()), (2, 2, 2));
+    assert_eq!(loaded.best_run(), 2);
+    assert_eq!(loaded.recent(), [1000, 1001, 1002]);
+
+    // A player has one random game: a save replaces it, whole.
+    let wrong = TrackMeta::new("Ünder \"Pressure\" \\ 圧力", "", "Queen & 椎名林檎");
+    game.guess(&TrackMeta::new("The Song", "", "Someone"), &wrong)
+        .unwrap();
+    store.save_random_game(&player, &game).await.unwrap();
+    assert_eq!(store.random_game(&player).await.unwrap(), Some(game));
+
+    // A new session over it is a replacement like any other.
+    let again = RandomGame::start(store.random_game(&player).await.unwrap().as_ref(), 7, DAY);
+    store.save_random_game(&player, &again).await.unwrap();
+    let loaded = store.random_game(&player).await.unwrap().unwrap();
+    assert_eq!(loaded, again);
+    assert_eq!(loaded.round(), 4);
+    assert_eq!(loaded.best_run(), 2);
+    assert_eq!((loaded.run(), loaded.played(), loaded.won()), (0, 0, 0));
+}
+
+pub async fn random_games_are_kept_apart_by_player(store: &dyn Store) {
+    let one = PlayerId::generate();
+    let other = PlayerId::generate();
+    let stranger = PlayerId::generate();
+    let (first, second) = (random_game(2), random_game(5));
+    store.save_random_game(&one, &first).await.unwrap();
+    store.save_random_game(&other, &second).await.unwrap();
+
+    assert_eq!(store.random_game(&one).await.unwrap(), Some(first.clone()));
+    assert_eq!(store.random_game(&other).await.unwrap(), Some(second));
+    assert_eq!(store.random_game(&stranger).await.unwrap(), None);
+
+    // Replacing one player's game leaves the other's alone.
+    let replaced = random_game(9);
+    store.save_random_game(&other, &replaced).await.unwrap();
+    assert_eq!(store.random_game(&one).await.unwrap(), Some(first));
+    assert_eq!(store.random_game(&other).await.unwrap(), Some(replaced));
+}
+
+pub async fn saving_the_same_random_game_twice_at_once_keeps_one_of_them_whole(store: &dyn Store) {
+    let player = PlayerId::generate();
+    let (one, other) = (random_game(2), random_game(6));
+    let (first, second) = tokio::join!(
+        store.save_random_game(&player, &one),
+        store.save_random_game(&player, &other)
+    );
+    first.unwrap();
+    second.unwrap();
+
+    // It is one of the two, not a mixture.
+    let stored = store.random_game(&player).await.unwrap().unwrap();
+    assert!(stored == one || stored == other, "{stored:?}");
+}
+
+pub async fn deleting_a_player_removes_their_random_game_and_counts_only_the_daily_games(
+    store: &dyn Store,
+) {
+    let leaving = PlayerId::generate();
+    let staying = PlayerId::generate();
+    let kept = random_game(4);
+    store
+        .save_random_game(&leaving, &random_game(3))
+        .await
+        .unwrap();
+    store.save_random_game(&staying, &kept).await.unwrap();
+    store
+        .save_game(&leaving, GENERAL, &won_game(DAY, 1))
+        .await
+        .unwrap();
+    store
+        .save_game(&leaving, ROCK, &lost_game(DAY))
+        .await
+        .unwrap();
+
+    // The number says how many daily games went; the random game went too.
+    assert_eq!(store.delete_player(&leaving).await.unwrap(), 2);
+    assert_eq!(store.random_game(&leaving).await.unwrap(), None);
+    assert_eq!(store.games(&leaving, GENERAL).await.unwrap(), Vec::new());
+    assert_eq!(store.random_game(&staying).await.unwrap(), Some(kept));
+
+    // A player with a random game and nothing else: it goes, and the count
+    // is of the daily games, which they never had.
+    assert_eq!(store.delete_player(&staying).await.unwrap(), 0);
+    assert_eq!(store.random_game(&staying).await.unwrap(), None);
+
+    // The ID is not used up: a game saved under it afterwards is a new start.
+    let fresh = random_game(1);
+    store.save_random_game(&leaving, &fresh).await.unwrap();
+    assert_eq!(store.random_game(&leaving).await.unwrap(), Some(fresh));
+}
+
+pub async fn random_games_daily_games_and_the_song_pool_do_not_touch_each_other(store: &dyn Store) {
+    let player = PlayerId::generate();
+    add(store, 1000, [Genre::Rock]).await;
+    add(store, 1001, []).await;
+    let random = random_game(2);
+    let daily = playing_game(DAY, 2);
+    store.save_random_game(&player, &random).await.unwrap();
+    store.save_game(&player, ROCK, &daily).await.unwrap();
+    store.save_pick(pick(DAY, ROCK, 1000)).await.unwrap();
+
+    // The song being played leaves the pool, and takes no game with it.
+    assert!(store.remove_song(1001).await.unwrap());
+    assert_eq!(
+        store.random_game(&player).await.unwrap(),
+        Some(random.clone())
+    );
+
+    // A re-roll's two deletions are about a section's day and nothing else.
+    assert_eq!(store.delete_games(ROCK, DAY).await.unwrap(), 1);
+    assert!(store.remove_pick(DAY, ROCK).await.unwrap());
+    assert_eq!(store.random_game(&player).await.unwrap(), Some(random));
+
+    // And saving a random game made no daily game, pick or song.
+    assert_eq!(store.games(&player, ROCK).await.unwrap(), Vec::new());
+    assert_eq!(store.games(&player, GENERAL).await.unwrap(), Vec::new());
+    assert_eq!(store.picks_on(DAY).await.unwrap(), Vec::new());
+    assert_eq!(ids(store).await, vec![1000]);
+}
+
+pub async fn wiping_deletes_every_random_game(store: &dyn Store) {
+    let one = PlayerId::generate();
+    let other = PlayerId::generate();
+    store.save_random_game(&one, &random_game(2)).await.unwrap();
+    store
+        .save_random_game(&other, &random_game(7))
+        .await
+        .unwrap();
+
+    store.wipe_games_and_picks().await.unwrap();
+
+    assert_eq!(store.random_game(&one).await.unwrap(), None);
+    assert_eq!(store.random_game(&other).await.unwrap(), None);
+    // The store works on: a game saved after the wipe is a first game.
+    let fresh = random_game(1);
+    store.save_random_game(&one, &fresh).await.unwrap();
+    assert_eq!(store.random_game(&one).await.unwrap(), Some(fresh));
 }

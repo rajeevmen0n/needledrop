@@ -1,4 +1,4 @@
-//! Persistent data behind one trait: the song pool, the players' games, the daily picks and the day offset.
+//! Persistent data behind one trait: the song pool, the players' games, daily and random, the daily picks and the day offset.
 //!
 //! [`Store`] is the only way the rest of the server touches persistent data.
 //! Handlers hold an `Arc<dyn Store>`, and no SQL, connection or database error
@@ -16,8 +16,9 @@
 //!   order) is Rust code that calls it.
 //! - A backend only has to be atomic for one record at a time. A song with its
 //!   genre tags is one record, and so are one player's game in one section on
-//!   one day, one section's pick for one day, and the day offset. Nothing
-//!   here needs a transaction that spans two kinds of record.
+//!   one day, one player's random game, one section's pick for one day, and
+//!   the day offset. Nothing here needs a transaction that spans two kinds of
+//!   record.
 //!
 //! [`contract`] holds the test suite every backend has to pass.
 
@@ -40,7 +41,7 @@ pub use self::memory::MemoryStore;
 #[cfg(test)]
 pub use self::seed::SEED_SONGS;
 pub use self::{seed::seed_if_empty, sqlite::SqliteStore};
-use crate::{config::StoreKind, game::GameState};
+use crate::{config::StoreKind, game::GameState, random::RandomGame};
 
 /// A genre a song can be tagged with. Each one is also a daily section whose
 /// pool is the songs carrying the tag; every song is in the General pool
@@ -371,9 +372,31 @@ pub trait Store: Send + Sync {
         section: Section,
     ) -> Result<Vec<GameState>, StoreError>;
 
+    /// The random game `player` is in, or `None` when they have never started
+    /// one (or it was deleted since). There is at most one per player: random
+    /// mode has no days and no sections.
+    ///
+    /// A stored random game this server cannot read is `None` too, on the
+    /// terms of [`games`](Self::games): it is left out and the backend says
+    /// so in the log, and the next
+    /// [`save_random_game`](Self::save_random_game) replaces it.
+    async fn random_game(&self, player: &PlayerId) -> Result<Option<RandomGame>, StoreError>;
+
+    /// Stores `game` as the player's random game, replacing the one stored,
+    /// if any. Whole and unconditional, like [`save_game`](Self::save_game):
+    /// the last save wins, and that a save is based on the latest state is
+    /// the caller's business (see `player::MoveLocks`).
+    async fn save_random_game(
+        &self,
+        player: &PlayerId,
+        game: &RandomGame,
+    ) -> Result<(), StoreError>;
+
     /// Deletes everything stored for `player`: their games in every section
-    /// and on every day. Returns how many games that was; 0 for a player the
-    /// store has never seen. Other players are not touched.
+    /// and on every day, and their random game. Returns how many daily games
+    /// that was; 0 for a player the store has never seen. The random game is
+    /// not counted: it is one record at most, and the number is there to say
+    /// how much of a history went. Other players are not touched.
     async fn delete_player(&self, player: &PlayerId) -> Result<usize, StoreError>;
 
     /// Deletes every player's game in `section` on `day`: what a re-roll of
@@ -411,14 +434,15 @@ pub trait Store: Send + Sync {
     /// Replaces the day offset.
     async fn set_day_offset(&self, days: i64) -> Result<(), StoreError>;
 
-    /// Deletes every game of every player and every pick of every day: what
-    /// Reset to day 1 does. The song pool, failed-preview days included, and
-    /// the day offset stay as they are.
+    /// Deletes every game of every player, the random games included, and
+    /// every pick of every day: what Reset to day 1 does. The song pool,
+    /// failed-preview days included, and the day offset stay as they are.
     ///
-    /// The games go first. A backend that cannot delete both kinds of record
+    /// The games go first. A backend that cannot delete the kinds of record
     /// at once must keep that order, so that an interruption leaves picks
     /// without games (a day nobody has played yet) and never games without
-    /// the pick they were played against.
+    /// the pick they were played against. A random game depends on no pick,
+    /// so where it goes in that order does not matter.
     async fn wipe_games_and_picks(&self) -> Result<(), StoreError>;
 }
 
@@ -449,6 +473,23 @@ fn decode_game(player: &PlayerId, section: Section, day: &str, json: &str) -> Op
             None
         }
     }
+}
+
+/// Reads a random game that a backend keeps as JSON ([`RandomGame`]'s own
+/// serialization). For the backends that store it so.
+///
+/// `None`, with a warning in the log, when the text is not a possible random
+/// game: the "cannot be read" of [`Store::random_game`]. The checks are the
+/// ones [`RandomGame`] makes whenever it is deserialized.
+fn decode_random_game(player: &PlayerId, json: &str) -> Option<RandomGame> {
+    serde_json::from_str::<RandomGame>(json)
+        .inspect_err(|error| {
+            tracing::warn!(
+                %player, %error,
+                "ignoring a stored random game that cannot be read"
+            );
+        })
+        .ok()
 }
 
 /// Opens the requested backend. For SQLite that is the file at

@@ -8,8 +8,8 @@ import { routeFor } from './lib/sections'
 
 // The one place where the address decides what the page is: `/admin` and
 // everything under it is the admin page, and the game is never mounted
-// there; every other address is the game, opened on the section it names
-// (`/`, `/pop`, `/rock`, `/hip-hop`; anything unknown is General).
+// there; every other address is the game, opened on the tab it names
+// (`/`, `/pop`, `/rock`, `/hip-hop`, `/random`; anything unknown is General).
 const target = document.getElementById('app')!
 const route = routeFor(location.pathname)
 
@@ -18,9 +18,9 @@ if (route.page === 'admin') {
   const { default: Admin } = await import('./Admin.svelte')
   mount(Admin, { target })
 } else {
-  // An unknown or oddly written address becomes the section's own.
+  // An unknown or oddly written address becomes the tab's own.
   if (location.pathname !== route.path) {
     history.replaceState(null, '', route.path + location.search + location.hash)
   }
-  mount(App, { target, props: { section: route.section } })
+  mount(App, { target, props: { tab: route.tab } })
 }

@@ -38,6 +38,8 @@ export interface RecordView {
   needle: number
   /** Time-domain samples that ripple the lit grooves; `null` for still grooves. */
   wave: Float32Array | null
+  /** The line under the name on the blank label: which pressing this is. */
+  series: string
   /** Stamped on the blank label. */
   stamp: string
   /** The album cover, once loaded. */
@@ -116,6 +118,7 @@ export class RecordPainter {
   private base: HTMLCanvasElement | null = null
   private sheen: HTMLCanvasElement | null = null
   private label: HTMLCanvasElement | null = null
+  /** What the cached label says: its series and its stamp. */
   private stamped = ''
 
   constructor(canvas: HTMLCanvasElement) {
@@ -316,9 +319,10 @@ export class RecordPainter {
     return canvas
   }
 
-  // The blank label: paper, a pressed ring, and the day stamped under the spindle like a test pressing.
-  private labelLayer(palette: Palette, stamp: string): HTMLCanvasElement {
-    if (this.label && this.stamped === stamp) return this.label
+  // The blank label: paper, a pressed ring, and the day (or the song's number) stamped under the spindle like a test pressing.
+  private labelLayer(palette: Palette, series: string, stamp: string): HTMLCanvasElement {
+    const says = `${series}\n${stamp}`
+    if (this.label && this.stamped === says) return this.label
     const { size, scale } = this.geometry
     const radius = (size / CANVAS_RADII) * LABEL
     const canvas = document.createElement('canvas')
@@ -348,7 +352,7 @@ export class RecordPainter {
     ctx.font = `800 ${radius * 0.21}px ${palette.font}`
     ctx.fillText('Needledrop', 0, -radius * 0.35, radius * 1.7)
     ctx.font = `400 ${radius * 0.105}px ${palette.font}`
-    ctx.fillText('THE DAILY PRESSING', 0, -radius * 0.12, radius * 1.65)
+    ctx.fillText(series, 0, -radius * 0.12, radius * 1.65)
     ctx.font = `600 ${radius * 0.11}px ${palette.font}`
     ctx.fillText('SIDE A', -radius * 0.49, radius * 0.22)
     ctx.fillText('33⅓', radius * 0.49, radius * 0.22)
@@ -362,7 +366,7 @@ export class RecordPainter {
     }
 
     this.label = canvas
-    this.stamped = stamp
+    this.stamped = says
     return canvas
   }
 
@@ -428,7 +432,7 @@ export class RecordPainter {
 
     ctx.save()
     ctx.rotate(view.rotation)
-    ctx.drawImage(this.labelLayer(palette, view.stamp), -r, -r, r * 2, r * 2)
+    ctx.drawImage(this.labelLayer(palette, view.series, view.stamp), -r, -r, r * 2, r * 2)
     ctx.restore()
 
     const cover = view.cover

@@ -1,11 +1,12 @@
 <script lang="ts">
-  // A player's record in one section: four figures and the wins by try. It
-  // knows nothing about the game; the page shows it with the result.
+  // A player's record in one section: four figures (Figures) and the wins by
+  // try. It knows nothing about the game; the page shows it with the result.
   //
-  // Every figure and every bar has its sentence for a screen reader; the big
-  // numbers and the bars are the same thing drawn, and hidden from it.
+  // Every bar has its sentence for a screen reader; the bar is the same thing
+  // drawn, and hidden from it.
   import { distribution, figures } from '../stats'
   import type { Stats } from '../stats'
+  import Figures from './Figures.svelte'
 
   interface Props {
     stats: Stats
@@ -23,15 +24,7 @@
 
 <section class="stats" aria-labelledby="{uid}-heading">
   <h2 id="{uid}-heading">{title}</h2>
-  <ul class="figures" role="list">
-    {#each figures(stats) as figure}
-      <li>
-        <span class="sr-only">{figure.spoken}</span>
-        <span class="value numeric" aria-hidden="true">{figure.value}</span>
-        <span class="label" aria-hidden="true">{figure.label}</span>
-      </li>
-    {/each}
-  </ul>
+  <Figures figures={figures(stats)} />
   <h3 id="{uid}-tries">Wins by try</h3>
   <ol class="tries" role="list" aria-labelledby="{uid}-tries">
     {#each rows as row}
@@ -67,37 +60,6 @@
     color: var(--muted);
     font-size: 0.75rem;
     font-weight: var(--weight-regular);
-  }
-
-  /* Four figures on one line, parted by hairlines: a pressing's label, not a dashboard. */
-  .figures {
-    display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
-  }
-
-  .figures li {
-    display: grid;
-    gap: 0.125rem;
-    padding: 0 0.75rem;
-    border-left: var(--line) solid var(--border);
-  }
-
-  .figures li:first-child {
-    padding-left: 0;
-    border-left: 0;
-  }
-
-  .value {
-    font-size: var(--text-title);
-    font-weight: var(--weight-medium);
-    line-height: 1.1;
-    letter-spacing: -0.02em;
-  }
-
-  .label {
-    color: var(--muted);
-    font-size: 0.75rem;
-    line-height: 1.3;
   }
 
   .tries {
@@ -154,15 +116,5 @@
     margin-left: 0.5rem;
     color: var(--muted);
     font-size: 0.75rem;
-  }
-
-  @media (max-width: 22.5rem) {
-    .figures li {
-      padding: 0 0.5rem;
-    }
-
-    .value {
-      font-size: 1.5rem;
-    }
   }
 </style>

@@ -8,6 +8,7 @@ mod game;
 mod mp3;
 mod pick;
 mod player;
+mod random;
 mod routes;
 mod stats;
 mod store;

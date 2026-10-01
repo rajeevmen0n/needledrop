@@ -2,12 +2,21 @@
   // The seven tries, one row each, in the order of the record's bands. Every
   // state has its own mark and words, so none is told apart by colour alone.
   //
-  // While the game is open the heading also carries the section's streak.
+  // While the game is open the heading also carries the section's streak, or
+  // in random mode the session's run.
   import { clipShort } from '../clip'
   import type { Game } from '../game.svelte'
+  import { runLine, songLine } from '../random'
   import { streakLine } from '../stats'
 
   let { game }: { game: Game } = $props()
+
+  // What the heading says beside the count: whose notes these are once the
+  // game is over, how the player is doing while it is open.
+  const aside = $derived.by(() => {
+    if (game.finished) return game.random ? songLine(game.song) : "Today's pressing"
+    return (game.random ? runLine(game.score) : streakLine(game.stats)) || 'Trust your ears'
+  })
 </script>
 
 <section class="attempts" aria-labelledby="attempts-heading">
@@ -16,9 +25,7 @@
       ? 'Your listening notes'
       : `Try ${game.turn} of ${game.ladder.length}`}<span
       class="numeric"
-      >{game.finished
-        ? "Today's pressing"
-        : streakLine(game.stats) || 'Trust your ears'}</span
+      >{aside}</span
     >
   </h2>
   <ol>

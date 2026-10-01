@@ -8,7 +8,13 @@
   /** Clips shorter than this are over before "Stop" could be read, so the button keeps saying "Play". */
   const STOPPABLE_SECONDS = 3
 
+  let button = $state<HTMLButtonElement>()
   let elapsed = $state(0)
+
+  /** Puts the keyboard focus on the play button: where playing continues after a new song arrives. */
+  export function focus() {
+    button?.focus()
+  }
 
   const stoppable = $derived(
     game.playing && game.clipSeconds >= STOPPABLE_SECONDS,
@@ -51,6 +57,7 @@
 <div class="play">
   <button
     type="button"
+    bind:this={button}
     class:playing={stoppable}
     class:sounding={game.playing}
     onclick={press}

@@ -1,7 +1,7 @@
 //! Test support: synthetic MP3 data, a local stand-in for the Deezer API, so
 //! handler and loader tests never touch the network, and the harness the
 //! handler tests share: the whole router, a browser that keeps its cookie, a
-//! store that always fails, and ready-made games.
+//! store that always fails, one that takes its time, and ready-made games.
 
 use std::{
     collections::HashMap,
@@ -34,6 +34,7 @@ use crate::{
     deezer::Deezer,
     game::{GameState, MAX_ATTEMPTS, Status, TrackMeta},
     player,
+    random::RandomGame,
     routes::{AppState, router},
     store::{
         Genre, Genres, MemoryStore, NewSong, Pick, PlayerId, PoolSong, Section, Store, StoreError,
@@ -632,6 +633,49 @@ impl Player {
         self.send(Request::delete("/api/player").body(Body::empty()).unwrap())
             .await
     }
+
+    /// `GET /api/random`: the state of the random game.
+    pub async fn random(&mut self) -> Reply {
+        self.get("/api/random").await
+    }
+
+    /// `GET /api/random/audio`: the clip unlocked of the random song.
+    pub async fn random_audio(&mut self) -> Reply {
+        self.get("/api/random/audio").await
+    }
+
+    /// `POST /api/random/start`, with no body: a new session.
+    pub async fn random_start(&mut self) -> Reply {
+        let request = Request::post("/api/random/start")
+            .body(Body::empty())
+            .unwrap();
+        self.send(request).await
+    }
+
+    /// A skip of the random song `round`.
+    pub async fn random_skip(&mut self, round: u64) -> Reply {
+        self.random_move(json!({ "round": round, "skip": true }))
+            .await
+    }
+
+    /// A guess at the random song `round`.
+    pub async fn random_guess(&mut self, round: u64, track_id: u64) -> Reply {
+        self.random_move(json!({ "round": round, "trackId": track_id }))
+            .await
+    }
+
+    /// `POST /api/random/guess` with a JSON body.
+    pub async fn random_move(&mut self, body: Value) -> Reply {
+        self.post_to("/api/random/guess", "application/json", body.to_string())
+            .await
+    }
+
+    /// `POST /api/random/next`: the song after the random song `round`.
+    pub async fn random_next(&mut self, round: u64) -> Reply {
+        let body = json!({ "round": round }).to_string();
+        self.post_to("/api/random/next", "application/json", body)
+            .await
+    }
 }
 
 /// A response, read to the end.
@@ -750,6 +794,12 @@ impl Store for BrokenStore {
     async fn games(&self, _: &PlayerId, _: Section) -> Result<Vec<GameState>, StoreError> {
         broken()
     }
+    async fn random_game(&self, _: &PlayerId) -> Result<Option<RandomGame>, StoreError> {
+        broken()
+    }
+    async fn save_random_game(&self, _: &PlayerId, _: &RandomGame) -> Result<(), StoreError> {
+        broken()
+    }
     async fn delete_player(&self, _: &PlayerId) -> Result<usize, StoreError> {
         broken()
     }
@@ -776,5 +826,116 @@ impl Store for BrokenStore {
     }
     async fn wipe_games_and_picks(&self) -> Result<(), StoreError> {
         broken()
+    }
+}
+
+// --- a store that takes its time ---------------------------------------------------
+
+/// A store that gives way to other tasks in the middle of every game
+/// operation, as a database on the network would: between a handler's
+/// read and its write, every other request gets to run.
+pub struct Unhurried(pub MemoryStore);
+
+#[async_trait]
+impl Store for Unhurried {
+    async fn songs(&self) -> Result<Vec<PoolSong>, StoreError> {
+        self.0.songs().await
+    }
+    async fn song(&self, track_id: u64) -> Result<Option<PoolSong>, StoreError> {
+        self.0.song(track_id).await
+    }
+    async fn add_song(&self, song: NewSong, genres: Genres) -> Result<PoolSong, StoreError> {
+        self.0.add_song(song, genres).await
+    }
+    async fn set_song_genres(
+        &self,
+        track_id: u64,
+        genres: Genres,
+    ) -> Result<Option<PoolSong>, StoreError> {
+        self.0.set_song_genres(track_id, genres).await
+    }
+    async fn remove_song(&self, track_id: u64) -> Result<bool, StoreError> {
+        self.0.remove_song(track_id).await
+    }
+    async fn set_preview_failed_on(
+        &self,
+        track_id: u64,
+        day: Option<Date>,
+    ) -> Result<bool, StoreError> {
+        self.0.set_preview_failed_on(track_id, day).await
+    }
+    async fn game(
+        &self,
+        player: &PlayerId,
+        section: Section,
+        day: Date,
+    ) -> Result<Option<GameState>, StoreError> {
+        let game = self.0.game(player, section, day).await;
+        tokio::task::yield_now().await;
+        game
+    }
+    async fn save_game(
+        &self,
+        player: &PlayerId,
+        section: Section,
+        game: &GameState,
+    ) -> Result<(), StoreError> {
+        tokio::task::yield_now().await;
+        self.0.save_game(player, section, game).await
+    }
+    async fn games(
+        &self,
+        player: &PlayerId,
+        section: Section,
+    ) -> Result<Vec<GameState>, StoreError> {
+        let games = self.0.games(player, section).await;
+        tokio::task::yield_now().await;
+        games
+    }
+    async fn random_game(&self, player: &PlayerId) -> Result<Option<RandomGame>, StoreError> {
+        let game = self.0.random_game(player).await;
+        tokio::task::yield_now().await;
+        game
+    }
+    async fn save_random_game(
+        &self,
+        player: &PlayerId,
+        game: &RandomGame,
+    ) -> Result<(), StoreError> {
+        tokio::task::yield_now().await;
+        self.0.save_random_game(player, game).await
+    }
+    async fn delete_player(&self, player: &PlayerId) -> Result<usize, StoreError> {
+        tokio::task::yield_now().await;
+        self.0.delete_player(player).await
+    }
+    async fn delete_games(&self, section: Section, day: Date) -> Result<usize, StoreError> {
+        tokio::task::yield_now().await;
+        self.0.delete_games(section, day).await
+    }
+    async fn picks_on(&self, day: Date) -> Result<Vec<Pick>, StoreError> {
+        let picks = self.0.picks_on(day).await;
+        tokio::task::yield_now().await;
+        picks
+    }
+    async fn pick_history(&self, section: Section) -> Result<Vec<Pick>, StoreError> {
+        self.0.pick_history(section).await
+    }
+    async fn save_pick(&self, pick: Pick) -> Result<Pick, StoreError> {
+        self.0.save_pick(pick).await
+    }
+    async fn remove_pick(&self, day: Date, section: Section) -> Result<bool, StoreError> {
+        tokio::task::yield_now().await;
+        self.0.remove_pick(day, section).await
+    }
+    async fn day_offset(&self) -> Result<i64, StoreError> {
+        self.0.day_offset().await
+    }
+    async fn set_day_offset(&self, days: i64) -> Result<(), StoreError> {
+        self.0.set_day_offset(days).await
+    }
+    async fn wipe_games_and_picks(&self) -> Result<(), StoreError> {
+        tokio::task::yield_now().await;
+        self.0.wipe_games_and_picks().await
     }
 }

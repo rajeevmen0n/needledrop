@@ -1,48 +1,61 @@
-// The four daily sections, where each lives in the address bar, and what a tab
-// says about its game. Pure: no DOM and no imports, so `node --test` can load
-// this file directly (see web/test/).
+// The four daily sections and random mode: the five tabs, where each lives in
+// the address bar, and what a tab says about its game. Pure: no DOM and no
+// imports, so `node --test` can load this file directly (see web/test/).
 
-/** The sections in tab order. The slugs are the ones the API and the URLs use. */
+/** The daily sections in tab order. The slugs are the ones the API and the URLs use. */
 export const SECTIONS = ['general', 'pop', 'rock', 'hip-hop'] as const
 
 export type Section = (typeof SECTIONS)[number]
 
-const LABELS: Record<Section, string> = {
+/** Random mode: a tab like the sections, but not one of them. It has no day and never ends. */
+export const RANDOM = 'random'
+
+/** Everything in the tab row, in order: the four sections, then random mode. */
+export const TABS = [...SECTIONS, RANDOM] as const
+
+export type Tab = (typeof TABS)[number]
+
+const LABELS: Record<Tab, string> = {
   general: 'General',
   pop: 'Pop',
   rock: 'Rock',
   'hip-hop': 'Hip-hop',
+  random: 'Random',
 }
 
 export function isSection(text: string): text is Section {
   return (SECTIONS as readonly string[]).includes(text)
 }
 
-/** "Hip-hop": the name on the tab. */
-export function sectionLabel(section: Section): string {
-  return LABELS[section]
+export function isTab(text: string): text is Tab {
+  return (TABS as readonly string[]).includes(text)
 }
 
-/** Where a section's game lives: `/` for General, `/pop` and so on for the rest. */
-export function sectionPath(section: Section): string {
-  return section === 'general' ? '/' : `/${section}`
+/** "Hip-hop": the name on the tab. */
+export function tabLabel(tab: Tab): string {
+  return LABELS[tab]
+}
+
+/** Where a tab's game lives: `/` for General, `/pop` and so on for the rest. */
+export function tabPath(tab: Tab): string {
+  return tab === 'general' ? '/' : `/${tab}`
 }
 
 /** "Pop · Needledrop" for the browser tab and the history list; General is the plain name. */
-export function pageTitle(section: Section): string {
-  return section === 'general' ? 'Needledrop' : `${sectionLabel(section)} · Needledrop`
+export function pageTitle(tab: Tab): string {
+  return tab === 'general' ? 'Needledrop' : `${tabLabel(tab)} · Needledrop`
 }
 
 /**
  * What an address shows. `path` is the address a game page should have: the
  * one it was asked for when that is already canonical, `/` for anything unknown.
  */
-export type Route = { page: 'admin' } | { page: 'game'; section: Section; path: string }
+export type Route = { page: 'admin' } | { page: 'game'; tab: Tab; path: string }
 
 /**
  * Which page a path is. `/admin` and everything under it is the admin page;
- * `/pop`, `/rock` and `/hip-hop` are those sections; everything else, `/`
- * included, is the General game. Case and trailing slashes do not matter.
+ * `/pop`, `/rock`, `/hip-hop` and `/random` are those tabs; everything else,
+ * `/` included, is the General game. Case and trailing slashes do not matter.
  */
 export function routeFor(pathname: string): Route {
   const parts = pathname
@@ -50,8 +63,8 @@ export function routeFor(pathname: string): Route {
     .split('/')
     .filter((part) => part !== '')
   if (parts[0] === 'admin') return { page: 'admin' }
-  const section = parts.length === 1 && isSection(parts[0]) ? parts[0] : 'general'
-  return { page: 'game', section, path: sectionPath(section) }
+  const tab = parts.length === 1 && isTab(parts[0]) ? parts[0] : 'general'
+  return { page: 'game', tab, path: tabPath(tab) }
 }
 
 // --- what a tab says ------------------------------------------------------------
@@ -64,8 +77,11 @@ export interface TabInfo {
   song: 'picked' | 'pending' | 'none'
 }
 
-/** `unknown` until the server has said anything about the section. */
-export type TabState = 'unknown' | 'unplayed' | 'playing' | 'won' | 'lost' | 'none'
+/**
+ * `unknown` until the server has said anything about the section. `endless`
+ * is random mode's, always: it has no game of the day to be won or lost.
+ */
+export type TabState = 'unknown' | 'unplayed' | 'playing' | 'won' | 'lost' | 'none' | 'endless'
 
 export function tabState(info: TabInfo | null): TabState {
   if (!info) return 'unknown'
@@ -82,6 +98,7 @@ const STATE_WORDS: Record<TabState, string> = {
   won: 'won',
   lost: 'lost',
   none: 'no song today',
+  endless: 'endless',
 }
 
 /** The state in words, for a screen reader and the tooltip. Empty while unknown. */
@@ -109,7 +126,7 @@ export function tabForKey(key: string, index: number, count: number): number | n
   }
 }
 
-/** The `id` of a section's tab element, which the tab panel names as its label. */
-export function tabId(section: Section): string {
-  return `tab-${section}`
+/** The `id` of a tab's element, which the tab panel names as its label. */
+export function tabId(tab: Tab): string {
+  return `tab-${tab}`
 }

@@ -22,6 +22,9 @@
 //! Rules 2 and 3 are absolute: when they leave nothing, the section has no
 //! song that day. Rules 4 to 6 give way when keeping them would leave nothing
 //! to play, the later ones first.
+//!
+//! [`draw_random`] is the draw of random mode, which is not a section: the
+//! whole pool under rules 2 and 3, and a player's recent songs last.
 
 use std::collections::BTreeSet;
 
@@ -165,6 +168,45 @@ pub fn choose(
         &fresh
     };
     Some(from[rng.random_range(0..from.len())])
+}
+
+/// The track random mode gives a player next, or `None` when there is nothing
+/// to give.
+///
+/// Random mode is not a section and has no day of its own, but it lives next
+/// to the daily games, so two of their rules hold here too and are as
+/// absolute: a song that a section plays on `day` (`taken`) is out, so that
+/// playing random never gives away a daily game, and so is a song whose
+/// preview failed the check that day. What is left of the whole pool are the
+/// candidates.
+///
+/// `recent` is what this player was given lately, oldest first, the song
+/// being replaced last. One of the candidates that is not among them is drawn
+/// by `rng`. When every candidate is recent (a small pool), it is the one
+/// played longest ago, which `rng` has no say in: the player goes round the
+/// pool in the same order, and the song just played comes back only when
+/// there is no other.
+pub fn draw_random(
+    day: Date,
+    pool: &[PoolSong],
+    taken: &BTreeSet<u64>,
+    recent: &[u64],
+    rng: &mut (impl Rng + ?Sized),
+) -> Option<u64> {
+    let candidates = candidates(Section::General, day, pool, taken);
+    let fresh: Vec<u64> = candidates
+        .iter()
+        .copied()
+        .filter(|track_id| !recent.contains(track_id))
+        .collect();
+    if !fresh.is_empty() {
+        return Some(fresh[rng.random_range(0..fresh.len())]);
+    }
+    // Every one of them is in `recent`: the one whose last turn is furthest
+    // back. Positions are distinct, so there is one answer.
+    candidates
+        .into_iter()
+        .min_by_key(|track_id| recent.iter().rposition(|played| played == track_id))
 }
 
 #[cfg(test)]
@@ -680,6 +722,113 @@ mod tests {
             assert_eq!(day.get(&ROCK), None);
             assert_eq!(day.get(&HIP_HOP), None);
             assert_eq!(day.get(&Section::General), Some(&2));
+        }
+    }
+
+    // --- the random draw ----------------------------------------------------------
+
+    /// The set of answers `draw_random` gives over many generators.
+    fn random_outcomes(pool: &[PoolSong], taken: &[u64], recent: &[u64]) -> BTreeSet<Option<u64>> {
+        let taken: BTreeSet<u64> = taken.iter().copied().collect();
+        (0..200)
+            .map(|seed| draw_random(DAY, pool, &taken, recent, &mut rng(seed)))
+            .collect()
+    }
+
+    #[test]
+    fn the_random_draw_is_from_the_whole_pool_whatever_the_tags() {
+        let pool = [
+            song(1, []),
+            song(2, [Genre::Pop]),
+            song(3, [Genre::Rock, Genre::HipHop]),
+            song(4, [Genre::HipHop]),
+        ];
+        assert_eq!(random_outcomes(&pool, &[], &[]), any_of([1, 2, 3, 4]));
+    }
+
+    #[test]
+    fn the_random_draw_never_gives_a_song_a_section_plays_that_day() {
+        let pool = [
+            song(1, []),
+            song(2, [Genre::Pop]),
+            song(3, [Genre::Rock]),
+            song(4, []),
+            song(5, []),
+        ];
+        assert_eq!(random_outcomes(&pool, &[1, 2, 3], &[]), any_of([4, 5]));
+        // Not even when it is all there is, and whatever was played lately.
+        assert_eq!(
+            random_outcomes(&pool, &[1, 2, 3, 4, 5], &[]),
+            BTreeSet::from([None])
+        );
+        assert_eq!(random_outcomes(&pool, &[1, 2, 3, 4], &[5, 5, 5]), only(5));
+    }
+
+    #[test]
+    fn the_random_draw_leaves_out_a_song_whose_preview_failed_that_day() {
+        let mut pool = vec![song(1, []), song(2, []), song(3, [])];
+        pool[0].preview_failed_on = Some(DAY);
+        // A failure on another day is history.
+        pool[1].preview_failed_on = Some(days_before(DAY, 1));
+        assert_eq!(random_outcomes(&pool, &[], &[]), any_of([2, 3]));
+
+        pool[1].preview_failed_on = Some(DAY);
+        pool[2].preview_failed_on = Some(DAY);
+        assert_eq!(random_outcomes(&pool, &[], &[]), BTreeSet::from([None]));
+    }
+
+    #[test]
+    fn the_random_draw_of_an_empty_pool_is_nothing() {
+        assert_eq!(random_outcomes(&[], &[], &[9]), BTreeSet::from([None]));
+    }
+
+    #[test]
+    fn the_random_draw_avoids_the_recent_songs_while_another_is_left() {
+        let pool: Vec<PoolSong> = (1..=6).map(|id| song(id, [])).collect();
+        assert_eq!(random_outcomes(&pool, &[], &[3, 1, 5]), any_of([2, 4, 6]));
+        assert_eq!(random_outcomes(&pool, &[], &[3, 1, 5, 2, 4]), only(6));
+        // Songs that have left the pool since, and a song listed twice,
+        // change nothing.
+        assert_eq!(
+            random_outcomes(&pool, &[], &[77, 3, 1, 3, 5, 88]),
+            any_of([2, 4, 6])
+        );
+        // What a section plays is out before the recent ones are looked at.
+        assert_eq!(random_outcomes(&pool, &[6], &[3, 1, 5, 2]), only(4));
+    }
+
+    #[test]
+    fn when_every_candidate_is_recent_the_one_played_longest_ago_comes_back() {
+        let pool: Vec<PoolSong> = (1..=4).map(|id| song(id, [])).collect();
+        // Oldest first: 2 was played longest ago.
+        assert_eq!(random_outcomes(&pool, &[], &[2, 4, 1, 3]), only(2));
+        // A song played twice counts by its last turn.
+        assert_eq!(random_outcomes(&pool, &[], &[2, 4, 1, 3, 2]), only(4));
+        // The oldest may be playing in a section today: then the next oldest.
+        assert_eq!(random_outcomes(&pool, &[2], &[2, 4, 1, 3]), only(4));
+        // The song just played comes back only when there is no other.
+        assert_eq!(random_outcomes(&pool[..1], &[], &[1]), only(1));
+        assert_eq!(random_outcomes(&pool[..2], &[], &[2, 1]), only(2));
+    }
+
+    #[test]
+    fn a_player_goes_round_a_small_pool_without_a_repeat_inside_a_round() {
+        let pool: Vec<PoolSong> = (1..=5).map(|id| song(id, [])).collect();
+        let taken = BTreeSet::from([5]);
+        for seed in 0..20 {
+            let mut rng = rng(seed);
+            let mut recent: Vec<u64> = Vec::new();
+            for _ in 0..12 {
+                let drawn = draw_random(DAY, &pool, &taken, &recent, &mut rng).unwrap();
+                recent.push(drawn);
+            }
+            // Four candidates: every four draws in a row are the four songs,
+            // and once the first round is over the order repeats.
+            for round in recent.chunks(4) {
+                let distinct: BTreeSet<u64> = round.iter().copied().collect();
+                assert_eq!(distinct, BTreeSet::from([1, 2, 3, 4]), "seed {seed}");
+            }
+            assert_eq!(recent[..4], recent[4..8], "seed {seed}");
         }
     }
 }

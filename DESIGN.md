@@ -81,8 +81,8 @@ The dark `--ink` token is foreground on champagne and ivory.
 Material highlights inside the record painter are expressive illustration
 colors, not additional UI semantic tokens.
 
-Champagne is for playing: the play control, Guess, unlocked clips, the selected
-tab's line, a win, today's bar in the stats. It is never the colour of a
+Champagne is for playing: the play control, Guess, random mode's Next song,
+unlocked clips, the selected tab's line, a win, today's bar in the stats. It is never the colour of a
 destructive action. The button that confirms a deletion is outlined in ivory,
 and there is no red: a problem is ivory text with the "!" mark.
 
@@ -107,7 +107,10 @@ question; condensed heavy display type sets the revealed song title.
 Regular-width body type keeps labels and history readable.
 Use tabular numerals for clip lengths and the pressing number.
 The compact wordmark and daily pressing are deliberately subordinate to the
-record and question. Keep the question short and precise.
+record and question. Keep the question short and precise. On the Random tab
+the pressing is numbered by its place in the session ("Random pressing ·
+Song 4") in the header and on the record's label, where the daily tabs carry
+the day.
 
 English interface, UTC game date, and UTC reset. The font falls back to system
 sans-serif for unsupported characters. Song metadata can contain any script;
@@ -130,15 +133,28 @@ Safe-area gutters, 44px minimum targets, 56px main controls, and 16px input text
 support touch. Seven equal clip segments communicate the ladder at a glance;
 history shows used and current attempts without seven empty visual rows.
 
-The four sections (General, Pop, Rock, Hip-hop) are tabs between two hairlines
-under the header: four equal columns on a phone, their own width at the left
-from 40rem. They must fit a 320px screen at 44px tall, so a tab is one short
-word and one 14px mark. The record, the rail, the controls and the history
-below always belong to the selected tab, and each tab has its own address.
+The four sections (General, Pop, Rock, Hip-hop) and random mode (Random, added
+at the owner's request on 2026-10-01) are tabs between two hairlines under the
+header: five equal columns on a phone, their own width at the left from 40rem.
+They must fit a 320px screen at 44px tall, so a tab is one short word and one
+14px mark; below 40rem the mark sits above the word, so that the longest word
+has a whole column, and from 40rem it sits beside it. The record, the rail, the
+controls and the history below always belong to the selected tab, and each tab
+has its own address.
 
 A finished section shows its stats between the result and the history: four
 figures on one line parted by hairlines, then "Wins by try". No boxes, no
 tiles. While a game is open only the streak shows, in the history's heading.
+
+Random mode is the same game without a day: one song after another for as long
+as the player likes. While a song is open it looks like a section's game, with
+the session's run ("Run: 3" / "No run yet") where the streak would be. Once the
+song is over, Next song comes straight after the revealed title and artist in
+the stacked layouts, so a phone reaches it without scrolling past the cover;
+in the side layout it stands beside the play control of the reveal. Either
+way it is before the score and the history. The score is the same line of
+four figures (run, best ever, played, won) and has no bars: only the longest
+run is kept beyond the session.
 
 The admin page at `/admin` is a tool for one person and is plain on purpose:
 the same black, type and tokens, with no sky, no record and no sound. One
@@ -205,7 +221,9 @@ mark is a small champagne record with a four-point glint on its rim.
 
 A tab's mark is the state of its game, in the shapes the history already uses:
 a ring for not played, a ring with a champagne dot for in progress, a check on
-a champagne disc for won, a cross for lost, a dash for no song today. The
+a champagne disc for won, a cross for lost, a dash for no song today. Random's
+mark never changes: a loop without an end, in the tab's own colour, with the
+word "endless" for a screen reader and the tooltip. It is never won or lost. The
 selected tab is marked by a 2px champagne line on the row's rule, not by a
 filled shape or a pill.
 
@@ -218,7 +236,8 @@ today's win, and the word "Today" says so as well.
 Shared owners: Play is used both before and after the reveal; GuessInput owns
 autocomplete and its authored listbox; Skip owns progression; Attempts owns
 readable history; Record owns animation and the canvas painter; SectionTabs
-owns the tabs and their keyboard pattern; Stats owns the figures and the bars;
+owns the tabs and their keyboard pattern; Figures owns the line of figures,
+Stats a section's record around it with the bars, Score a random session's;
 Confirm owns the one dialog pattern, for anything that cannot be undone. API
 and game state remain the established behavioral authority in AGENTS.md.
 
@@ -237,7 +256,11 @@ the action named in full ("Clear my data", not "OK"). A failure is reported
 inside it and leaves the page untouched. Never use the browser's own confirm.
 
 A section without a song says "No song today" where the game would be, and
-offers to check again. News the player did not cause (the song was replaced,
+offers to check again; random mode with nothing to draw says "No song to
+play" the same way. Next song is a primary button that keeps its width while
+the next song is found ("Finding…") and cannot be pressed twice; when the song
+arrives the keyboard focus goes to the play control, never to the search
+field, which would raise a phone's keyboard. News the player did not cause (the song was replaced,
 the day changed) is one ivory line with a champagne rule at its left, above
 the game, and is announced once.
 
@@ -276,7 +299,7 @@ keeping game state and playback progress available.
 - Let the real object do the visual work; avoid extra ornamental widgets.
 - Keep the server authoritative and never reveal answer data while playing.
 - Preserve the listening and guessing order across viewports.
-- Keep the tab row to one line of four at every width; do not add a fifth
+- Keep the tab row to one line of five at every width; do not add a sixth
   control to it.
 - Do not put the stats in cards or tiles, and do not colour more than one bar.
 - Do not list the song pool on the admin page, by tabs, pages or "show more":

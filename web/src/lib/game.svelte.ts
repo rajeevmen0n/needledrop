@@ -1,19 +1,52 @@
-// The game as the page sees it: the four sections' games as the server last
-// described them, which one is on screen, its loaded clip, and the moves. The
-// server decides everything; this only mirrors what it answers.
+// The game as the page sees it: the four sections' games and the random song
+// as the server last described them, which one is on screen, its loaded clip,
+// and the moves. The server decides everything; this only mirrors what it
+// answers.
 //
-// There is one `Game` and one audio player. Each section keeps what was last
-// heard about it, so coming back to a tab shows its game at once; the fields
-// the components read (`daily`, `status`, `submitting`, …) are always those of
-// the section on screen.
+// There is one `Game` and one audio player. Each tab keeps what was last heard
+// about it, so coming back to a tab shows its game at once; the fields the
+// components read (`view`, `status`, `submitting`, …) are always those of the
+// tab on screen.
+//
+// Random mode is the fifth tab. To the record, the rail, the controls and the
+// tries it is a game like the others (`GameView`); what differs is where it
+// comes from. It has no day: a new day leaves it alone. It belongs to a
+// session, which is this browser tab's (see `sessionMark`), and a song is
+// followed by the next one for as long as the player likes.
 
-import { ApiError, audioUrl, clearPlayer, getDaily, getToday, postGuess } from './api'
-import type { Answer, Attempt, Daily, Move, Section, Stats, Status, Today, Track } from './api'
+import {
+  ApiError,
+  audioUrl,
+  clearPlayer,
+  getDaily,
+  getRandom,
+  getToday,
+  isRandomSong,
+  postGuess,
+  postRandomGuess,
+  postRandomNext,
+  startRandom,
+} from './api'
+import type {
+  Answer,
+  Attempt,
+  Daily,
+  GameView,
+  Move,
+  RandomScore,
+  RandomSong,
+  Section,
+  Stats,
+  Status,
+  Today,
+  Track,
+} from './api'
 import { ClipPlayer } from './audio'
 import type { ClipProgress } from './audio'
 import { clipLabel } from './clip'
-import { SECTIONS, isSection, tabState } from './sections'
-import type { TabInfo, TabState } from './sections'
+import { remedyFor, sessionMark } from './random'
+import { RANDOM, SECTIONS, TABS, isSection, tabState } from './sections'
+import type { Tab, TabInfo, TabState } from './sections'
 
 /** One row of the attempts list. */
 export type Slot =
@@ -23,11 +56,14 @@ export type Slot =
   | { kind: 'current' }
   | { kind: 'empty' }
 
-/** One tab: a section and what is known of its game today. */
-export interface Tab {
-  section: Section
+/** One tab of the row: which it is and what is known of its game. */
+export interface TabMark {
+  tab: Tab
   state: TabState
 }
+
+const SONG_CHANGED = 'This song was changed in another tab, so that move did not count.'
+const SESSION_GONE = 'That game was no longer there. A new session has started.'
 
 function describe(err: unknown): string {
   return err instanceof ApiError ? err.message : 'Something went wrong. Try again.'
@@ -37,17 +73,20 @@ function codeOf(err: unknown): string {
   return err instanceof ApiError ? err.code : ''
 }
 
-/** What was last heard about one section's game. */
-class SectionGame {
+/** Whether this browser tab has a random session; see `sessionMark`. */
+const session = sessionMark(() => sessionStorage)
+
+/** What was last heard about one tab's game. */
+class TabGame<View extends GameView> {
   /** The server's last answer. `null` until a load succeeds. */
-  daily = $state<Daily | null>(null)
+  view = $state<View | null>(null)
   /** True while the game is being asked for in a way the page shows. */
   loading = $state(false)
   /** Why the load failed, as a sentence for the player. */
   loadError = $state<string | null>(null)
-  /** The section has no song today. */
+  /** There is no song to play: none today in a section, none to draw in random mode. */
   noSong = $state(false)
-  /** True while a skip or guess is on its way. */
+  /** True while a skip or guess, or a random session's start or next song, is on its way. */
   submitting = $state(false)
   /** Why the last skip or guess failed. */
   moveError = $state<string | null>(null)
@@ -58,12 +97,12 @@ class SectionGame {
 
   /** The newest request for this game; an older one that answers late is dropped. */
   request = 0
-  /** Goes up whenever `daily` is replaced, so a slower answer can tell it is the older one. */
+  /** Goes up whenever `view` is replaced, so a slower answer can tell it is the older one. */
   version = 0
 
   /** Back to "nothing heard yet". A move still on its way finishes on its own. */
   forget(): void {
-    this.daily = null
+    this.view = null
     this.loading = false
     this.loadError = null
     this.noSong = false
@@ -76,9 +115,9 @@ class SectionGame {
 }
 
 export class Game {
-  /** The section on screen. */
-  section = $state<Section>('general')
-  /** The server's day, as last heard. Everything on screen is about this day. */
+  /** The tab on screen: a section, or random mode. */
+  tab = $state<Tab>('general')
+  /** The server's day, as last heard. The four sections on screen are about this day. */
   day = $state<string | null>(null)
   /** The day's number, 1 on launch day. */
   number = $state<number | null>(null)
@@ -91,52 +130,73 @@ export class Game {
   fresh = $state(false)
   /** True while Clear my data is on its way. */
   clearing = $state(false)
+  /** True while random mode's next song is being drawn. */
+  drawing = $state(false)
 
-  private readonly games: Record<Section, SectionGame> = {
-    general: new SectionGame(),
-    pop: new SectionGame(),
-    rock: new SectionGame(),
-    'hip-hop': new SectionGame(),
+  private readonly games = {
+    general: new TabGame<Daily>(),
+    pop: new TabGame<Daily>(),
+    rock: new TabGame<Daily>(),
+    'hip-hop': new TabGame<Daily>(),
+    random: new TabGame<RandomSong>(),
   }
-  /** What each tab shows: the overview's word, or a loaded game's when that is newer. */
+  /** What each section's tab shows: the overview's word, or a loaded game's when that is newer. */
   private known = $state<Record<Section, TabInfo | null>>({
     general: null,
     pop: null,
     rock: null,
     'hip-hop': null,
   })
-  private current = $derived(this.games[this.section])
+  private current = $derived(this.games[this.tab])
 
-  /** The four tabs, in order. */
-  tabs: Tab[] = $derived(
-    SECTIONS.map((section) => ({ section, state: tabState(this.known[section]) })),
+  /** The five tabs, in order. Random mode's never changes: it has no game of the day. */
+  tabs: TabMark[] = $derived(
+    TABS.map((tab) => ({
+      tab,
+      state: tab === RANDOM ? 'endless' : tabState(this.known[tab]),
+    })),
   )
 
-  // --- the section on screen ---------------------------------------------------
+  // --- the tab on screen -------------------------------------------------------
 
-  /** The server's last answer about the section on screen. `null` until its first load succeeds. */
-  daily = $derived(this.current.daily)
+  /** Random mode is on screen. */
+  random = $derived(this.tab === RANDOM)
+  /** The server's last answer about the game on screen. `null` until its first load succeeds. */
+  view: Daily | RandomSong | null = $derived(this.current.view)
   loading = $derived(this.current.loading)
   loadError = $derived(this.current.loadError)
-  /** The section on screen has no song today. */
+  /** The tab on screen has no song to play. */
   noSong = $derived(this.current.noSong)
-  /** True while a move in this section, or Clear my data, is on its way. */
+  /** True while a move in this tab, or Clear my data, is on its way. */
   submitting = $derived(this.current.submitting || this.clearing)
   moveError = $derived(this.current.moveError)
   notice = $derived(this.current.notice)
   info = $derived(this.current.info)
 
-  status: Status = $derived(this.daily?.status ?? 'playing')
+  status: Status = $derived(this.view?.status ?? 'playing')
   finished = $derived(this.status !== 'playing')
-  attempts: Attempt[] = $derived(this.daily?.attempts ?? [])
-  ladder: number[] = $derived(this.daily?.ladder ?? [])
-  answer: Answer | null = $derived(this.daily?.answer ?? null)
-  /** The player's record in the section on screen. */
-  stats: Stats | null = $derived(this.daily?.stats ?? null)
+  attempts: Attempt[] = $derived(this.view?.attempts ?? [])
+  ladder: number[] = $derived(this.view?.ladder ?? [])
+  answer: Answer | null = $derived(this.view?.answer ?? null)
+  /** The player's record in the section on screen; `null` in random mode. */
+  stats: Stats | null = $derived(this.view && !isRandomSong(this.view) ? this.view.stats : null)
+  /** The random song on screen, which carries the session's score; `null` on a section's tab. */
+  song: RandomSong | null = $derived(this.view && isRandomSong(this.view) ? this.view : null)
+  /** The random session's score; `null` on a section's tab. */
+  score: RandomScore | null = $derived(this.song)
+  /**
+   * Which game is on screen: a section on a day, or one random song. When it
+   * changes, what is shown next is another game and not this one moving on.
+   */
+  scene = $derived(
+    this.tab === RANDOM
+      ? `${RANDOM} ${this.games.random.view?.round ?? ''}`
+      : `${this.tab} ${this.day ?? ''}`,
+  )
   /** Length of the whole preview in seconds: the last ladder step. */
   totalSeconds = $derived(this.ladder.at(-1) ?? 0)
   /** The clip length unlocked now. */
-  clipSeconds = $derived(this.daily?.clipSeconds ?? 0)
+  clipSeconds = $derived(this.view?.clipSeconds ?? 0)
   /** The turn being played, or the turn the game ended on. 1-based. */
   turn = $derived(Math.min(this.attempts.length + 1, Math.max(this.ladder.length, 1)))
   /** On the last turn a skip or a wrong guess ends the game. */
@@ -169,8 +229,12 @@ export class Game {
   private starting = false
   private opened = false
   private todayRequest = 0
-  /** Goes up when everything heard so far stops being true: a new day, a new player. */
+  /** The overview and daily games being asked for right now; see `startSession` for who waits for them. */
+  private readonly asking = new Set<Promise<unknown>>()
+  /** Goes up when everything heard about the day's games stops being true: a new day, a new player. */
   private epoch = 0
+  /** The same for the random game, which a new day leaves alone: a new player. */
+  private randomEpoch = 0
 
   constructor() {
     this.player.onstatechange = (playing) => {
@@ -180,43 +244,52 @@ export class Game {
 
   // --- which game is on screen --------------------------------------------------
 
-  /** Opens the page on a section: asks for the overview and that section's game. Call on page load. */
-  open(section: Section): void {
+  /** Opens the page on a tab: asks for the overview and that tab's game. Call on page load. */
+  open(tab: Tab): void {
     this.opened = true
-    this.section = section
+    this.tab = tab
     void this.fetchToday()
-    void this.fetchGame(section)
+    void this.fetchTab(tab)
   }
 
   /**
-   * Puts another section on screen. The clip that is playing stops. A section
-   * seen before shows what it showed (and is quietly asked about again, in
-   * case it changed elsewhere); a new one is loaded.
+   * Puts another tab on screen. The clip that is playing stops. A tab seen
+   * before shows what it showed (and is quietly asked about again, in case it
+   * changed elsewhere); a new one is loaded.
    */
-  select(section: Section): void {
-    if (!this.opened) return this.open(section)
-    if (section === this.section) return
+  select(tab: Tab): void {
+    if (!this.opened) return this.open(tab)
+    if (tab === this.tab) return
     this.dropClip()
     this.fresh = false
     // What the last move did there is old news by the time the tab is opened again.
     this.current.notice = ''
-    this.section = section
-    const game = this.games[section]
-    if (game.daily) {
+    this.tab = tab
+    const game = this.games[tab]
+    if (game.view) {
       void this.loadClip()
-      void this.fetchGame(section, true)
+      void this.fetchTab(tab, true)
       return
     }
     // The overview said so in advance; the request below has the last word.
-    if (tabState(this.known[section]) === 'none') game.noSong = true
-    if (!game.loading) void this.fetchGame(section, game.noSong)
+    if (tab !== RANDOM && tabState(this.known[tab]) === 'none') game.noSong = true
+    if (!game.loading && !game.submitting) void this.fetchTab(tab, game.noSong)
   }
 
-  /** Asks again for the overview and the game on screen. The "Try again" of a failed load. */
+  /**
+   * Asks again for the overview and the game on screen. The "Try again" of a
+   * failed load and the "Check again" of a tab without a song.
+   */
   async load(): Promise<void> {
     if (this.current.loading) return
     void this.fetchToday()
-    await this.fetchGame(this.section)
+    const random = this.games.random
+    // The draw after a finished song found nothing: asking again is that draw again.
+    if (this.tab === RANDOM && random.noSong && random.view) {
+      await this.next()
+      return
+    }
+    await this.fetchTab(this.tab)
   }
 
   /**
@@ -229,7 +302,7 @@ export class Game {
     void this.fetchToday()
     const game = this.current
     if (game.submitting || game.loading) return
-    void this.fetchGame(this.section, game.daily !== null || game.noSong)
+    void this.fetchTab(this.tab, game.view !== null || game.noSong)
   }
 
   // --- the clip -----------------------------------------------------------------
@@ -240,7 +313,7 @@ export class Game {
    */
   async play(): Promise<void> {
     // A second press while the first still waits for the clip would start it twice.
-    if (!this.daily || this.starting) return
+    if (!this.view || this.starting) return
     this.starting = true
     try {
       // Synchronously inside the gesture, before anything is awaited.
@@ -274,6 +347,11 @@ export class Game {
     return this.player.progress()
   }
 
+  /** Settles when the clip of the game on screen has loaded, or has failed to. */
+  async clipSettled(): Promise<void> {
+    await this.clip
+  }
+
   // --- moves --------------------------------------------------------------------
 
   /** Gives up the turn. Resolves to whether the server accepted the move. */
@@ -287,10 +365,11 @@ export class Game {
   }
 
   private async move(move: Move): Promise<boolean> {
-    const section = this.section
+    const section = this.tab
+    if (section === RANDOM) return this.moveRandom(move)
     const game = this.games[section]
     // `submitting` is the guard against a double tap sending two moves.
-    if (game.submitting || this.clearing || game.daily?.status !== 'playing') return false
+    if (game.submitting || this.clearing || game.view?.status !== 'playing') return false
     game.submitting = true
     game.moveError = null
     game.info = null
@@ -298,7 +377,7 @@ export class Game {
       const daily = await postGuess(section, move)
       this.receive(section, daily)
       game.notice = describeMove(daily)
-      if (daily.status !== 'playing' && section === this.section) this.fresh = true
+      if (daily.status !== 'playing' && section === this.tab) this.fresh = true
       return true
     } catch (err) {
       switch (codeOf(err)) {
@@ -325,17 +404,96 @@ export class Game {
     }
   }
 
-  // --- clear my data ------------------------------------------------------------
-
-  /** True while any section has a move on its way. */
-  get busy(): boolean {
-    return SECTIONS.some((section) => this.games[section].submitting)
+  /** A skip or guess on the random song. It names the round, so it cannot land on another song. */
+  private async moveRandom(move: Move): Promise<boolean> {
+    const game = this.games.random
+    const song = game.view
+    if (game.submitting || this.clearing || song?.status !== 'playing') return false
+    game.submitting = true
+    game.moveError = null
+    game.info = null
+    let failure: unknown
+    try {
+      const after = await postRandomGuess(song.round, move)
+      this.receiveRandom(after)
+      game.notice = describeMove(after)
+      if (after.status !== 'playing' && this.tab === RANDOM) this.fresh = true
+      return true
+    } catch (err) {
+      failure = err
+    } finally {
+      game.submitting = false
+    }
+    await this.randomRefused(failure)
+    return false
   }
 
   /**
-   * Deletes every game stored for this browser and starts over as a new
-   * player. Resolves to `null` when it is done, or to why it failed, in which
-   * case nothing on screen changes.
+   * Random mode: draws the next song, once the one on screen is over. Resolves
+   * to whether there is a new song to play.
+   */
+  async next(): Promise<boolean> {
+    const game = this.games.random
+    const song = game.view
+    // `submitting` is the guard against a double tap drawing two songs.
+    if (game.submitting || this.clearing || !song || song.status === 'playing') return false
+    game.submitting = true
+    this.drawing = true
+    game.moveError = null
+    game.info = null
+    let failure: unknown
+    try {
+      const drawn = await postRandomNext(song.round)
+      this.receiveRandom(drawn)
+      game.notice = `Next song. You can play ${clipLabel(drawn.clipSeconds)}.`
+      return true
+    } catch (err) {
+      failure = err
+    } finally {
+      game.submitting = false
+      this.drawing = false
+    }
+    await this.randomRefused(failure)
+    return false
+  }
+
+  /** The server refused a random move or draw: does what that calls for (see `remedyFor`). */
+  private async randomRefused(err: unknown): Promise<void> {
+    const game = this.games.random
+    switch (remedyFor(codeOf(err))) {
+      case 'reload':
+        await this.fetchRandom()
+        break
+      case 'tell':
+        // Another tab has moved on to another song, or started a session of its own.
+        game.info = SONG_CHANGED
+        await this.fetchRandom()
+        break
+      case 'restart':
+        // The server has no game for this browser any more (the data was cleared, the admin reset).
+        game.info = SESSION_GONE
+        await this.startSession()
+        break
+      case 'empty':
+        // What is on screen stays as it is; "Check again" asks for the draw again.
+        game.noSong = true
+        break
+      default:
+        game.moveError = describe(err)
+    }
+  }
+
+  // --- clear my data ------------------------------------------------------------
+
+  /** True while any tab has a move on its way. */
+  get busy(): boolean {
+    return TABS.some((tab) => this.games[tab].submitting)
+  }
+
+  /**
+   * Deletes every game stored for this browser, the random one included, and
+   * starts over as a new player. Resolves to `null` when it is done, or to why
+   * it failed, in which case nothing on screen changes.
    */
   async clearData(): Promise<string | null> {
     // A move answered after the deletion would bring the old player back with that game.
@@ -348,13 +506,20 @@ export class Game {
     } finally {
       this.clearing = false
     }
-    this.forget()
+    this.forgetDay()
+    this.forgetRandom()
     void this.fetchToday()
-    void this.fetchGame(this.section)
+    // On the Random tab this starts a new session: the old one went with the data.
+    void this.fetchTab(this.tab)
     return null
   }
 
   // --- what the server says -------------------------------------------------------
+
+  /** Asks for a tab's game: a section's, or the random song. `quiet` as in `fetchGame`. */
+  private fetchTab(tab: Tab, quiet = false): Promise<void> {
+    return tab === RANDOM ? this.fetchRandom(quiet) : this.fetchGame(tab, quiet)
+  }
 
   /**
    * Asks for a section's game. `quiet` is for a game that is already on
@@ -371,7 +536,7 @@ export class Game {
       game.loadError = null
     }
     try {
-      const daily = await getDaily(section)
+      const daily = await this.asked(getDaily(section))
       if (epoch !== this.epoch || id !== game.request) return
       // A move made in the meantime is newer than this answer.
       if (quiet && (game.submitting || version !== game.version)) return
@@ -380,11 +545,93 @@ export class Game {
       if (epoch !== this.epoch || id !== game.request) return
       if (codeOf(err) === 'no_song') this.songGone(section)
       else if (quiet) return // Stale but usable.
-      else if (game.daily) game.moveError = describe(err)
+      else if (game.view) game.moveError = describe(err)
       else game.loadError = describe(err)
     } finally {
       if (id === game.request) game.loading = false
     }
+  }
+
+  /**
+   * Asks for the random song this browser is on. A browser tab without a
+   * session starts one instead, and so does a session the server has no game
+   * for. `quiet` as in `fetchGame`.
+   */
+  private async fetchRandom(quiet = false): Promise<void> {
+    if (!session.known()) return this.startSession()
+    const game = this.games.random
+    const id = ++game.request
+    const epoch = this.randomEpoch
+    const version = game.version
+    if (!quiet) {
+      game.loading = true
+      game.loadError = null
+    }
+    try {
+      const song = await getRandom()
+      if (epoch !== this.randomEpoch || id !== game.request) return
+      // A move made in the meantime is newer than this answer.
+      if (quiet && (game.submitting || version !== game.version)) return
+      this.receiveRandom(song)
+    } catch (err) {
+      if (epoch !== this.randomEpoch || id !== game.request) return
+      if (remedyFor(codeOf(err)) === 'restart') {
+        // What is on screen, if anything, was a game the server no longer has.
+        if (game.view) game.info = SESSION_GONE
+        void this.startSession()
+      } else if (quiet) return // Stale but usable.
+      else if (game.view) game.moveError = describe(err)
+      else game.loadError = describe(err)
+    } finally {
+      if (id === game.request) game.loading = false
+    }
+  }
+
+  /**
+   * Starts a random session: a first song, the run and the totals at zero. One
+   * at a time, so a tab opened twice in a hurry starts one session and not two.
+   */
+  private async startSession(): Promise<void> {
+    const game = this.games.random
+    if (game.submitting) return
+    const id = ++game.request
+    const epoch = this.randomEpoch
+    // A start is a move as far as Clear my data is concerned: its answer sets the player cookie.
+    game.submitting = true
+    game.loading = true
+    game.loadError = null
+    try {
+      // A browser the server has not met is given a player by every answer,
+      // and keeps the one that arrives last. A start sent beside the page's
+      // first requests could so lose its game to another answer's player.
+      // Once those are answered, every request names the same player.
+      await Promise.allSettled([...this.asking])
+      if (epoch !== this.randomEpoch) return
+      const song = await startRandom()
+      if (epoch !== this.randomEpoch) return
+      session.keep()
+      this.receiveRandom(song)
+    } catch (err) {
+      if (epoch !== this.randomEpoch) return
+      if (remedyFor(codeOf(err)) === 'empty') {
+        game.view = null
+        game.version++
+        game.noSong = true
+        if (this.tab === RANDOM) this.dropClip()
+      } else if (game.view) game.moveError = describe(err)
+      else game.loadError = describe(err)
+    } finally {
+      game.submitting = false
+      if (id === game.request) game.loading = false
+    }
+  }
+
+  /** Notes a request as being on its way until it is answered. */
+  private asked<T>(request: Promise<T>): Promise<T> {
+    this.asking.add(request)
+    const done = () => void this.asking.delete(request)
+    request.then(done, done)
+    return request
   }
 
   /** Asks for the overview behind the tabs. A failure leaves the tabs as they were. */
@@ -393,7 +640,7 @@ export class Game {
     const versions = SECTIONS.map((section) => this.games[section].version)
     let today: Today
     try {
-      today = await getToday()
+      today = await this.asked(getToday())
     } catch {
       return
     }
@@ -411,15 +658,16 @@ export class Game {
         song: entry.song,
       }
     })
-    if (turned) void this.fetchGame(this.section)
+    const tab = this.tab
+    if (turned && tab !== RANDOM) void this.fetchGame(tab)
   }
 
   /** Takes in a section's game, from a load or a move. */
   private receive(section: Section, daily: Daily): void {
     const turned = this.noteDay(daily.day)
     const game = this.games[section]
-    const previous = game.daily
-    game.daily = daily
+    const previous = game.view
+    game.view = daily
     game.version++
     game.noSong = false
     game.loadError = null
@@ -431,50 +679,83 @@ export class Game {
       song: 'picked',
     }
     // The clip only changes with the day or the unlocked length.
-    if (section === this.section && (!previous || audioUrl(previous) !== audioUrl(daily))) {
+    if (section === this.tab && (!previous || audioUrl(previous) !== audioUrl(daily))) {
       void this.loadClip()
     }
     if (turned) {
       void this.fetchToday()
-      if (section !== this.section) void this.fetchGame(this.section)
+      const tab = this.tab
+      if (tab !== RANDOM && tab !== section) void this.fetchGame(tab)
     }
+  }
+
+  /** Takes in the random song, from a load, a move, a start or a draw. */
+  private receiveRandom(song: RandomSong): void {
+    const game = this.games.random
+    const previous = game.view
+    game.view = song
+    game.version++
+    game.noSong = false
+    game.loadError = null
+    if (this.tab !== RANDOM) return
+    // Another song: whatever ended the last one is not news about this one.
+    if (previous?.round !== song.round) this.fresh = false
+    // The clip only changes with the song or the unlocked length.
+    if (!previous || audioUrl(previous) !== audioUrl(song)) void this.loadClip()
   }
 
   /**
    * Notes the day of a response. When it is not the day on screen, midnight
-   * (or the admin's clock) has passed: everything heard so far is dropped,
-   * and the caller asks again. Returns whether that happened.
+   * (or the admin's clock) has passed: everything heard about the day's games
+   * is dropped, and the caller asks again. Returns whether that happened.
    */
   private noteDay(day: string): boolean {
     if (this.day === day) return false
     const first = this.day === null
     this.day = day
     if (first) return false
-    this.forget()
-    this.current.info = "The day has changed. This is today's game."
+    this.forgetDay()
+    if (this.tab !== RANDOM) this.current.info = "The day has changed. This is today's game."
     return true
   }
 
-  /** Drops everything heard about the games; requests still on their way are ignored when they answer. */
-  private forget(): void {
+  /**
+   * Drops everything heard about the day's four games; requests still on
+   * their way are ignored when they answer. The random game has no day and
+   * stays as it is, with its clip when it is the one on screen.
+   */
+  private forgetDay(): void {
     this.epoch++
-    this.dropClip()
-    this.fresh = false
+    if (this.tab !== RANDOM) {
+      this.dropClip()
+      this.fresh = false
+    }
     for (const section of SECTIONS) {
       this.games[section].forget()
       this.known[section] = null
     }
   }
 
+  /** Drops the random game and this browser tab's session: the player it belonged to is gone. */
+  private forgetRandom(): void {
+    this.randomEpoch++
+    if (this.tab === RANDOM) {
+      this.dropClip()
+      this.fresh = false
+    }
+    this.games.random.forget()
+    session.drop()
+  }
+
   /** The server says the section has no song today. */
   private songGone(section: Section): void {
     const game = this.games[section]
-    game.daily = null
+    game.view = null
     game.version++
     game.noSong = true
     game.loadError = null
     this.known[section] = { status: 'playing', attempts: 0, song: 'none' }
-    if (section === this.section) this.dropClip()
+    if (section === this.tab) this.dropClip()
   }
 
   /** Stops the sound and forgets the loaded clip: what is in the player belongs to another game. */
@@ -488,12 +769,12 @@ export class Game {
 
   /** Loads the clip of the game on screen. */
   private loadClip(): Promise<boolean> {
-    const daily = this.current.daily
-    if (!daily) return Promise.resolve(false)
+    const view = this.current.view
+    if (!view) return Promise.resolve(false)
     const id = ++this.clipId
     this.clipLoading = true
     this.clipError = null
-    this.clip = this.player.load(audioUrl(daily)).then(
+    this.clip = this.player.load(audioUrl(view)).then(
       () => {
         if (id === this.clipId) this.clipLoading = false
         return true
@@ -510,11 +791,11 @@ export class Game {
   }
 }
 
-function describeMove(daily: Daily): string {
-  if (daily.status === 'won') return 'Correct.'
-  if (daily.status === 'lost') return 'No tries left.'
-  const last = daily.attempts.at(-1)
-  const unlocked = `You can now play ${clipLabel(daily.clipSeconds)}.`
+function describeMove(view: GameView): string {
+  if (view.status === 'won') return 'Correct.'
+  if (view.status === 'lost') return 'No tries left.'
+  const last = view.attempts.at(-1)
+  const unlocked = `You can now play ${clipLabel(view.clipSeconds)}.`
   if (last?.kind === 'wrong') return `Not ${last.title} by ${last.artist}. ${unlocked}`
   return `Skipped. ${unlocked}`
 }
