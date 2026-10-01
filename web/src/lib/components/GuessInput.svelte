@@ -17,6 +17,13 @@
 
   const DEBOUNCE_MS = 200
   const MIN_CHARS = 2
+  /** The list opens under the field when it has at least this much room there, in pixels. */
+  const ROOM_BELOW = 232
+  /** The list is never taller than this, nor shorter than about two rows. */
+  const MAX_LIST = 400
+  const MIN_LIST = 112
+  /** Kept free between the list and the edge of the screen (or the keyboard). */
+  const EDGE = 12
 
   const uid = $props.id()
   const listId = `${uid}-list`
@@ -33,6 +40,9 @@
   let open = $state(false)
   /** Index of the highlighted row, -1 for none. */
   let active = $state(-1)
+  /** Which side of the field the list opens on, and how tall it may be. */
+  let above = $state(false)
+  let room = $state(MAX_LIST)
 
   let timer: ReturnType<typeof setTimeout> | undefined
   let request: AbortController | undefined
@@ -52,7 +62,24 @@
     return hint
   })
 
-  const label = (track: Track) => `${track.title} — ${track.artist}`
+  const label = (track: Track) => `${track.title}, ${track.artist}`
+
+  /**
+   * Puts the list where there is room for it. On a phone the on-screen keyboard
+   * covers the bottom of the page; the visual viewport is what is left, so the
+   * list opens above the field when the space under it is gone.
+   */
+  function place() {
+    if (!input) return
+    const field = input.getBoundingClientRect()
+    const view = window.visualViewport
+    const top = view ? view.offsetTop : 0
+    const bottom = top + (view ? view.height : window.innerHeight)
+    const over = field.top - top
+    const under = bottom - field.bottom
+    above = under < ROOM_BELOW && over > under
+    room = Math.max(MIN_LIST, Math.min(MAX_LIST, (above ? over : under) - EDGE))
+  }
 
   function cancelSearch() {
     clearTimeout(timer)
@@ -171,10 +198,27 @@
   }
 
   $effect(() => cancelSearch)
+
+  // While the list is open, follow the keyboard sliding in and out and the page scrolling.
+  $effect(() => {
+    if (!open) return
+    place()
+    const view = window.visualViewport
+    view?.addEventListener('resize', place)
+    view?.addEventListener('scroll', place)
+    window.addEventListener('resize', place)
+    window.addEventListener('scroll', place, { passive: true })
+    return () => {
+      view?.removeEventListener('resize', place)
+      view?.removeEventListener('scroll', place)
+      window.removeEventListener('resize', place)
+      window.removeEventListener('scroll', place)
+    }
+  })
 </script>
 
 <form class="guess" {onsubmit}>
-  <label for="{uid}-input">Your guess</label>
+  <label class="sr-only" for="{uid}-input">Your guess</label>
   <div class="row">
     <div class="field">
       <input
@@ -200,7 +244,12 @@
         onblur={() => (open = false)}
       />
       <!-- preventDefault on mousedown keeps the focus in the field, so a tap on a row does not close the list first. -->
-      <div class="popup" hidden={!open || (results.length === 0 && hint === '')}>
+      <div
+        class="popup"
+        class:above
+        style:max-height="{room}px"
+        hidden={!open || (results.length === 0 && hint === '')}
+      >
         <ul
           id={listId}
           role="listbox"
@@ -236,10 +285,10 @@
         {/if}
       </div>
     </div>
-    <button class="primary" type="submit" disabled={!picked || busy}>Guess</button>
+    <button class="button solid" type="submit" disabled={!picked || busy}>Guess</button>
   </div>
   <p class="help" id={helpId}>
-    {picked ? 'Press Guess to send it.' : 'Type a title or an artist, then pick a song from the list.'}
+    {picked ? 'Press Guess to send it.' : 'Type a title or artist, then pick a song from the list.'}
   </p>
   <p class="sr-only" role="status">{spoken}</p>
 </form>
@@ -250,13 +299,8 @@
     gap: var(--space-2);
   }
 
-  label {
-    font-weight: 600;
-  }
-
   .row {
     display: flex;
-    gap: var(--space-2);
   }
 
   .field {
@@ -265,43 +309,72 @@
     min-width: 0;
   }
 
+  /* A slip of paper stuck on the sleeve: the one place the player writes. */
   input {
+    display: block;
     width: 100%;
-    height: var(--control-height);
-    padding: 0 var(--space-3);
-    border: var(--border);
-    border-radius: var(--radius);
-    background: var(--color-surface);
+    height: var(--control);
+    padding: 0 var(--space-4);
+    border: var(--line) solid var(--paper);
+    border-radius: 0;
+    background: var(--paper);
+    color: var(--ink);
     /* 16 px or more, or iOS zooms the page when the field takes focus. */
-    font-size: max(1rem, 16px);
+    font-size: max(var(--text-body), 16px);
+    font-weight: var(--weight-medium);
+    appearance: none;
+  }
+
+  input::placeholder {
+    color: var(--ink);
+    font-weight: var(--weight-regular);
+    opacity: 1;
+  }
+
+  /* The ring goes inside the field: outside, the list and the button are in its way. */
+  input:focus-visible {
+    outline: 3px solid var(--ink);
+    outline-offset: -5px;
+    box-shadow: none;
+  }
+
+  .button {
+    flex: none;
   }
 
   .popup {
     position: absolute;
-    z-index: 1;
-    inset: calc(100% + var(--space-1)) 0 auto 0;
-    max-height: min(24rem, 55vh);
+    z-index: 2;
+    inset: calc(100% + var(--space-2)) 0 auto 0;
     overflow-y: auto;
-    border: var(--border);
-    border-radius: var(--radius);
-    background: var(--color-surface);
-    box-shadow: 0 6px 18px rgb(0 0 0 / 0.18);
+    overscroll-behavior: contain;
+    background: var(--paper);
+    color: var(--ink);
+    box-shadow: var(--lift);
+  }
+
+  .popup.above {
+    inset: auto 0 calc(100% + var(--space-2)) 0;
   }
 
   li {
     display: flex;
     align-items: center;
     gap: var(--space-3);
-    min-height: var(--control-height);
-    padding: var(--space-2) var(--space-3);
+    min-height: var(--control);
+    padding: var(--space-2) var(--space-3) var(--space-2) 0;
     /* A bar on the left marks the highlighted row, so it does not depend on colour alone. */
-    border-left: 4px solid transparent;
+    border-left: var(--space-2) solid transparent;
     cursor: pointer;
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
+    user-select: none;
+    -webkit-user-select: none;
   }
 
   li.active {
-    border-left-color: var(--color-accent);
-    background: var(--color-accent-soft);
+    border-left-color: var(--ink);
+    background: var(--accent);
   }
 
   img,
@@ -309,13 +382,13 @@
     flex: none;
     width: 2.5rem;
     height: 2.5rem;
-    border-radius: calc(var(--radius) / 2);
-    background: var(--color-bg);
+    background: var(--ink);
   }
 
   .names {
     display: grid;
     min-width: 0;
+    line-height: 1.25;
   }
 
   .title,
@@ -326,17 +399,16 @@
   }
 
   .title {
-    font-weight: 600;
+    font-weight: var(--weight-medium);
   }
 
   .artist,
   .hint,
   .help {
-    color: var(--color-muted);
     font-size: var(--text-small);
   }
 
   .hint {
-    padding: var(--space-3);
+    padding: var(--space-4);
   }
 </style>

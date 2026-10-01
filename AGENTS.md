@@ -83,18 +83,29 @@ Cookie key: 64 random bytes written as 128 hexadecimal characters. `GTS_SECRET` 
 
 ### Frontend (`web/src/`)
 
-A plain, restylable UI: fully playable, deliberately undesigned. The design pass (task 5) restyles it and adds `Record.svelte`; the logic below should not need rewriting for that.
+The designed UI (task 5). The look is described under **Design direction**; this is where things live.
 
 - `lib/api.ts` — types for the API (`Daily`, `Attempt`, `Answer`, `Track`, `Move`), `ApiError { code, message, status }` (`code` is the server's `error`, or `network` / `bad_response`), `getDaily`, `postGuess`, `searchTracks(query, signal)`, `audioUrl(daily)` (`?t=<attempts>-<status>`).
-- `lib/clip.ts` — pure helpers, unit-tested: `findAudibleStart` (threshold 0.002, cap 60 ms), `playableSeconds`, `clipLabel` ("0.3 seconds"), `clipShort` ("0.3 s"), `ladderFraction` (equal-width ladder steps).
+- `lib/clip.ts` — pure helpers, unit-tested: `findAudibleStart` (threshold 0.002, cap 60 ms), `playableSeconds`, `clipLabel` ("0.3 seconds"), `clipShort` ("0.3 s"), `ladderFraction` (equal-width ladder steps; the needle's position across the record's bands is exactly this).
 - `lib/audio.ts` — `ClipPlayer`, framework-free: one lazy `AudioContext` created in a gesture (`unlock()`), `load(url)` (decodes on a 44.1 kHz `OfflineAudioContext`, so no gesture is needed to load), `play(seconds)` (`source.start(when, offset, duration)` 30 ms ahead, 5 ms gain fades, clamped to the buffer), `stop()`, `progress()`, `onstatechange`, `analyser`. Graph: source → clip gain → output gain → analyser → destination. It skips the MP3's leading priming silence so the 0.1 s clip is 0.1 s of sound.
-- `lib/game.svelte.ts` — `Game` runes store and the `game` singleton: `daily`, `loadError`, `moveError`, `clipError`, `clipLoading`, `submitting`, `playing`, `notice`; derived `status`, `finished`, `turn`, `lastTurn`, `clipSeconds`, `nextClipSeconds`, `slots`; `load()`, `refresh()`, `play()`, `stop()`, `toggle()`, `skip()`, `guess(track)`. Reloads the clip whenever `audioUrl` or the day changes. Pressing play while playing stops the clip. A 409 `finished` re-fetches the state instead of showing an error.
-- `lib/components/` — `Controls` (play, `Timeline`, skip / "Give up"), `Timeline` (seven equal-width steps, unlocked fill, playhead from the audio clock), `GuessInput` (ARIA combobox; takes `onguess` and `busy`, knows nothing about the game), `Attempts`, `Reveal`.
-- `styles/tokens.css` (every colour, size and space, light and dark), `styles/base.css` (reset, buttons, focus ring, reduced motion). Components carry layout only.
-- `web/mock/` — a stand-in API for UI work without the server: `GTS_MOCK=1 GTS_MOCK_AUDIO=<mp3> pnpm dev` (from `web/`, in the dev shell). Not imported without the flag. One game per Vite process, no cookie; `POST /api/mock/reset` restarts it; the answer is "Paper Boats".
-- `web/test/` — `pnpm --dir web test` (`node --test`, no framework) covers `lib/clip.ts`.
+- `lib/game.svelte.ts` — `Game` runes store and the `game` singleton: `daily`, `loadError`, `moveError`, `clipError`, `clipLoading`, `submitting`, `playing`, `notice`, `moves`; derived `status`, `finished`, `turn`, `lastTurn`, `clipSeconds`, `nextClipSeconds`, `totalSeconds`, `slots`; `load()`, `refresh()`, `play()`, `stop()`, `toggle()`, `skip()`, `guess(track)`, `progress()`. Reloads the clip whenever `audioUrl` or the day changes. A 409 `finished` re-fetches the state instead of showing an error. The design pass did not change this file, `api.ts`, `clip.ts` or `audio.ts`.
+- `lib/sleeve.ts` — pure, unit-tested: `sleeveForDay(day)` (the UTC weekday of the game's `day`, 0 = Sunday) and `sleeveOverride(search)` (`?sleeve=0..6`).
+- `lib/record.ts` — `RecordPainter`, framework-free canvas 2D drawing: `configure(geometry)`, `setPalette(palette)`, `invalidate()`, `paint(view)`. `paint` draws exactly what its `RecordView` says (lit amount per band, rotation, needle position, waveform, cover, printed fraction, progress arc); the only state it keeps is three cached layers (disc and grooves, sheen, blank label). All geometry constants (band radii, label, tonearm pivot and length) are at the top of the file.
+- `lib/components/`
+  - `Record.svelte` — owns the `<canvas>`, the animation state and the one `requestAnimationFrame` loop; reads the colours, the font and the layout switches from CSS custom properties.
+  - `Play.svelte` — the play button (a round disc plus the label) and the one-line readout under the label; used while playing and in the reveal. Clips shorter than 3 s never show "Stop" (pressing again restarts them).
+  - `GuessInput.svelte` — ARIA combobox; takes `onguess` and `busy`, knows nothing about the game. Places its list above or below the field from `window.visualViewport`.
+  - `Skip.svelte` — "Skip to …" / "Give up".
+  - `Attempts.svelte` — the seven tries, one row per band: clip length, a mark (SVG shape), words.
+  - `Reveal.svelte` — result line, title in display type, artist, cover and album, Deezer link, `Play`.
+- `App.svelte` — layout (header, stage with the record, game column), picks the sleeve and sets `data-sleeve` on `<html>` and the `theme-color` meta.
+- `styles/tokens.css` (every colour, size and space: the seven sleeves, the type scale, the record's size and position per layout), `styles/base.css` (reset, `.button`, focus ring, `.error`, reduced motion). Components carry layout only.
+- `index.html` — `viewport-fit=cover`, the SVG favicon (`public/favicon.svg`), and a one-line inline script that sets `data-sleeve` from the browser's UTC weekday before first paint (the app then corrects it from the game's day).
+- Font: `@fontsource-variable/bricolage-grotesque` (dev dependency), `standard.css` — one variable file per subset with the weight, width and optical-size axes, bundled by Vite and served from this origin. No external font requests.
+- `web/mock/` — a stand-in API for UI work without the server: `GTS_MOCK=1 GTS_MOCK_AUDIO=<mp3> pnpm dev` (from `web/`, in the dev shell). Not imported without the flag. One game per Vite process, no cookie; `POST /api/mock/reset` restarts it; the answer is "Paper Boats". Not re-run after the design pass.
+- `web/test/` — `pnpm --dir web test` (`node --test`, no framework) covers `lib/clip.ts` and `lib/sleeve.ts` (14 tests).
 
-Headless Chromium for browser checks comes from the Nix cache: `nix build --inputs-from . nixpkgs#chromium --no-link --print-out-paths`, then drive it over the DevTools protocol with Node's built-in `WebSocket` (no dependencies). It has no audio output; use an `OfflineAudioContext` render to measure clip lengths.
+Headless Chromium for browser checks comes from the Nix cache: `nix build --inputs-from . nixpkgs#chromium --out-link <scratch dir>/chromium-root`, then drive `<link>/bin/chromium` over the DevTools protocol with Node's built-in `WebSocket` (no dependencies). Use `--out-link` (in a scratch directory, not the repo), not `--no-link`: without a GC root the store path was garbage-collected in the middle of a test run on 2026-10-01. It has no audio output, but the `AudioContext` clock and the analyser run, so playback, the needle and the ripple can be screenshotted. Emulate a phone with `Emulation.setDeviceMetricsOverride` (`mobile: true`) plus `Emulation.setTouchEmulationEnabled`, the on-screen keyboard with a short viewport (390×480), and reduced motion with `Emulation.setEmulatedMedia`.
 
 ## How to work here
 
@@ -146,34 +157,101 @@ All recipes run from the repo root, so the server's working directory is the rep
 
 ## Design direction
 
-Working title **Needledrop** (a needle drop is literally playing a fragment of a record).
+Working title **Needledrop** (a needle drop is literally playing a fragment of a record). This section describes what is built; later UI work should stay in this language.
 
-**Concept — an unlabelled record sliding out of its sleeve.** The page is a flat, fully saturated colour field, like a 60s jazz sleeve, not a dark app. One oversized black vinyl record is cropped by the viewport edge. Its surface carries **seven groove bands, one per clip length**; unlocked bands light up in the accent colour, and while a clip plays the record spins, the tonearm sweeps the unlocked band, and the grooves ripple with the live audio signal. The centre label is blank until the game ends — then the real album cover prints onto the label and the sleeve. That reveal is the one orchestrated motion moment; everything else is quiet.
+**Concept — an unlabelled record sliding out of its sleeve.** The page is one flat, fully saturated colour field, like a 1960s jazz sleeve, not a dark app. One oversized black record is cropped by the edge of the window (or, on a phone, hangs from under the header). The record is the only bold thing on the page and it is the progress display: **seven groove bands, one per clip length**, outermost first; unlocked bands are filled with the accent colour. Everything else is quiet type on the field.
 
-- **Colour** — a different two-colour sleeve per weekday (7 curated field/accent pairs, each contrast-checked), so every day's game looks like a different pressing. Default pair:
-  - Field `#2340E0` cobalt · Accent `#FF6A1F` tangerine · Paper `#EEF0FF` (text on field) · Ink `#0B1560` (text on paper) · Vinyl `#050505`
-- **Type** — one family, Bricolage Grotesque variable (self-hosted via Fontsource): condensed heavy for the huge day number and song title, regular width for UI; tabular figures for clip times. No monospace, no all-caps labels.
-- **Layout** — left-aligned, asymmetric:
+Principles:
+
+- **Two inks and the paper.** Field, accent, paper, ink, plus the black of the vinyl. No greys, no opacity-dimmed text, no gradients outside the record. Hierarchy comes from size, weight and width.
+- **Shape language.** Paper things are rectangles with square corners (the guess field, the result list, buttons, the cover); record things are circles (the play disc, the marks in the tries list). Paper surfaces that float (the result list, the cover) get a hard offset ink shadow (`--lift`), never a soft one.
+- **The accent means "unlocked / do this next"**: lit bands, the play disc, the enabled Guess button, the current try's dot, the correct mark. Accent on field is below 3:1 on two sleeves, so the accent never carries meaning on the field by itself: it always has ink text on it, a paper edge round it, or words beside it.
+- **States are shapes and words**, never colour alone: skipped `»` "Skipped", wrong `✕` title "by" artist, correct `✓` in a filled disc, current a filled dot and "This try" in a heavier weight, unused a hollow ring. The highlighted row in the result list has an ink bar on its left; a disabled button is dashed.
+- **Motion answers actions** (a band lights when it unlocks, the record turns while a clip sounds). The only orchestrated sequence is the reveal.
+- **Copy is plain and literal**, sentence case: "Play 0.3 seconds", "Skip to 1 second", "Give up", "Guess", "Play all 30 seconds", "Listen on Deezer", "You got it on try 3 of 7.", "No tries left. The song was". A picked song reads "Title, Artist" in the field and "Title by Artist" in the tries.
+
+### Sleeves
+
+One two-colour sleeve per UTC weekday (`data-sleeve` on `<html>`, numbered like `Date.getUTCDay()`), so each day's game is a different pressing. The weekday comes from the game's `day`, not the local date. `?sleeve=0..6` previews any of them. Vinyl is `#050505`; figures on locked bands are `#9a9a9a` (7.24:1 on vinyl).
+
+| # | Day | Field | Accent | Paper | Ink | paper / field | ink / paper | ink / accent | accent / vinyl | accent / field (not relied on) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | Sunday: petrol, coral | `#00677f` | `#ff7a66` | `#e8fbff` | `#00303c` | 6.06 | 13.22 | 5.53 | 7.99 | 2.53 |
+| 1 | Monday: signal red, sky | `#cc121c` | `#a9e2ff` | `#fff0ee` | `#4a0408` | 5.16 | 14.44 | 11.44 | 14.57 | 4.09 |
+| 2 | Tuesday: violet, lemon | `#6420d4` | `#ffe03a` | `#f3edff` | `#24085a` | 6.81 | 14.61 | 12.71 | 15.50 | 5.92 |
+| 3 | Wednesday: leaf green, pink | `#1b7a2b` | `#ffb3cf` | `#effbea` | `#06330f` | 5.09 | 13.21 | 8.47 | 12.23 | 3.26 |
+| 4 | Thursday: cobalt, tangerine (the agreed default) | `#2340e0` | `#ff6a1f` | `#eef0ff` | `#0b1560` | 6.44 | 14.37 | 5.68 | 7.12 | 2.55 |
+| 5 | Friday: magenta, lime | `#c4166e` | `#c6f53c` | `#fff0f7` | `#4a0428` | 5.17 | 14.23 | 12.34 | 16.04 | 4.48 |
+| 6 | Saturday: burnt orange, mint | `#bb410a` | `#9ff5d0` | `#fff3ea` | `#461600` | 4.97 | 14.01 | 11.96 | 15.96 | 4.25 |
+
+Rules a new or changed sleeve must meet (WCAG ratios, computed, not eyeballed): paper on field, ink on paper and ink on accent ≥ 4.5:1; accent on vinyl and paper on vinyl ≥ 3:1. Paper on vinyl is 17.8:1 or more on all seven. The focus ring is a 3 px paper outline with a 3 px ink gap, which shows on field, paper and vinyl on every sleeve; the guess field draws its ring inside itself in ink.
+
+### Type
+
+One family, **Bricolage Grotesque** variable, self-hosted (weight 200–800, width 75–100, optical size). Regular width for everything except the two display roles, which are condensed (width 75) and heavy (800): the day number in the header and the song title at the reveal. Tabular figures for clip times. No monospace, no all-caps, no letter-spaced labels.
+
+| Token | Size | Used for |
+|---|---|---|
+| `--text-small` | 14 px | help line, readout, rules line |
+| `--text-body` | 17 px | body, the guess field (never under 16 px, or iOS zooms on focus), tries |
+| `--text-large` | 21 px | wordmark on phones, play label, result line |
+| `--text-title` | 28 px | artist, wordmark in the side layout |
+| `--text-number` | `clamp(2.75rem, 1.75rem + 4.4vw, 5.5rem)` | "No. 12" |
+| `--text-display` | `clamp(3.25rem, 1rem + 12vw, 7rem)` | song title; titles over 22 characters are set at 66% |
+
+Weights 400 / 600 / 800 only. Display line-height 0.88, body 1.4.
+
+### Layout
+
+Left-aligned and asymmetric. Two layouts, switched by `@media (min-width: 40rem) and (min-aspect-ratio: 6/5)` (the same query is in `tokens.css` and `App.svelte`):
 
 ```
-┌──────────────────────────────────────────────┐
-│        ╭──────╮   Needledrop        No. 12   │
-│    ╭───┤      │                              │
-│  ╭─┤   │  ◯   │   Play 0.3 seconds  ▶        │
-│  │ │   │      │   ┌──────────────────────┐   │
-│  ╰─┤   │      │   │ Search for a song…   │   │
-│    ╰───┤      │   └──────────────────────┘   │
-│        ╰──────╯   Guess      Skip to 1 s     │
-│  record, cropped   1  skipped                │
-│  off left edge     2  ✕ Queen, Under Pressure│
-└──────────────────────────────────────────────┘
-mobile: record cropped at top, controls stacked below
+side (desktop, tablets and phones in landscape)        stacked (phones, portrait tablets)
+┌──────────────────────────────────────────────┐       ┌──────────────────────┐
+│      ╭────╮ ◎       Needledrop       No. 12  │       │ Needledrop    No. 12 │
+│   ╭──┤    │ ┃                                │       │╲ ╭──────────────╮  ╱ │
+│ ╭─┤  │ ◯  │ ┃       (▶) Play 0.3 seconds     │       │ ╲│      ◯       │ ╱  │
+│ │ │  │    │ ┛       [Search for a song][Guess]│      │  ╲╰────────────╯╱ ━◎ │
+│ ╰─┤  │    │         [Skip to 1 second]       │       │ (▶) Play 0.3 seconds │
+│   ╰──┤    │         0.1 s » Skipped          │       │ [Search…     ][Guess]│
+│      ╰────╯         0.3 s ● This try         │       │ [Skip to 1 second]   │
+│ record fixed, cropped left/top/bottom        │       │ 0.1 s » Skipped      │
+└──────────────────────────────────────────────┘       └──────────────────────┘
 ```
 
-- **States** — wrong / skipped / correct are distinguished by shape and text, not colour alone. Visible focus rings; `prefers-reduced-motion` swaps the spin for a static progress arc.
-- **Copy** — plain and literal: "Play 0.3 seconds", "Skip to 1 second", "Guess", "Listen on Deezer".
+- **Side:** the record is `position: fixed`, radius `min(56svh, 36vw)`, centre half a radius in from the left edge and at 54% of the height, so the label and the full ladder of bands are always visible; the game column (max 34rem) scrolls past it. Tonearm pivot above the record's right shoulder.
+- **Stacked:** header row, then a stage of height `1.33 × radius` where the record (radius `min(52vw, 19rem, 28svh)`) hangs with its centre a third of a radius below the header, then the game. The tonearm is turned a quarter (pivot at the lower right) and the clip lengths are printed down the lower left, so both sit in the visible half. Sized so play, guess field, Guess and Skip are in the first screenful at 320×568 and up.
+- The order is always play → guess → skip → tries → one line of rules. There is no intro paragraph, no heading above the tries, no step bar: the record and the tries list carry that.
+- Phones: `svh` units (with a `vh` fallback through `--screen`), `viewport-fit=cover` with `env(safe-area-inset-*)` in the header, gutters and bottom padding, `theme-color` set to the sleeve's field, targets ≥ 44 px (main controls 52–56 px), `touch-action: manipulation` and no tap highlight or text selection on controls. The result list opens under the field when there are 232 px of room there in the **visual** viewport, otherwise on whichever side has more, and its height is capped to that room, so with the on-screen keyboard up both the field and the list stay visible.
+- No layout shift: the header reserves the number's height while loading, the result list is absolutely positioned, the tries are always seven rows, the play button has a fixed height whatever its label, and the visible status line was removed (the live region is kept, visually hidden).
 
-The design task loads the `frontend-design` skill and follows this direction, with screenshot self-critique passes (headless Chromium from nixpkgs).
+### The record (`lib/record.ts`, `Record.svelte`)
+
+Canvas 2D on a square canvas 2.24 record-radii wide (room for the tonearm). The backing store uses the device pixel ratio capped at 2 and at 1800 px a side. Geometry, as fractions of the radius: bands from 0.955 in to 0.385 in seven equal steps with a 0.01 smooth gap between them, label 0.30, spindle hole 0.022 (it shows the field colour: the hole goes through to the sleeve).
+
+Drawn back to front each frame:
+
+1. **Disc layer (cached):** soft ink shadow on the sleeve, black disc, about 250 hairline grooves of seeded-random brightness inside the bands, a bright rim, one scribed ring in the run-out.
+2. **Lit bands:** each unlocked band is an accent ring (alpha = its lit amount, so unlocking fades in over 0.32 s, 0.09 s apart when several light) with 3–8 ink groove lines. While a clip plays those lines are polylines pushed in and out by the analyser's time-domain samples (`getFloatTimeDomainData`), tapered to zero at a seam on the cropped side.
+3. **Scale:** the clip length of each band ("0.1" … "30") printed along one radius (`--record-scale-angle`), ink on lit bands, grey on locked ones. It does not turn.
+4. **Sheen layer (cached):** two opposite conic-gradient wedges of white, carved into hairlines by `destination-out` strokes where the grooves are (the smooth gaps and the run-out keep the full highlight), plus two soft dark wedges a quarter turn away. The light is fixed; the layer rocks ±0.03 rad with the rotation, standing in for the warp of a real disc. Browsers without `createConicGradient` get a matt record.
+5. **Label:** a cached blank paper label with a pressed ring and the game's date stamped under the hole ("1 Oct 2026", like a test pressing), rotated with the record. Once the game is over, the album cover is drawn over it, clipped to the label (this taints the canvas; nothing reads pixels back).
+6. **Tonearm:** paper tube, counterweight, bearing, headshell, ink cartridge and an accent stylus point, with one blurred shadow. The arm swings about its pivot so the stylus sits on the groove at the needle's radius.
+
+What drives it (`Record.svelte`): `game.clipSeconds` and `game.ladder` → which bands are lit; `game.playing` → spin (33⅓ rpm, eased in over about 0.12 s); `game.progress().elapsed` through `ladderFraction` → the needle, so it crosses band *n* during the *n*-th stretch of the clip, on the audio clock; `game.player.analyser` → the ripple; `game.answer.cover` → the label. At rest the needle sits on the lead-in groove. A blank record coasts to a stop anywhere; a record with a cover slows evenly and always stops upright. `requestAnimationFrame` runs only while something moves (playing, coasting, a band lighting, the needle returning, the reveal) and is cancelled when the tab is hidden; an idle page requests no frames.
+
+### The reveal
+
+The one orchestrated moment, run only for the player who just made the last move (`game.moves > 0`); a reload shows the settled state at once.
+
+1. The remaining bands light, outermost first, 0.09 s apart, and the record spins up.
+2. **The cover prints onto the label over exactly one turn**: the label turns under a fixed print head, and the part that has passed it shows the cover (a growing sector). If the image is slow, the record keeps turning for up to 6 s.
+3. In the column the lines are uncovered left to right (`clip-path`, 140 ms steps): result line at once, then the title in display type, the artist, the cover and album ("the sleeve"), then the play button.
+4. The record coasts and stops with the cover upright (up to about 4 s).
+
+### Reduced motion
+
+`prefers-reduced-motion: reduce`: the record never turns, the needle stays on the lead-in, grooves do not ripple, bands and the cover appear at once, the CSS reveal has no duration or delay. While a clip plays, a paper progress ring round the label fills on the audio clock; that is the only thing that moves.
 
 ## Progress
 
@@ -182,14 +260,14 @@ The design task loads the `frontend-design` skill and follows this direction, wi
 - [x] **2. Server core** — 2026-10-01. `mp3.rs` (frame walker, `Mp3::prefix`) and `game.rs` (ladder, `GameState`, normalization, matching), both pure, 68 unit tests. Nothing calls them yet. `just check` and `just test` pass.
 - [x] **3. Server I/O** — 2026-10-01. `config.rs`, `deezer.rs`, `daily.rs`, `routes.rs` and `testutil.rs`, wired in `main.rs`; the API table above is what was built. Shipped with **one hard-coded track** (`track_id` in `config.toml`, `GTS_TRACK_ID`); the playlist-based daily pick is deferred to its own item below. 136 unit tests (handler tests run against a local Deezer stand-in); the curl walk-through against real Deezer passed (fresh game, seven clip sizes, wrong guess, win, loss, 409 after the end, no answer in any playing-state response). `just check` and `just test` pass.
 - [x] **4. Frontend plumbing** — 2026-10-01. API client, Web Audio clip player, runes game store, plain components (controls, timeline, autocomplete, tries, reveal), a flag-gated mock API and 11 unit tests for the pure helpers. Built in parallel with task 3, then run together: a full game (play, skip, wrong guess, reload, right guess, reveal) passes in headless Chromium through `https://gts.icyfire.dev` with no console errors, HMR websocket included. Not yet confirmed by ear.
-- [ ] **5. Design pass** — tokens, record canvas, combobox, reveal sequence, responsive + reduced motion.
+- [x] **5. Design pass** — 2026-10-01. Before it started, the owner tested the plain UI of task 4 in his browser and confirmed it "works perfectly", audio included. Then: seven weekday sleeves (contrast-checked, `?sleeve=0..6`), self-hosted Bricolage Grotesque, the record canvas (`lib/record.ts`, `Record.svelte`), side and stacked layouts with the phone as a first-class target, result list placed by the visual viewport, reveal sequence, reduced-motion mode, SVG favicon. Logic files untouched. Checked in headless Chromium against the real server at 320, 360, 390 and 430 px portrait, 844×390, 768×1024, 1024×768, 1440×900 and 1920×1080: a scripted game (play, skip, keyboard-only wrong guess, reload, right guess, reveal, full clip; a lost game; a reduced-motion game) passes with no console errors or warnings and no frames requested while idle. `just check` and `pnpm --dir web test` pass. Production bundle: JS 74.4 kB (28.3 kB gzip), CSS 13.4 kB (3.7 kB gzip), font 131.5 kB (latin; latin-ext 53.6 kB and vietnamese 22.0 kB load only when needed). **Not checked on a real phone or by ear** since the restyle.
 - [ ] **6. Verification + critique** — end-to-end checks, screenshots, fixes.
 - [ ] **Daily pick from playlists** — replace the hard-coded track: load the playlist pool from `config.toml`, drop unplayable tracks and past picks, pick one per UTC day, keep a history.
 
 ### Next up
 
-- The owner tests the plain UI at https://gts.icyfire.dev (audio by ear, phone, Safari / Firefox). Fix what he finds before the design pass.
-- Task 5 (design pass) restyles the working UI following Design direction.
+- The owner looks at the designed UI at https://gts.icyfire.dev on a real phone and a desktop: the record while a long clip plays (spin, needle, ripple), the reveal, the result list with the real on-screen keyboard, iOS Safari audio on the first tap, all seven sleeves (`?sleeve=0` … `?sleeve=6`).
+- Task 6 (verification + critique) picks up what he finds.
 - Daily pick from playlists, when it is taken up. What it needs to know:
   - `Daily::pick(day) -> u64` in `daily.rs` is the only thing that decides the track. Everything else (`song_for`, the disk cache keyed by track ID, the routes) already works per day and per track; `song_for` reloads when the picked ID changes.
   - `pick` is synchronous and infallible today. A real pick needs the pool (network) and a history file, so it will become async and fallible; `song_for` already holds a lock for the whole load and already has the fail / pause 10 s / retry path to hang that on.
@@ -263,14 +341,17 @@ pub fn normalize_artist(artist: &str) -> String;
 - Matching drops every `(…)` and `[…]` segment, so "(Remix)" and "(Instrumental)" variants count as the same song as the original, and titles differing only in a bracketed part ("Da Doo Ron Ron (When He Walked Me Home)") lose it. Checked offline against the 2,710 distinct tracks cached during playlist research: 37 key collisions, all the same song in another release, no false merges.
 - `jiff` is the date crate, with its `serde` feature on (`civil::Date` serializes as `"YYYY-MM-DD"`). `rand` is 0.10 and `reqwest` is 0.13, whose APIs and feature names differ from older examples (`rustls`, not `rustls-tls`; `query` is its own feature).
 - reqwest's rustls backend builds `aws-lc-sys` (C code), which makes the first server build take about a minute.
-- Audio has been verified only in headless Chromium (the truncated clip decodes; an offline render gives the exact clip lengths and fades). Firefox, Safari / iOS and anything audible are unverified until the owner checks by ear.
+- Audio: the owner confirmed by ear on 2026-10-01, in his own browser, that the plain UI of task 4 worked, clips included. The design pass did not touch `audio.ts`, but nobody has listened since the restyle, and which browsers he used is not recorded: Firefox, Safari / iOS remain unverified. In headless Chromium the truncated clip decodes and an offline render gives the exact clip lengths and fades.
 - iOS: the silent switch mutes Web Audio. No workaround is in place.
-- The 0.1 s clip makes the play button read "Stop" for a tenth of a second.
-- The autocomplete list opens below the field; on a phone it can run under the on-screen keyboard. The design pass should place it.
-- The timeline uses seven equal-width steps, not a linear 30 s scale (the first three steps would share 3% of the width).
-- Editing the text after picking a song searches for "Title — Artist" minus the edit, which may find nothing; clear the field (Escape twice) to start over.
-- `web/test/` covers only the pure helpers; the store and components have no automated tests in the repo (scratch DevTools-protocol smoke tests were run, not kept).
-- No favicon yet (`index.html` uses an empty `data:` icon); the design pass adds one.
+- The record's seven bands are equally wide, not a linear 30 s scale (the first three steps would share 3% of the width), so the needle crosses the early bands quickly and the last ones slowly.
+- Editing the text after picking a song searches for "Title, Artist" minus the edit, which may find nothing; clear the field (Escape twice) to start over.
+- `web/test/` covers only the pure helpers; the store, the components and the canvas have no automated tests in the repo (scratch DevTools-protocol scripts were run, not kept).
+- The designed UI has been seen only in headless Chromium 154. Unverified: Safari and Firefox rendering (conic gradients need Safari 16.1+; `svh` has a `vh` fallback), real on-screen keyboards (emulated with a short viewport only), canvas frame rate on a mid-range phone (the tonearm shadow and two full-canvas layer blits run every frame while a clip plays).
+- Accent on field is 2.53:1 (Sunday) and 2.55:1 (Thursday, the agreed default pair). Nothing depends on it — the play disc has a paper edge and an ink glyph, the current-try dot has a paper edge and words — but keep it that way when adding accent-coloured elements.
+- After the full clip stops in the finished state, the record takes up to about 4 s to coast to upright; frames run until it rests.
+- A very long word in a title breaks without a hyphen (`overflow-wrap: anywhere`).
+- In landscape on a phone with the keyboard up there is little room: the list is capped to the space left (two rows at worst) and scrolls.
+- The latin font file is 131.5 kB because it carries the optical-size axis as well as weight and width; `wdth.css` (78 kB, no optical size) is the smaller option if that matters more than the display cut of the title.
 
 ## Later
 

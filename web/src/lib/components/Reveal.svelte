@@ -1,16 +1,22 @@
 <script lang="ts">
-  // The end of the game: the result, the song, and the whole clip to play.
+  // The end of the game: the result, the song printed large, and the whole
+  // clip to play. After a move the lines print in one after another; on a
+  // reload they are simply there.
   import { onMount } from 'svelte'
-  import { clipLabel } from '../clip'
   import type { Game } from '../game.svelte'
-  import Timeline from './Timeline.svelte'
+  import Play from './Play.svelte'
 
   let { game }: { game: Game } = $props()
 
+  /** Titles longer than this are set a size down, so they do not fill the screen. */
+  const LONG_TITLE = 22
+
   let heading = $state<HTMLHeadingElement>()
+  // The sequence runs only for the player who just made the last move.
+  const fresh = $derived(game.moves > 0)
 
   const result = $derived.by(() => {
-    if (game.status !== 'won') return 'No tries left. The song was:'
+    if (game.status !== 'won') return 'No tries left. The song was'
     if (game.turn === 1) return 'You got it on the first try.'
     return `You got it on try ${game.turn} of ${game.ladder.length}.`
   })
@@ -18,91 +24,178 @@
   onMount(() => {
     // The guess field just disappeared and took the keyboard focus with it.
     // After a reload nothing was focused, so leave the page alone.
-    if (game.moves > 0) heading?.focus()
+    if (fresh) heading?.focus()
   })
 </script>
 
-<section class="reveal" aria-labelledby="reveal-heading">
+<section class="reveal" class:fresh aria-labelledby="reveal-heading">
   <h2 id="reveal-heading" tabindex="-1" bind:this={heading}>
-    <span class="mark" aria-hidden="true">{game.status === 'won' ? '✓' : '✕'}</span>
+    <span class="mark" class:won={game.status === 'won'} aria-hidden="true">
+      <svg viewBox="0 0 16 16" width="16" height="16">
+        {#if game.status === 'won'}
+          <path d="m3 8.5 3.5 3.5L13 4.5" />
+        {:else}
+          <path d="m3.5 3.5 9 9m0-9-9 9" />
+        {/if}
+      </svg>
+    </span>
     {result}
   </h2>
 
   {#if game.answer}
     {@const answer = game.answer}
     <div class="song">
+      <p class="title print" class:long={answer.title.length > LONG_TITLE}>{answer.title}</p>
+      <p class="artist print">{answer.artist}</p>
+    </div>
+    <div class="release print">
       {#if answer.cover}
-        <img src={answer.cover} alt="Cover of {answer.album}" width="160" height="160" />
+        <img src={answer.cover} alt="Cover of {answer.album}" width="112" height="112" />
       {/if}
-      <div class="details">
-        <p class="title">{answer.title}</p>
-        <p class="artist">{answer.artist}</p>
-        <p class="muted">{answer.album}</p>
-        <p><a href={answer.link} target="_blank" rel="noopener noreferrer">Listen on Deezer</a></p>
+      <div>
+        <p class="album">{answer.album}</p>
+        <a href={answer.link} target="_blank" rel="noopener noreferrer">Listen on Deezer</a>
       </div>
     </div>
   {/if}
 
-  <button class="primary" type="button" onclick={() => game.toggle()}>
-    {game.playing ? 'Stop' : `Play the full ${clipLabel(game.clipSeconds)}`}
-  </button>
-  {#if game.clipError}
-    <p class="error" role="alert">{game.clipError}</p>
-  {/if}
-  <Timeline {game} />
-
-  <p class="muted">A new song arrives every day at midnight UTC.</p>
+  <div class="print">
+    <Play {game} />
+  </div>
 </section>
 
 <style>
   .reveal {
     display: grid;
-    gap: var(--space-4);
+    gap: var(--space-5);
   }
 
   h2 {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
     font-size: var(--text-large);
-    line-height: 1.25;
+    font-weight: var(--weight-medium);
+    line-height: 1.2;
+  }
+
+  /* The heading takes the focus when the game ends; it is not a control, so no ring. */
+  h2:focus {
+    outline: none;
+    box-shadow: none;
+  }
+
+  .mark {
+    flex: none;
+    display: grid;
+    place-items: center;
+    width: 1.75rem;
+    height: 1.75rem;
+    border: var(--line) solid var(--paper);
+    border-radius: 50%;
+  }
+
+  .mark.won {
+    border-color: var(--accent);
+    background: var(--accent);
+    color: var(--ink);
+  }
+
+  svg {
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2.4;
+    stroke-linecap: round;
+    stroke-linejoin: round;
   }
 
   .song {
+    display: grid;
+    gap: var(--space-3);
+  }
+
+  /* The sleeve gets its title: the one line of display type on the page. */
+  .title {
+    font-size: var(--text-display);
+    font-weight: var(--weight-heavy);
+    font-stretch: calc(var(--width-condensed) * 1%);
+    line-height: var(--leading-display);
+    letter-spacing: -0.01em;
+    overflow-wrap: anywhere;
+    text-wrap: balance;
+  }
+
+  .title.long {
+    font-size: calc(var(--text-display) * 0.66);
+    line-height: 0.94;
+  }
+
+  .artist {
+    font-size: var(--text-title);
+    font-weight: var(--weight-medium);
+    line-height: 1.15;
+    overflow-wrap: anywhere;
+  }
+
+  .release {
     display: flex;
-    flex-wrap: wrap;
+    align-items: center;
     gap: var(--space-4);
+  }
+
+  .release > div {
+    display: grid;
+    gap: var(--space-1);
+    min-width: 0;
+    overflow-wrap: anywhere;
   }
 
   img {
     flex: none;
-    width: 10rem;
-    height: 10rem;
-    border: var(--border);
-    border-radius: var(--radius);
+    width: 7rem;
+    height: 7rem;
     object-fit: cover;
-  }
-
-  .details {
-    display: grid;
-    align-content: start;
-    gap: var(--space-1);
-    min-width: 10rem;
-    flex: 1;
-    overflow-wrap: anywhere;
-  }
-
-  .title {
-    font-size: var(--text-title);
-    font-weight: 700;
-    line-height: 1.2;
-  }
-
-  .artist {
-    font-size: var(--text-large);
+    background: var(--ink);
+    box-shadow: var(--lift);
   }
 
   a {
     display: inline-flex;
     align-items: center;
-    min-height: var(--control-height);
-    font-weight: 600;
+    min-height: var(--target);
+    font-weight: var(--weight-medium);
+  }
+
+  /* The one orchestrated moment: each line is uncovered from the left, like ink
+   * rolled onto the sleeve, starting as the cover prints on the label. */
+  .fresh .print {
+    animation: print 700ms var(--ease-out) both;
+  }
+
+  .fresh .title {
+    animation-delay: calc(var(--reveal-step) * 4);
+    animation-duration: 900ms;
+  }
+
+  .fresh .artist {
+    animation-delay: calc(var(--reveal-step) * 7);
+  }
+
+  .fresh .release {
+    animation-delay: calc(var(--reveal-step) * 9);
+  }
+
+  .fresh div.print:last-child {
+    animation-delay: calc(var(--reveal-step) * 11);
+  }
+
+  @keyframes print {
+    from {
+      clip-path: inset(-1em 100% -1em -1em);
+    }
+
+    to {
+      clip-path: inset(-1em);
+    }
   }
 </style>

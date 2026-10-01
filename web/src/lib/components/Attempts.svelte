@@ -1,37 +1,42 @@
 <script lang="ts">
-  // The seven tries, one row each. Every state has its own mark and words, so
-  // none of them is told apart by colour alone.
+  // The seven tries, one row each, in the order of the record's bands. Every
+  // state has its own mark and words, so none is told apart by colour alone.
   import { clipShort } from '../clip'
-  import type { Game, Slot } from '../game.svelte'
+  import type { Game } from '../game.svelte'
 
   let { game }: { game: Game } = $props()
-
-  const MARKS: Record<Slot['kind'], string> = {
-    skip: '»',
-    wrong: '✕',
-    correct: '✓',
-    current: '▶',
-    empty: '',
-  }
 </script>
 
 <section class="attempts" aria-labelledby="attempts-heading">
-  <h2 id="attempts-heading">Tries</h2>
+  <h2 class="sr-only" id="attempts-heading">Tries</h2>
   <ol>
     {#each game.slots as slot, i}
       <li class={slot.kind} aria-current={slot.kind === 'current' ? 'step' : undefined}>
-        <span class="number numeric">{i + 1}</span>
         <span class="clip numeric">{clipShort(game.ladder[i])}</span>
-        <span class="mark" aria-hidden="true">{MARKS[slot.kind]}</span>
+        <span class="mark" aria-hidden="true">
+          <svg viewBox="0 0 16 16" width="16" height="16">
+            {#if slot.kind === 'skip'}
+              <path d="M2.5 3.5 7 8l-4.5 4.5M8.5 3.5 13 8l-4.5 4.5" />
+            {:else if slot.kind === 'wrong'}
+              <path d="m3.5 3.5 9 9m0-9-9 9" />
+            {:else if slot.kind === 'correct'}
+              <path d="m3 8.5 3.5 3.5L13 4.5" />
+            {:else if slot.kind === 'current'}
+              <circle class="dot" cx="8" cy="8" r="5" />
+            {:else}
+              <circle cx="8" cy="8" r="4.5" />
+            {/if}
+          </svg>
+        </span>
         <span class="what">
           {#if slot.kind === 'skip'}
             Skipped
           {:else if slot.kind === 'wrong'}
             <span class="sr-only">Wrong:</span>
-            {slot.title} — {slot.artist}
+            <span class="title">{slot.title}</span> by {slot.artist}
           {:else if slot.kind === 'correct'}
             <span class="sr-only">Correct:</span>
-            {slot.title} — {slot.artist}
+            <span class="title">{slot.title}</span> by {slot.artist}
           {:else if slot.kind === 'current'}
             This try
           {:else}
@@ -44,41 +49,30 @@
 </section>
 
 <style>
-  .attempts {
-    display: grid;
-    gap: var(--space-2);
-  }
-
-  h2 {
-    font-size: var(--text-body);
-  }
-
-  ol {
-    display: grid;
-    gap: var(--space-1);
-  }
-
   li {
     display: grid;
-    grid-template-columns: 1.25rem 3rem 1.25rem 1fr;
-    align-items: center;
+    grid-template-columns: 3.25rem 1.5rem 1fr;
+    align-items: start;
     gap: var(--space-2);
-    min-height: 2.5rem;
-    padding: var(--space-1) var(--space-3);
-    border: var(--border);
-    border-radius: var(--radius);
-    background: var(--color-surface);
-  }
-
-  .number,
-  .clip {
-    color: var(--color-muted);
-    font-size: var(--text-small);
+    padding: var(--space-2) 0;
+    border-top: var(--line) solid transparent;
+    line-height: 1.5rem;
   }
 
   .mark {
-    text-align: center;
-    font-weight: 700;
+    display: grid;
+    place-items: center;
+    width: 1.5rem;
+    height: 1.5rem;
+    border-radius: 50%;
+  }
+
+  svg {
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2.2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
   }
 
   .what {
@@ -86,31 +80,28 @@
     overflow-wrap: anywhere;
   }
 
-  li.empty {
-    border-style: dashed;
-    background: none;
+  .title {
+    font-weight: var(--weight-medium);
   }
 
+  /* The try being played: a full dot, like the lit band, and heavier words. */
   li.current {
-    border-width: 2px;
-    border-color: var(--color-text);
-    font-weight: 600;
+    font-weight: var(--weight-medium);
   }
 
-  li.skip .what {
-    color: var(--color-muted);
+  .dot {
+    fill: var(--accent);
+    stroke: var(--paper);
+    stroke-width: 1.5;
   }
 
-  li.wrong .mark {
-    color: var(--color-bad);
+  /* The right answer: the mark turns into a filled disc. */
+  li.correct .mark {
+    background: var(--accent);
+    color: var(--ink);
   }
 
   li.correct {
-    border-width: 2px;
-    border-color: var(--color-good);
-  }
-
-  li.correct .mark {
-    color: var(--color-good);
+    font-weight: var(--weight-medium);
   }
 </style>

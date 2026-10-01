@@ -1,4 +1,4 @@
-/* Page-wide rules: reset, type, buttons, focus. Components only add layout. */
+/* Page-wide rules: reset, type, buttons, focus. Components add layout. */
 
 *,
 *::before,
@@ -8,15 +8,23 @@
 
 html {
   -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+  background: var(--field);
 }
 
 body {
   margin: 0;
-  background: var(--color-bg);
-  color: var(--color-text);
+  background: var(--field);
+  color: var(--paper);
   font-family: var(--font);
   font-size: var(--text-body);
-  line-height: 1.45;
+  font-weight: var(--weight-regular);
+  font-stretch: calc(var(--width-normal) * 1%);
+  font-optical-sizing: auto;
+  line-height: var(--leading-body);
+  /* The record is wider than a phone; only it may be cropped. */
+  overflow-x: clip;
+  -webkit-font-smoothing: antialiased;
 }
 
 h1,
@@ -27,19 +35,31 @@ ul {
   margin: 0;
 }
 
+h1,
+h2 {
+  font-size: inherit;
+  font-weight: inherit;
+}
+
 ol,
 ul {
   padding: 0;
   list-style: none;
 }
 
-img {
+img,
+svg {
   display: block;
+}
+
+img {
   max-width: 100%;
 }
 
 a {
-  color: var(--color-accent);
+  color: inherit;
+  text-decoration-thickness: var(--line);
+  text-underline-offset: 0.2em;
 }
 
 button,
@@ -49,45 +69,98 @@ input {
 }
 
 button {
-  min-height: var(--control-height);
-  padding: var(--space-2) var(--space-4);
-  border: var(--border);
-  border-radius: var(--radius);
-  background: var(--color-surface);
+  min-height: var(--target);
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
   cursor: pointer;
-  /* No double-tap zoom delay on phones. */
+  /* No double-tap zoom delay, no grey flash and no selected label on phones. */
   touch-action: manipulation;
-}
-
-button.primary {
-  border-color: var(--color-accent);
-  background: var(--color-accent);
-  color: var(--color-on-accent);
-  font-weight: 600;
+  -webkit-tap-highlight-color: transparent;
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 button:disabled {
-  /* Dashed as well as faded, so "disabled" is not carried by colour alone. */
-  border-style: dashed;
-  opacity: 0.55;
   cursor: not-allowed;
 }
 
+/* A rectangular button. `solid` is the one to press next; `outline` is the quiet one. */
+.button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: var(--control);
+  padding: 0 var(--space-5);
+  border: var(--line) solid var(--paper);
+  font-weight: var(--weight-medium);
+  white-space: nowrap;
+}
+
+.button.solid:not(:disabled) {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--ink);
+}
+
+.button:disabled {
+  /* Dashed as well as hollow, so "not yet" is not carried by colour alone. */
+  border-style: dashed;
+}
+
+@media (hover: hover) {
+  .button.outline:not(:disabled):hover {
+    background: var(--paper);
+    color: var(--ink);
+  }
+
+  .button.solid:not(:disabled):hover {
+    border-color: var(--paper);
+    background: var(--paper);
+  }
+}
+
+.button:not(:disabled):active {
+  transform: translateY(1px);
+}
+
+/* Paper on the field, with ink filling the gap: visible on the field, on paper and on vinyl, on every sleeve. */
 :focus-visible {
-  outline: 3px solid var(--color-focus);
-  outline-offset: 2px;
+  outline: 3px solid var(--paper);
+  outline-offset: 3px;
+  box-shadow: 0 0 0 3px var(--ink);
+}
+
+::selection {
+  background: var(--accent);
+  color: var(--ink);
 }
 
 .numeric {
   font-variant-numeric: tabular-nums;
 }
 
-.muted {
-  color: var(--color-muted);
+/* Problems are paper like everything else; the mark and the words say it is one. */
+.error {
+  display: flex;
+  gap: var(--space-2);
+  font-weight: var(--weight-medium);
 }
 
-.error {
-  color: var(--color-bad);
+.error::before {
+  content: '!';
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 1.4em;
+  height: 1.4em;
+  border-radius: 50%;
+  background: var(--paper);
+  color: var(--ink);
+  font-weight: var(--weight-heavy);
+  line-height: 1;
 }
 
 /* For text only screen readers should get. */
@@ -108,6 +181,7 @@ button:disabled {
   *::before,
   *::after {
     animation-duration: 0.01ms !important;
+    animation-delay: 0s !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
     scroll-behavior: auto !important;
