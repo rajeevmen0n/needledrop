@@ -42,7 +42,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(?config, "configuration loaded");
 
     let key = player::session_key(config.secret.as_deref(), &config.data_dir)?;
-    let deezer = Deezer::new().context("building the Deezer client")?;
+    let deezer = Deezer::new(config.public_url.as_deref()).context("building the Deezer client")?;
 
     // A database that cannot be used stops the server here, like a bad config,
     // rather than on the first request that needs it.

@@ -19,8 +19,8 @@ just dev             # server with auto-reload + Vite dev server; Ctrl-C stops b
 | Rust API | http://127.0.0.1:4810 (`GTS_BIND` overrides it) |
 | Vite dev server | http://127.0.0.1:4811 (proxies `/api` to the API) — open this one |
 
-Both bind `127.0.0.1` only. To reach the game under a public hostname, put a TLS-terminating reverse proxy in front (`/` → 4811, `/api/` → 4810); `AGENTS.md` has the details.
+Both bind `127.0.0.1` only. To reach the game under a public hostname, put a TLS-terminating reverse proxy in front (`/` → 4811, `/api/` → 4810) and set `public_url` to that address in `config.local.toml` (git-ignored; a copy of `config.toml` with the blank `public_url` filled in) or in `GTS_PUBLIC_URL`. It is the only place the hostname is written, both servers read it, and it is never committed. `AGENTS.md` has the details.
 
 Other recipes: `just server`, `just web`, `just test`, `just check`, `just build`, `just fmt`. Run `just` to list them.
 
-Settings live in `config.toml`. `AGENTS.md` has the architecture, conventions and current progress.
+Settings live in `config.toml`; one machine's own go in `config.local.toml` next to it, which wins and is git-ignored. `AGENTS.md` has the architecture, conventions and current progress.

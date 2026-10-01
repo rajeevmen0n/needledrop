@@ -21,12 +21,20 @@ use crate::game::TrackMeta;
 
 const API_BASE: &str = "https://api.deezer.com";
 
-/// Sent with every request, so Deezer can tell who is calling.
-const USER_AGENT: &str = concat!(
-    "guessthesong/",
-    env!("CARGO_PKG_VERSION"),
-    " (+https://gts.icyfire.dev)"
-);
+/// The start of the user agent sent with every request, so Deezer can tell
+/// who is calling. [`user_agent`] adds where the game lives, when that is
+/// configured.
+const USER_AGENT: &str = concat!("guessthesong/", env!("CARGO_PKG_VERSION"));
+
+/// The user agent of a server whose game is at `public_url`: the conventional
+/// `name/version (+contact URL)`, or the name and version alone for a server
+/// that has no public address.
+fn user_agent(public_url: Option<&str>) -> String {
+    match public_url {
+        Some(url) => format!("{USER_AGENT} (+{url})"),
+        None => USER_AGENT.to_owned(),
+    }
+}
 
 /// Whole-request limit. A player is waiting on the other end of every call.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -306,20 +314,22 @@ struct Inner {
 }
 
 impl Deezer {
-    /// A client for the real Deezer API.
-    pub fn new() -> Result<Self, DeezerError> {
-        Self::with_base(API_BASE)
+    /// A client for the real Deezer API. `public_url` is the address the
+    /// game is served under, if it has one (`public_url` in the config); it
+    /// goes into the user agent and nowhere else.
+    pub fn new(public_url: Option<&str>) -> Result<Self, DeezerError> {
+        Self::with_base(API_BASE, public_url)
     }
 
     /// A client for a Deezer stand-in at `base` (no trailing slash).
     #[cfg(test)]
     pub fn for_tests(base: &str) -> Self {
-        Self::with_base(base).expect("building the HTTP client")
+        Self::with_base(base, None).expect("building the HTTP client")
     }
 
-    fn with_base(base: &str) -> Result<Self, DeezerError> {
+    fn with_base(base: &str, public_url: Option<&str>) -> Result<Self, DeezerError> {
         let http = reqwest::Client::builder()
-            .user_agent(USER_AGENT)
+            .user_agent(user_agent(public_url))
             .timeout(REQUEST_TIMEOUT)
             .connect_timeout(CONNECT_TIMEOUT)
             .build()?;
@@ -453,6 +463,16 @@ mod tests {
     }
 
     // --- JSON -------------------------------------------------------------
+
+    #[test]
+    fn the_user_agent_names_the_public_address_when_there_is_one() {
+        let version = env!("CARGO_PKG_VERSION");
+        assert_eq!(user_agent(None), format!("guessthesong/{version}"));
+        assert_eq!(
+            user_agent(Some("https://needledrop.example")),
+            format!("guessthesong/{version} (+https://needledrop.example)")
+        );
+    }
 
     #[test]
     fn track_json_maps_to_a_track() {

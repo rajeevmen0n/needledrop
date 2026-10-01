@@ -1,5 +1,10 @@
 # Needledrop server settings. The file is read from the working directory;
 # `GTS_CONFIG` points the server at another path.
+#
+# Settings of one machine go in config.local.toml next to this file: it is
+# git-ignored, and any key set there wins over the same key here. To make
+# one, copy this file and change what differs; keys it leaves out keep the
+# value they have here.
 
 # `GTS_BIND` overrides this.
 bind = "127.0.0.1:4810"
@@ -10,6 +15,17 @@ data_dir = "data"
 # Day 1 of the game, as a UTC date; the day number counts from it, and the
 # admin's "Reset to day 1" goes back to it.
 launch_date = "2026-10-01"
+
+# The address players reach the game under, when a reverse proxy serves it
+# beyond loopback: scheme and host, plus the port if it is not the default,
+# and nothing after, for example "https://needledrop.example". The server
+# names it in the user agent it shows Deezer, and the Vite dev server answers
+# that host and opens its hot-reload websocket there (hot reload then only
+# connects for a page opened through this address).
+# It stays blank in this file, which is committed: a hostname belongs to one
+# machine. Fill it in in config.local.toml, or set `GTS_PUBLIC_URL`. Blank
+# means the server and the Vite dev server work for localhost only.
+public_url = ""
 
 # Where the song pool, the players' games, the daily picks and the day offset
 # are kept. "sqlite" (the default when this table is left out) is one file,

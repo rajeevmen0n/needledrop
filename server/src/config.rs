@@ -1,11 +1,18 @@
-//! Settings from `config.toml` and the environment: bind address, data dir, launch date, store backend.
+//! Settings from `config.toml` and the environment: bind address, data dir, launch date, public address, store backend.
 //!
-//! The file is the base and the environment wins: `GTS_BIND` and `GTS_SECRET`
-//! override or add to what the file says. Keys the server does not know are
+//! Three layers, the later winning over the earlier: `config.toml`, which is
+//! committed and holds what every machine shares; `config.local.toml` next to
+//! it, which is git-ignored and holds what belongs to one machine (the public
+//! hostname, above all); and the environment, where `GTS_BIND`,
+//! `GTS_PUBLIC_URL` and `GTS_SECRET` override or add to what the files say.
+//! Keys the server does not know are
 //! ignored, which is what lets a config file from before the song database
 //! (with its `track_id` and `playlists`) still start the server.
 
-use std::{fmt, path::PathBuf};
+use std::{
+    fmt, io,
+    path::{Path, PathBuf},
+};
 
 use anyhow::Context;
 use jiff::civil::Date;
@@ -17,6 +24,7 @@ const DEFAULT_PATH: &str = "config.toml";
 
 const ENV_CONFIG: &str = "GTS_CONFIG";
 const ENV_BIND: &str = "GTS_BIND";
+const ENV_PUBLIC_URL: &str = "GTS_PUBLIC_URL";
 const ENV_SECRET: &str = "GTS_SECRET";
 
 /// Which backend keeps the persistent data: `[store] kind` in the file.
@@ -50,6 +58,13 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// Day 1 of the game, a UTC date.
     pub launch_date: Date,
+    /// The address players reach the game under, when it has one beyond
+    /// loopback: scheme and host, with a port if it is not the default, and
+    /// no trailing slash (`https://needledrop.example`). This is the one
+    /// place a deployment's hostname is written down. The server puts it in
+    /// the user agent it shows Deezer; the Vite dev server reads the same
+    /// setting to know which host to answer and where hot reload connects.
+    pub public_url: Option<String>,
     /// The backend that keeps the song pool, the games, the picks and the
     /// day offset.
     pub store: StoreKind,
@@ -66,6 +81,7 @@ impl fmt::Debug for Config {
             .field("bind", &self.bind)
             .field("data_dir", &self.data_dir)
             .field("launch_date", &self.launch_date)
+            .field("public_url", &self.public_url)
             .field("store", &self.store)
             .field("secret", &self.secret.as_ref().map(|_| "<redacted>"))
             .finish()
@@ -77,10 +93,22 @@ impl fmt::Debug for Config {
 pub enum ConfigError {
     #[error("{0}")]
     Toml(#[from] toml::de::Error),
+    #[error("in the local settings file: {0}")]
+    LocalToml(#[source] toml::de::Error),
     #[error("`bind` is empty: expected an address such as 127.0.0.1:4810")]
     EmptyBind,
     #[error("`store.kind` is {0:?}: expected \"sqlite\" or \"memory\"")]
     UnknownStoreKind(String),
+    #[error(
+        "{setting} is {value:?}: expected the address the game is served under, \
+         such as https://needledrop.example ({reason})"
+    )]
+    PublicUrl {
+        /// `` `public_url` `` or the variable that overrode it.
+        setting: &'static str,
+        value: String,
+        reason: &'static str,
+    },
 }
 
 /// `config.toml` as written. Everything but the launch date can be left out.
@@ -91,6 +119,7 @@ struct FileConfig {
     #[serde(default = "default_data_dir")]
     data_dir: PathBuf,
     launch_date: Date,
+    public_url: Option<String>,
     #[serde(default)]
     store: FileStore,
 }
@@ -110,31 +139,79 @@ fn default_data_dir() -> PathBuf {
 }
 
 impl Config {
-    /// Reads the config file and applies the process environment on top.
+    /// Reads the config file, the local settings file next to it if there is
+    /// one, and applies the process environment on top.
     pub fn load() -> anyhow::Result<Self> {
         let path = env_var(ENV_CONFIG).unwrap_or_else(|| DEFAULT_PATH.to_owned());
         let text = std::fs::read_to_string(&path).with_context(|| {
             format!("reading the config file {path:?} (set {ENV_CONFIG} to use another path)")
         })?;
-        Self::from_sources(&text, env_var).with_context(|| format!("loading the config {path:?}"))
+        let local_path = local_path(Path::new(&path));
+        let local = match std::fs::read_to_string(&local_path) {
+            Ok(local) => Some(local),
+            // Most machines have none: the committed file is the whole config.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("reading the local settings file {}", local_path.display())
+                });
+            }
+        };
+        Self::from_layers(&text, local.as_deref(), env_var)
+            .with_context(|| format!("loading the config {path:?} with {}", local_path.display()))
     }
 
-    /// Builds the config from the file's text and an environment lookup.
-    ///
-    /// The lookup is passed in so the precedence rules can be tested without
-    /// touching the process environment. A variable that is unset or blank
-    /// leaves the file's value alone.
+    /// Builds the config from one file's text and an environment lookup:
+    /// [`from_layers`](Self::from_layers) without a local settings file.
+    #[cfg(test)]
     pub fn from_sources(
         toml_text: &str,
         env: impl Fn(&str) -> Option<String>,
     ) -> Result<Self, ConfigError> {
+        Self::from_layers(toml_text, None, env)
+    }
+
+    /// Builds the config from the committed file's text, the local settings
+    /// file's text if there is one, and an environment lookup.
+    ///
+    /// A key the local file sets replaces the same key of the committed file;
+    /// a table (`[store]`) is merged key by key. The lookup is passed in so
+    /// the precedence rules can be tested without touching the process
+    /// environment. A variable that is unset or blank leaves the files' value
+    /// alone.
+    pub fn from_layers(
+        toml_text: &str,
+        local_toml_text: Option<&str>,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self, ConfigError> {
         let env = |var: &str| env(var).filter(|value| !value.trim().is_empty());
-        let file: FileConfig = toml::from_str(toml_text)?;
+        let file: FileConfig = match local_toml_text {
+            // The common case keeps the parser's own errors, which point at
+            // the line.
+            None => toml::from_str(toml_text)?,
+            Some(local) => {
+                let mut merged: toml::Table = toml::from_str(toml_text)?;
+                let local: toml::Table = toml::from_str(local).map_err(ConfigError::LocalToml)?;
+                overlay(&mut merged, local);
+                merged.try_into()?
+            }
+        };
 
         let bind = env(ENV_BIND).unwrap_or(file.bind).trim().to_owned();
         if bind.is_empty() {
             return Err(ConfigError::EmptyBind);
         }
+
+        // Blank in the file means the same as leaving the key out: a server
+        // that is only reached on loopback.
+        let public_url = match env(ENV_PUBLIC_URL) {
+            Some(value) => Some(public_url(ENV_PUBLIC_URL, &value)?),
+            None => file
+                .public_url
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| public_url("`public_url`", &value))
+                .transpose()?,
+        };
 
         let store = match file.store.kind {
             Some(kind) => StoreKind::from_name(&kind).ok_or(ConfigError::UnknownStoreKind(kind))?,
@@ -145,10 +222,66 @@ impl Config {
             bind,
             data_dir: file.data_dir,
             launch_date: file.launch_date,
+            public_url,
             store,
             secret: env(ENV_SECRET),
         })
     }
+}
+
+/// Where the local settings that go with the config file at `path` are:
+/// `config.toml` → `config.local.toml`, in the same directory. The Vite dev
+/// server works the name out the same way (`web/dev-server.ts`).
+fn local_path(path: &Path) -> PathBuf {
+    path.with_extension("local.toml")
+}
+
+/// Lays `over` on top of `base`: a key of `over` replaces the same key of
+/// `base`, except that two tables are merged key by key, so a local file can
+/// change `[store] kind` without repeating the rest of the table.
+fn overlay(base: &mut toml::Table, over: toml::Table) {
+    for (key, value) in over {
+        match (base.get_mut(&key), value) {
+            (Some(toml::Value::Table(below)), toml::Value::Table(above)) => overlay(below, above),
+            (_, value) => {
+                base.insert(key, value);
+            }
+        }
+    }
+}
+
+/// Checks a public address and writes it the one way it is used: scheme,
+/// host and, when it is not the scheme's default, the port; nothing after.
+///
+/// Anything else is refused rather than trimmed. An address with a path would
+/// say the game lives under a prefix, which neither the server nor the client
+/// supports, and a typo here should stop the server, not be guessed at.
+fn public_url(setting: &'static str, value: &str) -> Result<String, ConfigError> {
+    let refuse = |reason| ConfigError::PublicUrl {
+        setting,
+        value: value.to_owned(),
+        reason,
+    };
+    let url = reqwest::Url::parse(value.trim())
+        .map_err(|_| refuse("it is not a URL; it needs https:// or http:// in front"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(refuse("the scheme has to be https or http"));
+    }
+    let Some(host) = url.host_str() else {
+        return Err(refuse("it has no host"));
+    };
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(refuse("it must not carry a user name or password"));
+    }
+    if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+        return Err(refuse(
+            "it must end after the host: no path, query or fragment",
+        ));
+    }
+    Ok(match url.port() {
+        Some(port) => format!("{}://{host}:{port}", url.scheme()),
+        None => format!("{}://{host}", url.scheme()),
+    })
 }
 
 /// A process environment variable, if set to valid Unicode.
@@ -212,10 +345,194 @@ mod tests {
                 bind: "127.0.0.1:4810".to_owned(),
                 data_dir: PathBuf::from("data"),
                 launch_date: date(2026, 10, 1),
+                public_url: None,
                 store: StoreKind::Sqlite,
                 secret: None,
             }
         );
+    }
+
+    #[test]
+    fn the_public_address_is_optional_and_written_one_way() {
+        // Left out or blank: a server reached on loopback only.
+        for file in [
+            MINIMAL.to_owned(),
+            format!("{MINIMAL}public_url = \"\"\n"),
+            format!("{MINIMAL}public_url = \"  \"\n"),
+        ] {
+            let config = Config::from_sources(&file, no_env).unwrap();
+            assert_eq!(config.public_url, None, "{file}");
+        }
+
+        for (written, kept) in [
+            ("https://needledrop.example", "https://needledrop.example"),
+            ("https://needledrop.example/", "https://needledrop.example"),
+            (
+                "  https://Needledrop.Example  ",
+                "https://needledrop.example",
+            ),
+            // The default port is not written; another one is kept.
+            (
+                "https://needledrop.example:443",
+                "https://needledrop.example",
+            ),
+            (
+                "https://needledrop.example:8443",
+                "https://needledrop.example:8443",
+            ),
+            ("http://192.168.1.20:4811", "http://192.168.1.20:4811"),
+        ] {
+            let file = format!("{MINIMAL}public_url = \"{written}\"\n");
+            let config = Config::from_sources(&file, no_env).unwrap();
+            assert_eq!(config.public_url.as_deref(), Some(kept), "{written}");
+        }
+    }
+
+    #[test]
+    fn the_local_file_wins_over_the_committed_one_key_by_key() {
+        let committed = r#"
+            bind = "127.0.0.1:4810"
+            data_dir = "data"
+            launch_date = "2026-10-01"
+            public_url = "https://committed.example"
+
+            [store]
+            kind = "sqlite"
+        "#;
+
+        // No local file, and an empty one, change nothing.
+        let alone = Config::from_layers(committed, None, no_env).unwrap();
+        assert_eq!(
+            Config::from_layers(committed, Some(""), no_env).unwrap(),
+            alone
+        );
+        assert_eq!(
+            alone.public_url.as_deref(),
+            Some("https://committed.example")
+        );
+
+        // What it sets replaces the committed value; the rest stays.
+        let local = "public_url = \"https://this-machine.example\"\nbind = \"127.0.0.1:9999\"\n";
+        let config = Config::from_layers(committed, Some(local), no_env).unwrap();
+        assert_eq!(
+            config.public_url.as_deref(),
+            Some("https://this-machine.example")
+        );
+        assert_eq!(config.bind, "127.0.0.1:9999");
+        assert_eq!(config.data_dir, PathBuf::from("data"));
+        assert_eq!(config.launch_date, date(2026, 10, 1));
+        assert_eq!(config.store, StoreKind::Sqlite);
+
+        // A table is merged, not replaced.
+        let local = "[store]\nkind = \"memory\"\n";
+        let config = Config::from_layers(committed, Some(local), no_env).unwrap();
+        assert_eq!(config.store, StoreKind::Memory);
+        assert_eq!(
+            config.public_url.as_deref(),
+            Some("https://committed.example")
+        );
+
+        // A blank address in the local file says "none" on this machine.
+        let config = Config::from_layers(committed, Some("public_url = \"\"\n"), no_env).unwrap();
+        assert_eq!(config.public_url, None);
+
+        // It can supply what the committed file leaves out.
+        let config = Config::from_layers(
+            "bind = \"127.0.0.1:4810\"\n",
+            Some("launch_date = \"2026-10-01\"\n"),
+            no_env,
+        )
+        .unwrap();
+        assert_eq!(config.launch_date, date(2026, 10, 1));
+
+        // And the environment wins over both files.
+        let env = env_of(&[("GTS_PUBLIC_URL", "https://from-the-environment.example")]);
+        let local = "public_url = \"https://this-machine.example\"\n";
+        let config = Config::from_layers(committed, Some(local), env).unwrap();
+        assert_eq!(
+            config.public_url.as_deref(),
+            Some("https://from-the-environment.example")
+        );
+    }
+
+    #[test]
+    fn a_mistake_in_the_local_file_is_an_error_that_says_which_file() {
+        // Not TOML at all.
+        let error = Config::from_layers(MINIMAL, Some("public_url = "), no_env).unwrap_err();
+        assert!(matches!(error, ConfigError::LocalToml(_)), "{error}");
+        assert!(error.to_string().contains("local settings file"), "{error}");
+
+        // TOML, but not a usable setting: the same errors as in the committed file.
+        let error =
+            Config::from_layers(MINIMAL, Some("public_url = \"nowhere\"\n"), no_env).unwrap_err();
+        assert!(matches!(error, ConfigError::PublicUrl { .. }), "{error}");
+        let error = Config::from_layers(MINIMAL, Some("bind = 4810\n"), no_env).unwrap_err();
+        assert!(matches!(error, ConfigError::Toml(_)), "{error}");
+        assert!(error.to_string().contains("bind"), "{error}");
+        let error = Config::from_layers(MINIMAL, Some("[store]\nkind = \"postgres\"\n"), no_env)
+            .unwrap_err();
+        assert!(matches!(error, ConfigError::UnknownStoreKind(_)), "{error}");
+    }
+
+    #[test]
+    fn the_local_file_sits_next_to_the_config_file() {
+        for (config, local) in [
+            ("config.toml", "config.local.toml"),
+            (
+                "/etc/needledrop/prod.toml",
+                "/etc/needledrop/prod.local.toml",
+            ),
+            ("/repo/settings.dev.toml", "/repo/settings.dev.local.toml"),
+            ("/repo/settings.conf", "/repo/settings.local.toml"),
+            ("/repo.d/settings", "/repo.d/settings.local.toml"),
+        ] {
+            assert_eq!(local_path(Path::new(config)), Path::new(local), "{config}");
+        }
+    }
+
+    #[test]
+    fn the_environment_names_the_public_address_over_the_file() {
+        let file = format!("{MINIMAL}public_url = \"https://from-the-file.example\"\n");
+        let env = env_of(&[("GTS_PUBLIC_URL", "https://from-the-environment.example/")]);
+        let config = Config::from_sources(&file, env).unwrap();
+        assert_eq!(
+            config.public_url.as_deref(),
+            Some("https://from-the-environment.example")
+        );
+
+        // The variable alone is enough, and a blank one leaves the file's.
+        let env = env_of(&[("GTS_PUBLIC_URL", "http://localhost:4811")]);
+        let config = Config::from_sources(MINIMAL, env).unwrap();
+        assert_eq!(config.public_url.as_deref(), Some("http://localhost:4811"));
+        let config = Config::from_sources(&file, env_of(&[("GTS_PUBLIC_URL", " ")])).unwrap();
+        assert_eq!(
+            config.public_url.as_deref(),
+            Some("https://from-the-file.example")
+        );
+    }
+
+    #[test]
+    fn a_public_address_that_is_not_one_names_the_setting_and_the_value() {
+        for value in [
+            "needledrop.example",
+            "ftp://needledrop.example",
+            "https://",
+            "https://needledrop.example/game",
+            "https://needledrop.example/?x=1",
+            "https://needledrop.example/#top",
+            "https://user:secret@needledrop.example",
+        ] {
+            let file = format!("{MINIMAL}public_url = \"{value}\"\n");
+            let error = Config::from_sources(&file, no_env).unwrap_err();
+            assert!(matches!(error, ConfigError::PublicUrl { .. }), "{error}");
+            let message = error.to_string();
+            assert!(message.contains("`public_url`"), "{message}");
+            assert!(message.contains(&format!("{value:?}")), "{message}");
+        }
+
+        let env = env_of(&[("GTS_PUBLIC_URL", "needledrop.example")]);
+        let error = Config::from_sources(MINIMAL, env).unwrap_err();
+        assert!(error.to_string().contains("GTS_PUBLIC_URL"), "{error}");
     }
 
     #[test]
@@ -245,6 +562,21 @@ mod tests {
         // The keys that went with the hard-coded track are gone from it.
         assert!(!text.contains("track_id"), "{text}");
         assert!(!text.contains("playlists"), "{text}");
+        // It is committed, so it names no host: the key is there, blank, to
+        // be filled in in a copy of the file, `config.local.toml`.
+        assert!(text.contains("public_url = \"\""), "{text}");
+        assert_eq!(config.public_url, None);
+
+        // A copy of it with the address filled in is such a local file.
+        let local = text.replace(
+            "public_url = \"\"",
+            "public_url = \"https://needledrop.example\"",
+        );
+        let config = Config::from_layers(&text, Some(&local), no_env).unwrap();
+        assert_eq!(
+            config.public_url.as_deref(),
+            Some("https://needledrop.example")
+        );
     }
 
     #[test]

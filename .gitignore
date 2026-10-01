@@ -7,3 +7,6 @@ result
 
 # Real Deezer previews for local tests: copyrighted audio, never committed.
 server/tests/fixtures/*.mp3
+
+# Settings of one machine (the public hostname, for one): config.local.toml, read on top of config.toml.
+*.local.toml
