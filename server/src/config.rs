@@ -1,8 +1,9 @@
-//! Settings from `config.toml` and the environment: bind address, data dir, launch date, track ID, store backend.
+//! Settings from `config.toml` and the environment: bind address, data dir, launch date, store backend.
 //!
-//! The file is the base and the environment wins: `GTS_BIND`, `GTS_TRACK_ID`
-//! and `GTS_SECRET` override or add to what the file says. Keys the server
-//! does not know (`playlists`, until the daily pick is built) are ignored.
+//! The file is the base and the environment wins: `GTS_BIND` and `GTS_SECRET`
+//! override or add to what the file says. Keys the server does not know are
+//! ignored, which is what lets a config file from before the song database
+//! (with its `track_id` and `playlists`) still start the server.
 
 use std::{fmt, path::PathBuf};
 
@@ -16,7 +17,6 @@ const DEFAULT_PATH: &str = "config.toml";
 
 const ENV_CONFIG: &str = "GTS_CONFIG";
 const ENV_BIND: &str = "GTS_BIND";
-const ENV_TRACK_ID: &str = "GTS_TRACK_ID";
 const ENV_SECRET: &str = "GTS_SECRET";
 
 /// Which backend keeps the persistent data: `[store] kind` in the file.
@@ -50,9 +50,8 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// Day 1 of the game, a UTC date.
     pub launch_date: Date,
-    /// Deezer ID of the song the server plays.
-    pub track_id: u64,
-    /// The backend that keeps the song pool.
+    /// The backend that keeps the song pool, the games, the picks and the
+    /// day offset.
     pub store: StoreKind,
     /// `GTS_SECRET` when set: the cookie key (see `player::session_key` for
     /// the format). Only ever taken from the environment, because
@@ -67,7 +66,6 @@ impl fmt::Debug for Config {
             .field("bind", &self.bind)
             .field("data_dir", &self.data_dir)
             .field("launch_date", &self.launch_date)
-            .field("track_id", &self.track_id)
             .field("store", &self.store)
             .field("secret", &self.secret.as_ref().map(|_| "<redacted>"))
             .finish()
@@ -79,16 +77,6 @@ impl fmt::Debug for Config {
 pub enum ConfigError {
     #[error("{0}")]
     Toml(#[from] toml::de::Error),
-    #[error("{var}={value:?} is not valid: {reason}")]
-    Env {
-        var: &'static str,
-        value: String,
-        reason: String,
-    },
-    #[error("`track_id` is not set: add it to the config file or set {ENV_TRACK_ID}")]
-    MissingTrackId,
-    #[error("`track_id` must be a Deezer track ID greater than zero")]
-    ZeroTrackId,
     #[error("`bind` is empty: expected an address such as 127.0.0.1:4810")]
     EmptyBind,
     #[error("`store.kind` is {0:?}: expected \"sqlite\" or \"memory\"")]
@@ -103,7 +91,6 @@ struct FileConfig {
     #[serde(default = "default_data_dir")]
     data_dir: PathBuf,
     launch_date: Date,
-    track_id: Option<u64>,
     #[serde(default)]
     store: FileStore,
 }
@@ -144,18 +131,6 @@ impl Config {
         let env = |var: &str| env(var).filter(|value| !value.trim().is_empty());
         let file: FileConfig = toml::from_str(toml_text)?;
 
-        let track_id = match env(ENV_TRACK_ID) {
-            Some(value) => value.trim().parse().map_err(|error| ConfigError::Env {
-                var: ENV_TRACK_ID,
-                reason: format!("expected a Deezer track ID ({error})"),
-                value,
-            })?,
-            None => file.track_id.ok_or(ConfigError::MissingTrackId)?,
-        };
-        if track_id == 0 {
-            return Err(ConfigError::ZeroTrackId);
-        }
-
         let bind = env(ENV_BIND).unwrap_or(file.bind).trim().to_owned();
         if bind.is_empty() {
             return Err(ConfigError::EmptyBind);
@@ -170,7 +145,6 @@ impl Config {
             bind,
             data_dir: file.data_dir,
             launch_date: file.launch_date,
-            track_id,
             store,
             secret: env(ENV_SECRET),
         })
@@ -187,8 +161,19 @@ mod tests {
     use super::*;
     use jiff::civil::date;
 
-    /// The shape of the real `config.toml`, `playlists` included.
+    /// The shape of the real `config.toml`.
     const FILE: &str = r#"
+        bind = "127.0.0.1:4810"
+        data_dir = "data"
+        launch_date = "2026-10-01"
+
+        [store]
+        kind = "sqlite"
+    "#;
+
+    /// A config file from before the song database: one hard-coded track and
+    /// the playlists the daily song was once going to come from.
+    const OLD_FILE: &str = r#"
         bind = "127.0.0.1:4810"
         data_dir = "data"
         launch_date = "2026-10-01"
@@ -203,7 +188,7 @@ mod tests {
     "#;
 
     /// The smallest file that loads.
-    const MINIMAL: &str = "launch_date = \"2026-10-01\"\ntrack_id = 7\n";
+    const MINIMAL: &str = "launch_date = \"2026-10-01\"\n";
 
     fn no_env(_: &str) -> Option<String> {
         None
@@ -219,7 +204,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_the_file_and_ignores_unknown_keys() {
+    fn reads_the_file() {
         let config = Config::from_sources(FILE, no_env).unwrap();
         assert_eq!(
             config,
@@ -227,11 +212,27 @@ mod tests {
                 bind: "127.0.0.1:4810".to_owned(),
                 data_dir: PathBuf::from("data"),
                 launch_date: date(2026, 10, 1),
-                track_id: 136_889_400,
                 store: StoreKind::Sqlite,
                 secret: None,
             }
         );
+    }
+
+    #[test]
+    fn an_old_config_file_with_a_track_and_playlists_still_loads() {
+        // The song now comes from the database; the keys that used to choose
+        // it are unknown keys like any other, and are ignored whatever they
+        // hold.
+        let expected = Config::from_sources(FILE, no_env).unwrap();
+        assert_eq!(Config::from_sources(OLD_FILE, no_env).unwrap(), expected);
+        for leftover in ["track_id = 0", "track_id = \"abc\"", "playlists = 7"] {
+            let file = format!("{MINIMAL}{leftover}\n");
+            let config = Config::from_sources(&file, no_env).unwrap();
+            assert_eq!(config.launch_date, date(2026, 10, 1), "{leftover}");
+        }
+        // The variable that used to override the track is not read either.
+        let env = env_of(&[("GTS_TRACK_ID", "starboy")]);
+        assert_eq!(Config::from_sources(OLD_FILE, env).unwrap(), expected);
     }
 
     #[test]
@@ -240,29 +241,25 @@ mod tests {
             .unwrap();
         let config = Config::from_sources(&text, no_env).unwrap();
         assert_eq!(config.bind, "127.0.0.1:4810");
-        assert!(config.track_id > 0);
         assert_eq!(config.store, StoreKind::Sqlite);
+        // The keys that went with the hard-coded track are gone from it.
+        assert!(!text.contains("track_id"), "{text}");
+        assert!(!text.contains("playlists"), "{text}");
     }
 
     #[test]
     fn bind_and_data_dir_have_defaults() {
-        let config =
-            Config::from_sources("launch_date = \"2026-10-01\"\ntrack_id = 7", no_env).unwrap();
+        let config = Config::from_sources(MINIMAL, no_env).unwrap();
         assert_eq!(config.bind, "127.0.0.1:4810");
         assert_eq!(config.data_dir, PathBuf::from("data"));
-        assert_eq!(config.track_id, 7);
+        assert_eq!(config.launch_date, date(2026, 10, 1));
     }
 
     #[test]
     fn environment_wins_over_the_file() {
-        let env = env_of(&[
-            ("GTS_BIND", "0.0.0.0:9999"),
-            ("GTS_TRACK_ID", " 3135556 "),
-            ("GTS_SECRET", "abc"),
-        ]);
+        let env = env_of(&[("GTS_BIND", "0.0.0.0:9999"), ("GTS_SECRET", "abc")]);
         let config = Config::from_sources(FILE, env).unwrap();
         assert_eq!(config.bind, "0.0.0.0:9999");
-        assert_eq!(config.track_id, 3_135_556);
         assert_eq!(config.secret.as_deref(), Some("abc"));
         // What the environment does not mention still comes from the file.
         assert_eq!(config.launch_date, date(2026, 10, 1));
@@ -271,57 +268,24 @@ mod tests {
 
     #[test]
     fn blank_variables_count_as_unset() {
-        let env = env_of(&[("GTS_BIND", ""), ("GTS_TRACK_ID", "  "), ("GTS_SECRET", "")]);
+        let env = env_of(&[("GTS_BIND", ""), ("GTS_SECRET", "  ")]);
         let config = Config::from_sources(FILE, env).unwrap();
         assert_eq!(config.bind, "127.0.0.1:4810");
-        assert_eq!(config.track_id, 136_889_400);
         assert_eq!(config.secret, None);
     }
 
     #[test]
-    fn track_id_may_come_from_the_environment_alone() {
-        let file = "launch_date = \"2026-10-01\"";
-        assert!(matches!(
-            Config::from_sources(file, no_env),
-            Err(ConfigError::MissingTrackId)
-        ));
-        let config = Config::from_sources(file, env_of(&[("GTS_TRACK_ID", "42")])).unwrap();
-        assert_eq!(config.track_id, 42);
-    }
-
-    #[test]
-    fn a_bad_track_id_variable_is_named_in_the_error() {
-        let error = Config::from_sources(FILE, env_of(&[("GTS_TRACK_ID", "starboy")])).unwrap_err();
-        let message = error.to_string();
-        assert!(message.contains("GTS_TRACK_ID"), "{message}");
-        assert!(message.contains("starboy"), "{message}");
-    }
-
-    #[test]
-    fn a_zero_track_id_is_rejected() {
-        assert!(matches!(
-            Config::from_sources(FILE, env_of(&[("GTS_TRACK_ID", "0")])),
-            Err(ConfigError::ZeroTrackId)
-        ));
-        assert!(matches!(
-            Config::from_sources("launch_date = \"2026-10-01\"\ntrack_id = 0", no_env),
-            Err(ConfigError::ZeroTrackId)
-        ));
-    }
-
-    #[test]
     fn a_missing_or_malformed_launch_date_names_the_key() {
-        let missing = Config::from_sources("track_id = 1", no_env).unwrap_err();
+        let missing = Config::from_sources("bind = \"127.0.0.1:1\"", no_env).unwrap_err();
         assert!(missing.to_string().contains("launch_date"), "{missing}");
 
-        let malformed =
-            Config::from_sources("launch_date = \"1 Oct 2026\"\ntrack_id = 1", no_env).unwrap_err();
+        let malformed = Config::from_sources("launch_date = \"1 Oct 2026\"", no_env).unwrap_err();
         assert!(malformed.to_string().contains("launch_date"), "{malformed}");
     }
 
     #[test]
     fn a_wrongly_typed_value_is_an_error() {
-        let file = "launch_date = \"2026-10-01\"\ntrack_id = \"abc\"";
+        let file = "launch_date = \"2026-10-01\"\nbind = 4810";
         assert!(matches!(
             Config::from_sources(file, no_env),
             Err(ConfigError::Toml(_))
@@ -330,6 +294,19 @@ mod tests {
             Config::from_sources("launch_date = ", no_env),
             Err(ConfigError::Toml(_))
         ));
+    }
+
+    #[test]
+    fn an_empty_bind_is_an_error() {
+        for file in [
+            format!("{MINIMAL}bind = \"\"\n"),
+            format!("{MINIMAL}bind = \"   \"\n"),
+        ] {
+            assert!(matches!(
+                Config::from_sources(&file, no_env),
+                Err(ConfigError::EmptyBind)
+            ));
+        }
     }
 
     #[test]

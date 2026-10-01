@@ -12,7 +12,7 @@ use std::{
 use async_trait::async_trait;
 use jiff::civil::Date;
 
-use super::{Genres, NewSong, PlayerId, PoolSong, Section, Store, StoreError};
+use super::{Genres, NewSong, Pick, PlayerId, PoolSong, Section, Store, StoreError};
 use crate::game::GameState;
 
 /// What identifies a stored game. Ordered by player, then section, then day,
@@ -27,6 +27,12 @@ pub struct MemoryStore {
     songs: Mutex<BTreeMap<u64, PoolSong>>,
     /// Every game any player has made a move in.
     games: Mutex<BTreeMap<GameKey, GameState>>,
+    /// The track picked for each day and section. Ordered by day, then
+    /// section, which gives [`Store::picks_on`] and [`Store::pick_history`]
+    /// their orders.
+    picks: Mutex<BTreeMap<(Date, Section), u64>>,
+    /// Days the server's day is ahead of the real date.
+    day_offset: Mutex<i64>,
 }
 
 impl MemoryStore {
@@ -44,6 +50,27 @@ impl MemoryStore {
     /// Locks the games, on the same terms as [`pool`](Self::pool).
     fn played(&self) -> MutexGuard<'_, BTreeMap<GameKey, GameState>> {
         self.games.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Locks the picks, on the same terms as [`pool`](Self::pool).
+    fn picked(&self) -> MutexGuard<'_, BTreeMap<(Date, Section), u64>> {
+        self.picks.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Locks the day offset, on the same terms as [`pool`](Self::pool).
+    fn offset(&self) -> MutexGuard<'_, i64> {
+        self.day_offset
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// A stored pick as the trait hands it out.
+fn pick_of((&(day, section), &track_id): (&(Date, Section), &u64)) -> Pick {
+    Pick {
+        day,
+        section,
+        track_id,
     }
 }
 
@@ -131,6 +158,59 @@ impl Store for MemoryStore {
         let before = games.len();
         games.retain(|(of, _, _), _| of != player);
         Ok(before - games.len())
+    }
+
+    async fn delete_games(&self, section: Section, day: Date) -> Result<usize, StoreError> {
+        let mut games = self.played();
+        let before = games.len();
+        games.retain(|(_, in_section, on), _| !(*in_section == section && *on == day));
+        Ok(before - games.len())
+    }
+
+    async fn picks_on(&self, day: Date) -> Result<Vec<Pick>, StoreError> {
+        Ok(self
+            .picked()
+            .iter()
+            .filter(|((on, _), _)| *on == day)
+            .map(pick_of)
+            .collect())
+    }
+
+    async fn pick_history(&self, section: Section) -> Result<Vec<Pick>, StoreError> {
+        Ok(self
+            .picked()
+            .iter()
+            .filter(|((_, of), _)| *of == section)
+            .map(pick_of)
+            .collect())
+    }
+
+    async fn save_pick(&self, pick: Pick) -> Result<Pick, StoreError> {
+        let mut picks = self.picked();
+        let track_id = *picks
+            .entry((pick.day, pick.section))
+            .or_insert(pick.track_id);
+        Ok(Pick { track_id, ..pick })
+    }
+
+    async fn remove_pick(&self, day: Date, section: Section) -> Result<bool, StoreError> {
+        Ok(self.picked().remove(&(day, section)).is_some())
+    }
+
+    async fn day_offset(&self) -> Result<i64, StoreError> {
+        Ok(*self.offset())
+    }
+
+    async fn set_day_offset(&self, days: i64) -> Result<(), StoreError> {
+        *self.offset() = days;
+        Ok(())
+    }
+
+    async fn wipe_games_and_picks(&self) -> Result<(), StoreError> {
+        // Games first: see the trait.
+        self.played().clear();
+        self.picked().clear();
+        Ok(())
     }
 }
 

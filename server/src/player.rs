@@ -271,10 +271,9 @@ fn decode_hex(text: &str) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::{
-        daily::today_utc,
         game::{GameState, MAX_ATTEMPTS},
         store::{Genre, Section},
-        testutil::{BrokenStore, Harness, MockTrack, lost_game, won_game},
+        testutil::{BrokenStore, Harness, MockTrack, TODAY, lost_game, won_game},
     };
     use axum::{
         body::Body,
@@ -302,7 +301,7 @@ mod tests {
     async fn a_first_visit_is_given_a_player_cookie() {
         let harness = start().await;
         let mut player = harness.player();
-        let reply = player.get("/api/daily").await;
+        let reply = player.get("/api/daily/general").await;
         assert_eq!(reply.status, StatusCode::OK);
 
         let cookies: Vec<_> = reply.headers.get_all(header::SET_COOKIE).iter().collect();
@@ -326,7 +325,7 @@ mod tests {
     async fn the_cookie_is_secure_behind_https() {
         let harness = start().await;
         let mut player = harness.player();
-        for uri in ["/api/daily", "/api/player"] {
+        for uri in ["/api/daily/general", "/api/player"] {
             let request = Request::builder()
                 .method(if uri == "/api/player" {
                     "DELETE"
@@ -350,7 +349,7 @@ mod tests {
     async fn the_cookie_holds_the_player_id_and_nothing_else() {
         let harness = start().await;
         let mut player = harness.player();
-        player.get("/api/daily").await;
+        player.get("/api/daily/general").await;
         let id = harness.player_id(&player).unwrap();
 
         // Whatever happens in the game, what is inside stays those 32
@@ -370,11 +369,11 @@ mod tests {
     async fn every_visit_and_every_move_refreshes_the_cookie_for_the_same_player() {
         let harness = start().await;
         let mut player = harness.player();
-        player.get("/api/daily").await;
+        player.get("/api/daily/general").await;
         let id = harness.player_id(&player).unwrap();
         let first = player.cookie.clone();
 
-        for reply in [player.get("/api/daily").await, player.skip().await] {
+        for reply in [player.get("/api/daily/general").await, player.skip().await] {
             let cookie = reply.header(header::SET_COOKIE);
             assert!(cookie.contains("Max-Age=34560000"), "{cookie}");
             assert_eq!(harness.player_id(&player), Some(id.clone()));
@@ -387,7 +386,11 @@ mod tests {
     async fn listening_and_searching_set_no_cookie() {
         let harness = start().await;
         let mut player = harness.player();
-        for uri in ["/api/daily/audio", "/api/search?q=zanzibar", "/api/health"] {
+        for uri in [
+            "/api/daily/general/audio",
+            "/api/search?q=zanzibar",
+            "/api/health",
+        ] {
             let reply = player.get(uri).await;
             assert_eq!(reply.status, StatusCode::OK, "{uri}");
             assert!(reply.headers.get(header::SET_COOKIE).is_none(), "{uri}");
@@ -417,7 +420,7 @@ mod tests {
             harness.cookie_holding("gts_player", ""),
         ] {
             player.cookie = Some(garbage.clone());
-            let reply = player.get("/api/daily").await;
+            let reply = player.get("/api/daily/general").await;
             assert_eq!(reply.status, StatusCode::OK, "{garbage}");
             let body = reply.json();
             assert_eq!(body["attempts"], json!([]), "{garbage}");
@@ -430,7 +433,7 @@ mod tests {
 
         // The untouched cookie still finds the game with the skip.
         player.cookie = Some(real);
-        let body = player.get("/api/daily").await.json();
+        let body = player.get("/api/daily/general").await.json();
         assert_eq!(body["attempts"], json!([{ "kind": "skip" }]));
     }
 
@@ -444,13 +447,13 @@ mod tests {
         // Even if the other server had a game under that very ID.
         second
             .store
-            .save_game(&id, Section::General, &lost_game(today_utc()))
+            .save_game(&id, Section::General, &lost_game(TODAY))
             .await
             .unwrap();
 
         // The same cookie, sent to a server with a different key.
         player.app = second.app.clone();
-        let body = player.get("/api/daily").await.json();
+        let body = player.get("/api/daily/general").await.json();
         assert_eq!(body["attempts"], json!([]));
         assert_eq!(body["status"], "playing");
         assert!(second.player_id(&player).is_some_and(|new| new != id));
@@ -462,10 +465,10 @@ mod tests {
         let mut player = harness.player();
         // What the first version of the game kept in the browser: a whole
         // game, here one that is already won.
-        let old = serde_json::to_string(&won_game(today_utc(), 0)).unwrap();
+        let old = serde_json::to_string(&won_game(TODAY, 0)).unwrap();
         player.cookie = Some(harness.cookie_holding("gts_daily", &old));
 
-        let reply = player.get("/api/daily").await;
+        let reply = player.get("/api/daily/general").await;
         let body = reply.json();
         assert_eq!(body["status"], "playing");
         assert_eq!(body["attempts"], json!([]));
@@ -482,13 +485,13 @@ mod tests {
     #[tokio::test]
     async fn clearing_deletes_the_players_games_and_issues_a_new_id() {
         let harness = start().await;
-        let today = today_utc();
+        let today = TODAY;
         let mut player = harness.player();
         player.skip().await;
         player.skip().await;
         let old_id = harness.player_id(&player).unwrap();
         let old_cookie = player.cookie.clone();
-        // Earlier days, and a section there is no route for yet.
+        // An earlier day, and another section.
         let store = &harness.store;
         for (section, game) in [
             (Section::General, won_game(today.yesterday().unwrap(), 2)),
@@ -496,7 +499,7 @@ mod tests {
         ] {
             store.save_game(&old_id, section, &game).await.unwrap();
         }
-        let before = player.get("/api/daily").await.json();
+        let before = player.get("/api/daily/general").await.json();
         assert_eq!(before["attempts"].as_array().unwrap().len(), 2);
         assert_eq!(before["stats"]["played"], 1);
 
@@ -517,7 +520,7 @@ mod tests {
         // The browser is somebody new, with a fresh game and an empty record.
         let new_id = harness.player_id(&player).unwrap();
         assert_ne!(new_id, old_id);
-        let after = player.get("/api/daily").await.json();
+        let after = player.get("/api/daily/general").await.json();
         assert_eq!(after["attempts"], json!([]));
         assert_eq!(after["status"], "playing");
         assert_eq!(after["clipSeconds"], 0.1);
@@ -529,7 +532,7 @@ mod tests {
         // games, who starts the day again.
         let mut stale = harness.player();
         stale.cookie = old_cookie;
-        let body = stale.get("/api/daily").await.json();
+        let body = stale.get("/api/daily/general").await.json();
         assert_eq!(body["attempts"], json!([]));
         assert_eq!(body["stats"]["played"], 0);
         assert_eq!(harness.player_id(&stale), Some(old_id));
@@ -542,18 +545,18 @@ mod tests {
         for _ in 0..MAX_ATTEMPTS {
             player.skip().await;
         }
-        let before = player.get("/api/daily").await.json();
+        let before = player.get("/api/daily/general").await.json();
         assert_eq!(before["answer"]["title"], "Zanzibar Nights");
 
         player.clear().await;
         // While playing again, nothing about the song comes back.
-        let fresh = player.get("/api/daily").await;
+        let fresh = player.get("/api/daily/general").await;
         assert_eq!(fresh.json()["answer"], json!(null));
         fresh.assert_lacks(&SECRETS);
         for _ in 0..MAX_ATTEMPTS {
             player.skip().await;
         }
-        let after = player.get("/api/daily").await.json();
+        let after = player.get("/api/daily/general").await.json();
         assert_eq!(after["answer"], before["answer"]);
         assert_eq!(after["day"], before["day"]);
         assert_eq!(after["number"], before["number"]);
@@ -571,7 +574,7 @@ mod tests {
 
         assert_eq!(leaving.clear().await.status, StatusCode::NO_CONTENT);
 
-        let body = staying.get("/api/daily").await.json();
+        let body = staying.get("/api/daily/general").await.json();
         assert_eq!(body["attempts"].as_array().unwrap().len(), 2);
         assert_eq!(harness.player_id(&staying), Some(staying_id));
     }
@@ -594,7 +597,7 @@ mod tests {
         assert_eq!(player.clear().await.status, StatusCode::NO_CONTENT);
         assert_ne!(harness.player_id(&player), Some(first));
 
-        let body = other.get("/api/daily").await.json();
+        let body = other.get("/api/daily/general").await.json();
         assert_eq!(body["attempts"], json!([{ "kind": "skip" }]));
     }
 
@@ -627,7 +630,7 @@ mod tests {
         let reply = player.get("/api/player").await;
         assert_eq!(reply.status, StatusCode::METHOD_NOT_ALLOWED);
         assert!(reply.body.is_empty());
-        let body = player.get("/api/daily").await.json();
+        let body = player.get("/api/daily/general").await.json();
         assert_eq!(body["attempts"], json!([{ "kind": "skip" }]));
     }
 
@@ -696,7 +699,7 @@ mod tests {
         // What the old cookie held, put into the new cookie's name: still
         // nobody, because it is not an ID.
         let key = Key::generate();
-        let state = serde_json::to_string(&GameState::new(today_utc())).unwrap();
+        let state = serde_json::to_string(&GameState::new(TODAY)).unwrap();
         let jar = PrivateCookieJar::new(key).add(Cookie::new(COOKIE_NAME, state));
         assert_eq!(known_player(&jar), None);
     }

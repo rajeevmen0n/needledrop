@@ -23,15 +23,18 @@ use async_trait::async_trait;
 use jiff::civil::Date;
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
-use super::{Genre, Genres, NewSong, PlayerId, PoolSong, Section, Store, StoreError, decode_game};
+use super::{
+    Genre, Genres, NewSong, Pick, PlayerId, PoolSong, Section, Store, StoreError, decode_game,
+};
 use crate::game::GameState;
 
 /// The script that brings the schema to each version, in order. Version 0 is
 /// a database without a schema version: a new file, or the one that was built
 /// by hand before the server made its own (see the first script).
-const MIGRATIONS: [(i64, &str); 2] = [
+const MIGRATIONS: [(i64, &str); 3] = [
     (1, include_str!("sqlite/001_songs.sql")),
     (2, include_str!("sqlite/002_games.sql")),
+    (3, include_str!("sqlite/003_picks_and_clock.sql")),
 ];
 
 /// The version this server reads and writes.
@@ -154,6 +157,8 @@ fn check_schema(connection: &Connection) -> Result<(), Failure> {
         format!("SELECT {SONG_COLUMNS} FROM songs"),
         "SELECT track_id, genre FROM song_genres".to_owned(),
         "SELECT player, section, day, state FROM games".to_owned(),
+        "SELECT day, section, track_id FROM picks".to_owned(),
+        "SELECT id, day_offset FROM clock".to_owned(),
     ] {
         connection.prepare(&sql).map_err(|error| {
             Failure::Data(format!(
@@ -256,6 +261,38 @@ fn load_song(connection: &Connection, id: i64) -> Result<Option<PoolSong>, Failu
 /// logged, not an error.
 fn text_or_empty<'row>(row: &'row Row<'_>, column: usize) -> Result<&'row str, Failure> {
     Ok(row.get_ref(column)?.as_str().unwrap_or_default())
+}
+
+/// A row of `day, section, track_id` as a pick. Unlike a game, a pick that
+/// cannot be read is an error: leaving it out would have the server draw a
+/// second song for a day that already has one.
+fn pick_from_row(row: &Row<'_>) -> Result<Pick, Failure> {
+    let day: String = row.get(0)?;
+    let slug: String = row.get(1)?;
+    let id: i64 = row.get(2)?;
+    Ok(Pick {
+        day: day.parse().map_err(|_| {
+            Failure::Data(format!("a pick has the day {day:?}, which is not a date"))
+        })?,
+        section: Section::from_slug(&slug).ok_or_else(|| {
+            Failure::Data(format!("a pick is for {slug:?}, which is not a section"))
+        })?,
+        track_id: u64::try_from(id)
+            .map_err(|_| Failure::Data(format!("the pick {id} is not a Deezer track ID")))?,
+    })
+}
+
+/// The picks a query returns, in the order of the trait: by day, then by
+/// section. Sorted here, as the pool is, so the order is not the query's.
+fn load_picks(connection: &Connection, sql: &str, parameter: &str) -> Result<Vec<Pick>, Failure> {
+    let mut statement = connection.prepare(sql)?;
+    let mut rows = statement.query([parameter])?;
+    let mut picks = Vec::new();
+    while let Some(row) = rows.next()? {
+        picks.push(pick_from_row(row)?);
+    }
+    picks.sort_unstable();
+    Ok(picks)
 }
 
 /// Makes `genres` the tags of song `id`, dropping the ones it had.
@@ -446,6 +483,117 @@ impl Store for SqliteStore {
         let player = player.clone();
         self.run("deleting a player's games", move |connection| {
             Ok(connection.execute("DELETE FROM games WHERE player = ?1", [player.as_str()])?)
+        })
+        .await
+    }
+
+    async fn delete_games(&self, section: Section, day: Date) -> Result<usize, StoreError> {
+        let day = day.to_string();
+        self.run("deleting a day's games in a section", move |connection| {
+            Ok(connection.execute(
+                "DELETE FROM games WHERE section = ?1 AND day = ?2",
+                params![section.slug(), day],
+            )?)
+        })
+        .await
+    }
+
+    async fn picks_on(&self, day: Date) -> Result<Vec<Pick>, StoreError> {
+        let day = day.to_string();
+        self.run("reading a day's picks", move |connection| {
+            load_picks(
+                connection,
+                "SELECT day, section, track_id FROM picks WHERE day = ?1",
+                &day,
+            )
+        })
+        .await
+    }
+
+    async fn pick_history(&self, section: Section) -> Result<Vec<Pick>, StoreError> {
+        self.run("reading a section's pick history", move |connection| {
+            load_picks(
+                connection,
+                "SELECT day, section, track_id FROM picks WHERE section = ?1",
+                section.slug(),
+            )
+        })
+        .await
+    }
+
+    async fn save_pick(&self, pick: Pick) -> Result<Pick, StoreError> {
+        self.run("saving a pick", move |connection| {
+            let id = key(pick.track_id).ok_or_else(|| {
+                Failure::Data(format!(
+                    "the track ID {} is too large to store",
+                    pick.track_id
+                ))
+            })?;
+            let day = pick.day.to_string();
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            // A day and section that already have a pick keep it.
+            transaction.execute(
+                "INSERT INTO picks (day, section, track_id) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT (day, section) DO NOTHING",
+                params![day, pick.section.slug(), id],
+            )?;
+            let stands = transaction.query_row(
+                "SELECT day, section, track_id FROM picks WHERE day = ?1 AND section = ?2",
+                params![day, pick.section.slug()],
+                |row| Ok(pick_from_row(row)),
+            )??;
+            transaction.commit()?;
+            Ok(stands)
+        })
+        .await
+    }
+
+    async fn remove_pick(&self, day: Date, section: Section) -> Result<bool, StoreError> {
+        let day = day.to_string();
+        self.run("removing a pick", move |connection| {
+            let removed = connection.execute(
+                "DELETE FROM picks WHERE day = ?1 AND section = ?2",
+                params![day, section.slug()],
+            )?;
+            Ok(removed > 0)
+        })
+        .await
+    }
+
+    async fn day_offset(&self) -> Result<i64, StoreError> {
+        self.run("reading the day offset", |connection| {
+            let offset = connection
+                .query_row("SELECT day_offset FROM clock WHERE id = 1", [], |row| {
+                    row.get(0)
+                })
+                .optional()?;
+            Ok(offset.unwrap_or(0))
+        })
+        .await
+    }
+
+    async fn set_day_offset(&self, days: i64) -> Result<(), StoreError> {
+        self.run("setting the day offset", move |connection| {
+            connection.execute(
+                "INSERT INTO clock (id, day_offset) VALUES (1, ?1) \
+                 ON CONFLICT (id) DO UPDATE SET day_offset = excluded.day_offset",
+                [days],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn wipe_games_and_picks(&self) -> Result<(), StoreError> {
+        self.run("wiping the games and the picks", |connection| {
+            // SQLite can do both at once, which is more than the trait asks.
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute("DELETE FROM games", [])?;
+            transaction.execute("DELETE FROM picks", [])?;
+            transaction.commit()?;
+            Ok(())
         })
         .await
     }
@@ -817,6 +965,275 @@ mod tests {
         );
         // Clearing the player's data removes the unreadable rows too.
         assert_eq!(store.delete_player(&player).await.unwrap(), 6);
+    }
+
+    #[tokio::test]
+    async fn a_database_from_before_the_picks_gains_their_tables_and_keeps_its_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("needledrop.db");
+        // A database as the previous version of the server left it: schema
+        // version 2, with songs and a game, and neither picks nor a clock.
+        execute(&path, HAND_BUILT);
+        execute(&path, MIGRATIONS[1].1);
+        execute(&path, "PRAGMA user_version = 2");
+        let player = PlayerId::generate();
+        execute(
+            &path,
+            &format!(
+                r#"INSERT INTO games (player, section, day, state) VALUES
+                     ('{player}', 'general', '2026-10-01',
+                      '{{"day":"2026-10-01","attempts":[],"status":"won"}}');"#
+            ),
+        );
+
+        let store = SqliteStore::open(&path).unwrap();
+        assert_eq!(user_version(&path), SCHEMA_VERSION);
+        // What was there is as it was.
+        assert_eq!(store.songs().await.unwrap().len(), 2);
+        assert_eq!(
+            store.games(&player, Section::General).await.unwrap(),
+            vec![won_game(date(2026, 10, 1), 0)]
+        );
+
+        // And the new records start empty and work.
+        assert_eq!(store.day_offset().await.unwrap(), 0);
+        assert_eq!(store.picks_on(date(2026, 10, 1)).await.unwrap(), Vec::new());
+        let pick = Pick {
+            day: date(2026, 10, 1),
+            section: Section::General,
+            track_id: 4_603_408,
+        };
+        assert_eq!(store.save_pick(pick).await.unwrap(), pick);
+        store.set_day_offset(1).await.unwrap();
+        assert_eq!(store.day_offset().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn picks_and_the_day_offset_survive_reopening_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("picks.db");
+        let rock = Section::Genre(Genre::Rock);
+        let day = date(2026, 10, 1);
+        let next_day = date(2026, 10, 2);
+        let pick = |day, section, track_id| Pick {
+            day,
+            section,
+            track_id,
+        };
+
+        let store = SqliteStore::open(&path).unwrap();
+        for saved in [
+            pick(day, rock, 4_091_937_401),
+            pick(day, Section::General, 15_391_618),
+            pick(next_day, rock, 92_720_046),
+            // One that loses to the pick already there, and one that is
+            // removed before the restart.
+            pick(day, rock, 7),
+            pick(next_day, Section::General, 8),
+        ] {
+            store.save_pick(saved).await.unwrap();
+        }
+        assert!(store.remove_pick(next_day, Section::General).await.unwrap());
+        store.set_day_offset(41).await.unwrap();
+        store.set_day_offset(-3).await.unwrap();
+        drop(store);
+
+        // A restart: the same file, a new connection, nothing migrated twice.
+        let reopened = SqliteStore::open(&path).unwrap();
+        assert_eq!(user_version(&path), SCHEMA_VERSION);
+        assert_eq!(
+            reopened.picks_on(day).await.unwrap(),
+            vec![
+                pick(day, Section::General, 15_391_618),
+                pick(day, rock, 4_091_937_401),
+            ]
+        );
+        assert_eq!(
+            reopened.pick_history(rock).await.unwrap(),
+            vec![
+                pick(day, rock, 4_091_937_401),
+                pick(next_day, rock, 92_720_046)
+            ]
+        );
+        assert_eq!(
+            reopened.picks_on(next_day).await.unwrap(),
+            vec![pick(next_day, rock, 92_720_046)]
+        );
+        assert_eq!(reopened.day_offset().await.unwrap(), -3);
+        // The pick that stands still stands for a server that draws again.
+        assert_eq!(
+            reopened.save_pick(pick(day, rock, 99)).await.unwrap(),
+            pick(day, rock, 4_091_937_401)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wipe_survives_reopening_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wiped.db");
+        let player = PlayerId::generate();
+        let day = date(2026, 10, 1);
+
+        let store = SqliteStore::open(&path).unwrap();
+        store
+            .add_song(new_song(7, "Song", "Someone"), Genres::from([Genre::Pop]))
+            .await
+            .unwrap();
+        store
+            .save_pick(Pick {
+                day,
+                section: Section::General,
+                track_id: 7,
+            })
+            .await
+            .unwrap();
+        store
+            .save_game(&player, Section::General, &won_game(day, 0))
+            .await
+            .unwrap();
+        store.set_day_offset(5).await.unwrap();
+        store.wipe_games_and_picks().await.unwrap();
+        drop(store);
+
+        let reopened = SqliteStore::open(&path).unwrap();
+        assert_eq!(reopened.picks_on(day).await.unwrap(), Vec::new());
+        assert_eq!(
+            reopened.games(&player, Section::General).await.unwrap(),
+            Vec::new()
+        );
+        // The pool and the offset were not the wipe's to take.
+        assert_eq!(reopened.songs().await.unwrap().len(), 1);
+        assert_eq!(reopened.day_offset().await.unwrap(), 5);
+    }
+
+    #[tokio::test]
+    async fn a_pick_and_the_day_offset_are_stored_as_documented_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("picks.db");
+        let store = SqliteStore::open(&path).unwrap();
+        let hip_hop = Section::Genre(Genre::HipHop);
+        for track_id in [1_109_731, 3_616_616] {
+            store
+                .save_pick(Pick {
+                    day: date(2026, 10, 1),
+                    section: hip_hop,
+                    track_id,
+                })
+                .await
+                .unwrap();
+        }
+        for days in [1, 2] {
+            store.set_day_offset(days).await.unwrap();
+        }
+
+        let connection = Connection::open(&path).unwrap();
+        let picks: Vec<(String, String, i64)> = connection
+            .prepare("SELECT day, section, track_id FROM picks")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            picks,
+            vec![("2026-10-01".to_owned(), "hip-hop".to_owned(), 1_109_731)]
+        );
+        // One row for the clock, however often it is set.
+        let clock: Vec<(i64, i64)> = connection
+            .prepare("SELECT id, day_offset FROM clock")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(clock, vec![(1, 2)]);
+    }
+
+    #[tokio::test]
+    async fn a_stored_pick_that_cannot_be_read_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("picks.db");
+        let store = SqliteStore::open(&path).unwrap();
+        // Rows this server would never write. Unlike a game, a pick is not
+        // left out: the server would draw a second song for the day.
+        execute(
+            &path,
+            "INSERT INTO picks (day, section, track_id) VALUES
+               ('last tuesday', 'pop', 7),
+               ('2026-10-01', 'rock', -7);",
+        );
+
+        let error = store
+            .pick_history(Section::Genre(Genre::Pop))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("last tuesday"), "{error}");
+        assert!(error.contains("not a date"), "{error}");
+        let error = store
+            .picks_on(date(2026, 10, 1))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not a Deezer track ID"), "{error}");
+        // The rest of the table is still readable.
+        assert_eq!(
+            store.pick_history(Section::General).await.unwrap(),
+            Vec::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pick_of_a_track_id_sqlite_cannot_hold_is_an_error() {
+        let fixture = fixture();
+        let store = fixture.store();
+        let day = date(2026, 10, 1);
+
+        let error = store
+            .save_pick(Pick {
+                day,
+                section: Section::General,
+                track_id: u64::MAX,
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("too large"), "{error}");
+        assert_eq!(store.picks_on(day).await.unwrap(), Vec::new());
+
+        // The largest ID it can hold is fine.
+        let largest = Pick {
+            day,
+            section: Section::General,
+            track_id: u64::try_from(i64::MAX).unwrap(),
+        };
+        assert_eq!(store.save_pick(largest).await.unwrap(), largest);
+        assert_eq!(store.picks_on(day).await.unwrap(), vec![largest]);
+    }
+
+    #[test]
+    fn a_picks_table_of_another_shape_is_refused_and_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pool.db");
+        execute(&path, HAND_BUILT);
+        execute(&path, MIGRATIONS[1].1);
+        execute(&path, "PRAGMA user_version = 2");
+        execute(&path, "CREATE TABLE picks (id INTEGER PRIMARY KEY)");
+
+        // The script that creates the table fails on the one in its way, and
+        // nothing of the migration is kept: no clock table either.
+        let error = SqliteStore::open(&path).err().unwrap().to_string();
+        assert!(error.contains("pool.db"), "{error}");
+        assert_eq!(user_version(&path), 2);
+        let tables: i64 = Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'clock'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 0);
     }
 
     #[test]

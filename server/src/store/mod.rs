@@ -1,4 +1,4 @@
-//! Persistent data behind one trait: the song pool and the players' games today; picks and the day offset later.
+//! Persistent data behind one trait: the song pool, the players' games, the daily picks and the day offset.
 //!
 //! [`Store`] is the only way the rest of the server touches persistent data.
 //! Handlers hold an `Arc<dyn Store>`, and no SQL, connection or database error
@@ -12,10 +12,12 @@
 //!   queries, and they take and return the plain types defined here.
 //! - Logic stays above the trait. A backend fetches and stores; anything that
 //!   decides (seeding only an empty pool, the order a list is shown in, the
-//!   stats, and later the daily pick) is Rust code that calls it.
+//!   stats, the daily pick, what a re-roll or a reset deletes and in which
+//!   order) is Rust code that calls it.
 //! - A backend only has to be atomic for one record at a time. A song with its
-//!   genre tags is one record, and so is one player's game in one section on
-//!   one day. Nothing here needs a transaction that spans two kinds of record.
+//!   genre tags is one record, and so are one player's game in one section on
+//!   one day, one section's pick for one day, and the day offset. Nothing
+//!   here needs a transaction that spans two kinds of record.
 //!
 //! [`contract`] holds the test suite every backend has to pass.
 
@@ -32,6 +34,8 @@ use async_trait::async_trait;
 use jiff::civil::Date;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+#[cfg(test)]
+pub use self::seed::SEED_SONGS;
 pub use self::{memory::MemoryStore, seed::seed_if_empty, sqlite::SqliteStore};
 use crate::{config::StoreKind, game::GameState};
 
@@ -251,6 +255,19 @@ impl PoolSong {
     }
 }
 
+/// The song a section plays on a day: one row of the pick history.
+///
+/// Only the track ID is kept. The song may leave the pool afterwards; the
+/// pick stays, because the games of that day were played against it and the
+/// history is what keeps a section from repeating itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Pick {
+    pub day: Date,
+    pub section: Section,
+    /// Deezer track ID.
+    pub track_id: u64,
+}
+
 /// A store operation that failed: the database could not be opened, read or
 /// written, or holds something this server cannot interpret.
 ///
@@ -358,6 +375,51 @@ pub trait Store: Send + Sync {
     /// and on every day. Returns how many games that was; 0 for a player the
     /// store has never seen. Other players are not touched.
     async fn delete_player(&self, player: &PlayerId) -> Result<usize, StoreError>;
+
+    /// Deletes every player's game in `section` on `day`: what a re-roll of
+    /// that section's song does, since those games were played against the
+    /// song that is being replaced. Returns how many games that was. Other
+    /// days and other sections are not touched.
+    async fn delete_games(&self, section: Section, day: Date) -> Result<usize, StoreError>;
+
+    /// The picks made for `day`, at most one per section, in [`Section`]'s
+    /// order (General first). A section that is missing has no pick yet.
+    async fn picks_on(&self, day: Date) -> Result<Vec<Pick>, StoreError>;
+
+    /// Every pick `section` has on record, on any day, by ascending day. The
+    /// daily pick reads it to avoid repeating a song.
+    async fn pick_history(&self, section: Section) -> Result<Vec<Pick>, StoreError>;
+
+    /// Stores `pick` unless its day and section already have one, and returns
+    /// the pick that stands: `pick` itself, or the one that was there first.
+    ///
+    /// This is the one conditional write the trait asks for, and it has to be
+    /// atomic: two requests that both find a day without a song at midnight
+    /// each draw one, and both must end up playing the same.
+    async fn save_pick(&self, pick: Pick) -> Result<Pick, StoreError>;
+
+    /// Removes the pick of `section` on `day`, so that the next
+    /// [`save_pick`](Self::save_pick) for them stands. `false` when there was
+    /// none. The games of that day are not touched; see
+    /// [`delete_games`](Self::delete_games).
+    async fn remove_pick(&self, day: Date, section: Section) -> Result<bool, StoreError>;
+
+    /// How many days the server's day is ahead of the real UTC date (behind
+    /// it, when negative). 0 until it is set.
+    async fn day_offset(&self) -> Result<i64, StoreError>;
+
+    /// Replaces the day offset.
+    async fn set_day_offset(&self, days: i64) -> Result<(), StoreError>;
+
+    /// Deletes every game of every player and every pick of every day: what
+    /// Reset to day 1 does. The song pool, failed-preview days included, and
+    /// the day offset stay as they are.
+    ///
+    /// The games go first. A backend that cannot delete both kinds of record
+    /// at once must keep that order, so that an interruption leaves picks
+    /// without games (a day nobody has played yet) and never games without
+    /// the pick they were played against.
+    async fn wipe_games_and_picks(&self) -> Result<(), StoreError>;
 }
 
 /// Reads a game that a backend keeps as JSON ([`GameState`]'s own

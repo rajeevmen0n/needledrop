@@ -6,7 +6,7 @@
 use std::{
     collections::HashMap,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
@@ -30,12 +30,14 @@ use tokio::{net::TcpListener, task::JoinHandle};
 use tower::ServiceExt;
 
 use crate::{
-    daily::Daily,
+    daily::{Clock, Daily},
     deezer::Deezer,
     game::{GameState, MAX_ATTEMPTS, Status, TrackMeta},
     player,
     routes::{AppState, router},
-    store::{Genres, MemoryStore, NewSong, PlayerId, PoolSong, Section, Store, StoreError},
+    store::{
+        Genre, Genres, MemoryStore, NewSong, Pick, PlayerId, PoolSong, Section, Store, StoreError,
+    },
 };
 
 /// Frames in a real Deezer preview (29.988 s).
@@ -317,40 +319,124 @@ pub fn lost_game(day: Date) -> GameState {
 /// Day 1 of the game in every [`Harness`].
 pub const LAUNCH: Date = date(2026, 10, 1);
 
-/// The whole router over a Deezer stand-in, a store the test can reach and a
-/// temporary data directory.
+/// The real date in every [`Harness`] until a test moves it: day 3 of the
+/// game. A fixed date, so that no test depends on when it runs or breaks
+/// when midnight passes in the middle of it.
+pub const TODAY: Date = date(2026, 10, 3);
+
+/// The real date, as a test sets it.
+#[derive(Clone)]
+pub struct TestClock(Arc<Mutex<Date>>);
+
+impl TestClock {
+    pub fn new(day: Date) -> Self {
+        Self(Arc::new(Mutex::new(day)))
+    }
+
+    /// Makes it another day: a real midnight, or several.
+    pub fn set(&self, day: Date) {
+        *self.0.lock().unwrap() = day;
+    }
+
+    /// The clock a [`Daily`] reads this date through.
+    pub fn clock(&self) -> Clock {
+        let day = Arc::clone(&self.0);
+        Clock::new(move || *day.lock().unwrap())
+    }
+}
+
+/// The whole router over a Deezer stand-in, a store the test can reach, a
+/// temporary data directory and a clock that says [`TODAY`].
 pub struct Harness {
     pub deezer: MockDeezer,
     pub store: Arc<dyn Store>,
     pub app: Router,
+    pub clock: TestClock,
     /// The cookie key, so a test can look inside a cookie or make one.
     key: Key,
-    _data_dir: tempfile::TempDir,
+    data_dir: tempfile::TempDir,
 }
 
 impl Harness {
-    /// A server whose Deezer knows `tracks`, that plays `answer` and keeps
-    /// its data in an empty [`MemoryStore`].
+    /// A server whose Deezer knows `tracks` and whose song pool is the one
+    /// song `answer`, untagged, in an otherwise empty [`MemoryStore`]: the
+    /// General section plays it every day and the genre sections have no
+    /// song.
     pub async fn start(tracks: Vec<MockTrack>, answer: u64) -> Self {
         Self::with_store(tracks, answer, Arc::new(MemoryStore::new())).await
     }
 
     /// The same over a store of the test's choosing.
     pub async fn with_store(tracks: Vec<MockTrack>, answer: u64, store: Arc<dyn Store>) -> Self {
+        Self::over(tracks, &[(answer, &[])], store).await
+    }
+
+    /// A server whose song pool is `pool`: track IDs with their genre tags.
+    pub async fn with_pool(tracks: Vec<MockTrack>, pool: &[(u64, &[Genre])]) -> Self {
+        Self::over(tracks, pool, Arc::new(MemoryStore::new())).await
+    }
+
+    /// A server over `store`, with `pool` added to whatever the store holds.
+    /// A song takes its title and artist from the track of that ID in
+    /// `tracks`; a store that cannot take it (one that is broken on purpose)
+    /// is left as it is.
+    pub async fn over(
+        tracks: Vec<MockTrack>,
+        pool: &[(u64, &[Genre])],
+        store: Arc<dyn Store>,
+    ) -> Self {
+        for (track_id, genres) in pool {
+            let known = tracks.iter().find(|track| track.id == *track_id);
+            let song = match known {
+                Some(track) => NewSong {
+                    track_id: *track_id,
+                    title: track.title.clone(),
+                    title_short: track.title_short.clone(),
+                    artist: track.artist.clone(),
+                    album: track.album.clone(),
+                },
+                None => NewSong {
+                    track_id: *track_id,
+                    title: format!("Song {track_id}"),
+                    title_short: format!("Song {track_id}"),
+                    artist: "Someone".to_owned(),
+                    album: "LP".to_owned(),
+                },
+            };
+            let _ = store.add_song(song, genres.iter().copied().collect()).await;
+        }
+
         let deezer = MockDeezer::start(tracks).await;
         let data_dir = tempfile::tempdir().unwrap();
-        let client = deezer.client();
-        let daily = Daily::new(client.clone(), data_dir.path(), answer)
-            .with_retry_after(std::time::Duration::ZERO);
+        let clock = TestClock::new(TODAY);
         let key = Key::generate();
-        let state = AppState::new(client, daily, Arc::clone(&store), LAUNCH, key.clone());
+        let app = serve(&deezer, &store, data_dir.path(), &clock, &key);
         Self {
             deezer,
             store,
-            app: router(state),
+            app,
+            clock,
             key,
-            _data_dir: data_dir,
+            data_dir,
         }
+    }
+
+    /// Restarts the server: a new process over the same store, data
+    /// directory, cookie key and Deezer, with nothing in memory. Browsers
+    /// made before it still talk to the old one; make new ones.
+    pub fn restart(&mut self) {
+        self.app = serve(
+            &self.deezer,
+            &self.store,
+            self.data_dir.path(),
+            &self.clock,
+            &self.key,
+        );
+    }
+
+    /// Where the server keeps its files: `audio/` is the preview cache.
+    pub fn data_dir(&self) -> &std::path::Path {
+        self.data_dir.path()
     }
 
     /// A browser that has not been here before.
@@ -394,6 +480,18 @@ impl Harness {
         PlayerId::parse(&self.cookie_plaintext(player)?)
     }
 
+    /// The track `section` plays on `day`, as the store has it: `None`
+    /// until the pick is made.
+    pub async fn pick(&self, day: Date, section: Section) -> Option<u64> {
+        self.store
+            .picks_on(day)
+            .await
+            .unwrap()
+            .iter()
+            .find(|pick| pick.section == section)
+            .map(|pick| pick.track_id)
+    }
+
     /// Sends a request without a cookie.
     pub async fn send(&self, request: Request<Body>) -> Reply {
         self.player().send(request).await
@@ -407,6 +505,35 @@ impl Harness {
         self.send(Request::delete(uri).body(Body::empty()).unwrap())
             .await
     }
+
+    /// `POST` without a cookie: with a JSON body, or with no body and no
+    /// content type at all.
+    pub async fn post(&self, uri: &str, body: Option<Value>) -> Reply {
+        let request = Request::builder().method(Method::POST).uri(uri);
+        let request = match body {
+            Some(body) => request
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string())),
+            None => request.body(Body::empty()),
+        };
+        self.send(request.unwrap()).await
+    }
+}
+
+/// The router of a server process with nothing in memory, which tries
+/// Deezer again at once after a failure.
+fn serve(
+    deezer: &MockDeezer,
+    store: &Arc<dyn Store>,
+    data_dir: &std::path::Path,
+    clock: &TestClock,
+    key: &Key,
+) -> Router {
+    let client = deezer.client();
+    let daily = Daily::new(client.clone(), Arc::clone(store), data_dir, clock.clock())
+        .with_retry_after(std::time::Duration::ZERO);
+    let state = AppState::new(client, daily, Arc::clone(store), LAUNCH, key.clone());
+    router(state)
 }
 
 /// A browser: it keeps the player cookie between requests.
@@ -444,27 +571,60 @@ impl Player {
             .await
     }
 
-    /// `POST /api/daily/guess` with a JSON body.
+    /// `GET /api/daily/{section}`: the state of the section's game.
+    pub async fn daily(&mut self, section: Section) -> Reply {
+        self.get(&format!("/api/daily/{section}")).await
+    }
+
+    /// `GET /api/daily/{section}/audio`: the clip unlocked there.
+    pub async fn audio(&mut self, section: Section) -> Reply {
+        self.get(&format!("/api/daily/{section}/audio")).await
+    }
+
+    /// A move in the General section, with a JSON body.
     pub async fn post(&mut self, body: Value) -> Reply {
         self.post_raw("application/json", body.to_string()).await
     }
 
+    /// A move in the General section, with any body.
     pub async fn post_raw(&mut self, content_type: &str, body: impl Into<Body>) -> Reply {
+        self.post_to("/api/daily/general/guess", content_type, body)
+            .await
+    }
+
+    pub async fn post_to(&mut self, uri: &str, content_type: &str, body: impl Into<Body>) -> Reply {
         let request = Request::builder()
             .method(Method::POST)
-            .uri("/api/daily/guess")
+            .uri(uri)
             .header(header::CONTENT_TYPE, content_type)
             .body(body.into())
             .unwrap();
         self.send(request).await
     }
 
+    /// A skip in the General section.
     pub async fn skip(&mut self) -> Reply {
-        self.post(json!({ "skip": true })).await
+        self.skip_in(Section::General).await
     }
 
+    /// A guess in the General section.
     pub async fn guess(&mut self, track_id: u64) -> Reply {
-        self.post(json!({ "trackId": track_id })).await
+        self.guess_in(Section::General, track_id).await
+    }
+
+    pub async fn skip_in(&mut self, section: Section) -> Reply {
+        self.move_in(section, json!({ "skip": true })).await
+    }
+
+    pub async fn guess_in(&mut self, section: Section, track_id: u64) -> Reply {
+        self.move_in(section, json!({ "trackId": track_id })).await
+    }
+
+    /// `POST /api/daily/{section}/guess` with a JSON body.
+    pub async fn move_in(&mut self, section: Section, body: Value) -> Reply {
+        let uri = format!("/api/daily/{section}/guess");
+        self.post_to(&uri, "application/json", body.to_string())
+            .await
     }
 
     /// `DELETE /api/player`: Clear my data.
@@ -591,6 +751,30 @@ impl Store for BrokenStore {
         broken()
     }
     async fn delete_player(&self, _: &PlayerId) -> Result<usize, StoreError> {
+        broken()
+    }
+    async fn delete_games(&self, _: Section, _: Date) -> Result<usize, StoreError> {
+        broken()
+    }
+    async fn picks_on(&self, _: Date) -> Result<Vec<Pick>, StoreError> {
+        broken()
+    }
+    async fn pick_history(&self, _: Section) -> Result<Vec<Pick>, StoreError> {
+        broken()
+    }
+    async fn save_pick(&self, _: Pick) -> Result<Pick, StoreError> {
+        broken()
+    }
+    async fn remove_pick(&self, _: Date, _: Section) -> Result<bool, StoreError> {
+        broken()
+    }
+    async fn day_offset(&self) -> Result<i64, StoreError> {
+        broken()
+    }
+    async fn set_day_offset(&self, _: i64) -> Result<(), StoreError> {
+        broken()
+    }
+    async fn wipe_games_and_picks(&self) -> Result<(), StoreError> {
         broken()
     }
 }

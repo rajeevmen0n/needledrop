@@ -10,7 +10,7 @@
 
 use jiff::civil::{Date, date};
 
-use super::{Genre, Genres, NewSong, PlayerId, PoolSong, Section, Store};
+use super::{Genre, Genres, NewSong, Pick, PlayerId, PoolSong, Section, Store};
 use crate::{
     game::{GameState, Status, TrackMeta},
     testutil::{lost_game, playing_game, won_game},
@@ -76,6 +76,18 @@ macro_rules! contract_tests {
             deleting_a_player_removes_all_their_games_in_every_section,
             deleting_a_player_leaves_everyone_else_alone,
             games_and_the_song_pool_do_not_touch_each_other,
+            deleting_a_days_games_in_a_section_leaves_every_other_game,
+            a_new_store_has_no_picks,
+            a_saved_pick_stands_and_is_found_by_day_and_by_section,
+            a_pick_is_not_replaced_by_a_later_one_for_the_same_day_and_section,
+            picks_saved_at_once_for_one_day_and_section_agree_on_one,
+            a_days_picks_are_listed_general_first_then_the_genres,
+            a_sections_pick_history_is_listed_by_ascending_day,
+            a_removed_pick_makes_room_for_another,
+            picks_games_and_the_song_pool_do_not_touch_each_other,
+            the_day_offset_is_zero_until_it_is_set_and_then_what_was_set,
+            wiping_deletes_every_game_and_every_pick,
+            wiping_leaves_the_song_pool_and_the_day_offset_alone,
         );
     };
     (@cases $fixture:expr; $($case:ident),+ $(,)?) => {
@@ -818,4 +830,331 @@ pub async fn games_and_the_song_pool_do_not_touch_each_other(store: &dyn Store) 
         .unwrap();
     assert_eq!(store.delete_player(&player).await.unwrap(), 1);
     assert_eq!(store.songs().await.unwrap(), vec![song]);
+}
+
+// --- deleting a day's games in a section ----------------------------------------
+
+pub async fn deleting_a_days_games_in_a_section_leaves_every_other_game(store: &dyn Store) {
+    let one = PlayerId::generate();
+    let other = PlayerId::generate();
+    let next_day = date(2026, 10, 2);
+    // The games that go: both players', finished or not.
+    store
+        .save_game(&one, ROCK, &playing_game(DAY, 3))
+        .await
+        .unwrap();
+    store
+        .save_game(&other, ROCK, &won_game(DAY, 0))
+        .await
+        .unwrap();
+    // The games that stay: another section on that day, that section on
+    // another day.
+    let general = lost_game(DAY);
+    let later = won_game(next_day, 2);
+    store.save_game(&one, GENERAL, &general).await.unwrap();
+    store.save_game(&one, ROCK, &later).await.unwrap();
+    store.save_game(&other, ROCK, &later).await.unwrap();
+
+    assert_eq!(store.delete_games(ROCK, DAY).await.unwrap(), 2);
+
+    assert_eq!(store.game(&one, ROCK, DAY).await.unwrap(), None);
+    assert_eq!(store.game(&other, ROCK, DAY).await.unwrap(), None);
+    assert_eq!(store.games(&one, ROCK).await.unwrap(), vec![later.clone()]);
+    assert_eq!(store.games(&other, ROCK).await.unwrap(), vec![later]);
+    assert_eq!(store.games(&one, GENERAL).await.unwrap(), vec![general]);
+
+    // Nothing is left to delete there, and a day nobody played has nothing.
+    assert_eq!(store.delete_games(ROCK, DAY).await.unwrap(), 0);
+    assert_eq!(
+        store
+            .delete_games(Section::Genre(Genre::Pop), DAY)
+            .await
+            .unwrap(),
+        0
+    );
+    // A game saved there afterwards is a new start.
+    let fresh = playing_game(DAY, 1);
+    store.save_game(&one, ROCK, &fresh).await.unwrap();
+    assert_eq!(store.game(&one, ROCK, DAY).await.unwrap(), Some(fresh));
+}
+
+// --- picks ----------------------------------------------------------------------
+
+const POP: Section = Section::Genre(Genre::Pop);
+
+fn pick(day: Date, section: Section, track_id: u64) -> Pick {
+    Pick {
+        day,
+        section,
+        track_id,
+    }
+}
+
+pub async fn a_new_store_has_no_picks(store: &dyn Store) {
+    assert_eq!(store.picks_on(DAY).await.unwrap(), Vec::new());
+    for section in Section::ALL {
+        assert_eq!(store.pick_history(section).await.unwrap(), Vec::new());
+        assert!(!store.remove_pick(DAY, section).await.unwrap());
+    }
+    // Asking and removing created nothing.
+    assert_eq!(store.picks_on(DAY).await.unwrap(), Vec::new());
+}
+
+pub async fn a_saved_pick_stands_and_is_found_by_day_and_by_section(store: &dyn Store) {
+    // A track ID that does not fit in 32 bits, as Deezer has them.
+    let saved = pick(DAY, ROCK, 4_091_937_401);
+    assert_eq!(store.save_pick(saved).await.unwrap(), saved);
+
+    assert_eq!(store.picks_on(DAY).await.unwrap(), vec![saved]);
+    assert_eq!(store.pick_history(ROCK).await.unwrap(), vec![saved]);
+    // Neither another day nor another section has it.
+    assert_eq!(store.picks_on(date(2026, 10, 2)).await.unwrap(), Vec::new());
+    assert_eq!(store.picks_on(date(2026, 9, 30)).await.unwrap(), Vec::new());
+    assert_eq!(store.pick_history(GENERAL).await.unwrap(), Vec::new());
+    assert_eq!(store.pick_history(POP).await.unwrap(), Vec::new());
+}
+
+pub async fn a_pick_is_not_replaced_by_a_later_one_for_the_same_day_and_section(store: &dyn Store) {
+    let first = pick(DAY, POP, 100);
+    assert_eq!(store.save_pick(first).await.unwrap(), first);
+
+    // The second caller is told which pick stands, and it is not its own.
+    assert_eq!(store.save_pick(pick(DAY, POP, 200)).await.unwrap(), first);
+    assert_eq!(store.save_pick(pick(DAY, POP, 300)).await.unwrap(), first);
+    // Saving the pick that stands is not an error either.
+    assert_eq!(store.save_pick(first).await.unwrap(), first);
+    assert_eq!(store.picks_on(DAY).await.unwrap(), vec![first]);
+    assert_eq!(store.pick_history(POP).await.unwrap(), vec![first]);
+
+    // The rule is per day and per section: the same section on another day
+    // and another section on the same day take their own.
+    let next_day = pick(date(2026, 10, 2), POP, 200);
+    let rock = pick(DAY, ROCK, 200);
+    assert_eq!(store.save_pick(next_day).await.unwrap(), next_day);
+    assert_eq!(store.save_pick(rock).await.unwrap(), rock);
+    assert_eq!(store.picks_on(DAY).await.unwrap(), vec![first, rock]);
+}
+
+pub async fn picks_saved_at_once_for_one_day_and_section_agree_on_one(store: &dyn Store) {
+    // Two requests at midnight, each with the song it drew.
+    let (one, other, third) = tokio::join!(
+        store.save_pick(pick(DAY, GENERAL, 100)),
+        store.save_pick(pick(DAY, GENERAL, 200)),
+        store.save_pick(pick(DAY, GENERAL, 300)),
+    );
+    let stands = one.unwrap();
+    assert_eq!(other.unwrap(), stands);
+    assert_eq!(third.unwrap(), stands);
+    assert!([100, 200, 300].contains(&stands.track_id), "{stands:?}");
+    assert_eq!(store.picks_on(DAY).await.unwrap(), vec![stands]);
+}
+
+pub async fn a_days_picks_are_listed_general_first_then_the_genres(store: &dyn Store) {
+    let next_day = date(2026, 10, 2);
+    // Saved in the order they are made, which is not the order they are
+    // listed in, with another day's in between.
+    store.save_pick(pick(DAY, POP, 1)).await.unwrap();
+    store.save_pick(pick(next_day, POP, 9)).await.unwrap();
+    store.save_pick(pick(DAY, ROCK, 2)).await.unwrap();
+    store
+        .save_pick(pick(DAY, Section::Genre(Genre::HipHop), 3))
+        .await
+        .unwrap();
+    store.save_pick(pick(DAY, GENERAL, 4)).await.unwrap();
+
+    let listed = store.picks_on(DAY).await.unwrap();
+    let sections: Vec<Section> = listed.iter().map(|pick| pick.section).collect();
+    assert_eq!(sections, Section::ALL);
+    let tracks: Vec<u64> = listed.iter().map(|pick| pick.track_id).collect();
+    assert_eq!(tracks, vec![4, 1, 2, 3]);
+    assert!(listed.iter().all(|pick| pick.day == DAY));
+    // The same answer every time.
+    assert_eq!(store.picks_on(DAY).await.unwrap(), listed);
+    assert_eq!(
+        store.picks_on(next_day).await.unwrap(),
+        vec![pick(next_day, POP, 9)]
+    );
+}
+
+pub async fn a_sections_pick_history_is_listed_by_ascending_day(store: &dyn Store) {
+    // Saved out of order, across a month and a year boundary, with the same
+    // song on two days.
+    let saved = [
+        pick(date(2026, 10, 10), POP, 5),
+        pick(date(2026, 10, 2), POP, 7),
+        pick(date(2027, 1, 1), POP, 5),
+        pick(date(2026, 9, 30), POP, 1),
+        pick(date(2026, 12, 31), POP, 3),
+    ];
+    for pick in saved {
+        store.save_pick(pick).await.unwrap();
+    }
+    // Other sections' picks on days in between are not part of it.
+    store
+        .save_pick(pick(date(2026, 10, 5), ROCK, 7))
+        .await
+        .unwrap();
+    store
+        .save_pick(pick(date(2026, 10, 2), GENERAL, 8))
+        .await
+        .unwrap();
+
+    let history = store.pick_history(POP).await.unwrap();
+    let mut expected = saved.to_vec();
+    expected.sort_by_key(|pick| pick.day);
+    assert_eq!(history, expected);
+    let days: Vec<Date> = history.iter().map(|pick| pick.day).collect();
+    assert_eq!(
+        days,
+        vec![
+            date(2026, 9, 30),
+            date(2026, 10, 2),
+            date(2026, 10, 10),
+            date(2026, 12, 31),
+            date(2027, 1, 1),
+        ]
+    );
+    assert_eq!(store.pick_history(POP).await.unwrap(), history);
+    assert_eq!(
+        store.pick_history(ROCK).await.unwrap(),
+        vec![pick(date(2026, 10, 5), ROCK, 7)]
+    );
+}
+
+pub async fn a_removed_pick_makes_room_for_another(store: &dyn Store) {
+    let next_day = date(2026, 10, 2);
+    let old = pick(DAY, POP, 100);
+    let rock = pick(DAY, ROCK, 300);
+    let tomorrow = pick(next_day, POP, 100);
+    for pick in [old, rock, tomorrow] {
+        store.save_pick(pick).await.unwrap();
+    }
+
+    assert!(store.remove_pick(DAY, POP).await.unwrap());
+    // Only that day's pick of that section went.
+    assert_eq!(store.picks_on(DAY).await.unwrap(), vec![rock]);
+    assert_eq!(store.pick_history(POP).await.unwrap(), vec![tomorrow]);
+    // The second removal finds nothing.
+    assert!(!store.remove_pick(DAY, POP).await.unwrap());
+
+    // Now another pick stands there: a re-roll.
+    let new = pick(DAY, POP, 200);
+    assert_eq!(store.save_pick(new).await.unwrap(), new);
+    assert_eq!(store.picks_on(DAY).await.unwrap(), vec![new, rock]);
+    assert_eq!(store.pick_history(POP).await.unwrap(), vec![new, tomorrow]);
+}
+
+pub async fn picks_games_and_the_song_pool_do_not_touch_each_other(store: &dyn Store) {
+    let player = PlayerId::generate();
+    add(store, 7, [Genre::Rock]).await;
+    let picked = pick(DAY, ROCK, 7);
+    store.save_pick(picked).await.unwrap();
+    // A pick of a track the pool has never had is a pick all the same.
+    let stranger = pick(DAY, GENERAL, 999);
+    assert_eq!(store.save_pick(stranger).await.unwrap(), stranger);
+    let game = won_game(DAY, 2);
+    store.save_game(&player, ROCK, &game).await.unwrap();
+
+    // A song leaving the pool takes neither its pick nor the games with it:
+    // the day was played, and the history is what prevents repeats.
+    assert!(store.remove_song(7).await.unwrap());
+    assert_eq!(store.picks_on(DAY).await.unwrap(), vec![stranger, picked]);
+    assert_eq!(
+        store.games(&player, ROCK).await.unwrap(),
+        vec![game.clone()]
+    );
+
+    // Removing a pick deletes no game, and deleting the games no pick: the
+    // caller does both, in the order it wants.
+    assert!(store.remove_pick(DAY, ROCK).await.unwrap());
+    assert_eq!(store.games(&player, ROCK).await.unwrap(), vec![game]);
+    assert_eq!(store.delete_games(ROCK, DAY).await.unwrap(), 1);
+    assert_eq!(store.picks_on(DAY).await.unwrap(), vec![stranger]);
+    // And clearing a player's data touches no pick.
+    store.delete_player(&player).await.unwrap();
+    assert_eq!(store.picks_on(DAY).await.unwrap(), vec![stranger]);
+}
+
+// --- the day offset -------------------------------------------------------------
+
+pub async fn the_day_offset_is_zero_until_it_is_set_and_then_what_was_set(store: &dyn Store) {
+    assert_eq!(store.day_offset().await.unwrap(), 0);
+
+    for days in [1, 2, 400, 0, -3, -36_500, 7] {
+        store.set_day_offset(days).await.unwrap();
+        assert_eq!(store.day_offset().await.unwrap(), days);
+        // The same answer every time.
+        assert_eq!(store.day_offset().await.unwrap(), days);
+    }
+    // Setting what is already there is fine.
+    store.set_day_offset(7).await.unwrap();
+    assert_eq!(store.day_offset().await.unwrap(), 7);
+
+    // It is a setting of its own: no pick, game or song came of it.
+    assert_eq!(store.picks_on(DAY).await.unwrap(), Vec::new());
+    assert_eq!(store.songs().await.unwrap(), Vec::new());
+}
+
+// --- wiping ---------------------------------------------------------------------
+
+pub async fn wiping_deletes_every_game_and_every_pick(store: &dyn Store) {
+    let one = PlayerId::generate();
+    let other = PlayerId::generate();
+    let days = [date(2026, 10, 1), date(2026, 10, 2), date(2026, 11, 30)];
+    for day in days {
+        for section in Section::ALL {
+            store.save_pick(pick(day, section, 100)).await.unwrap();
+            store
+                .save_game(&one, section, &won_game(day, 1))
+                .await
+                .unwrap();
+        }
+        store
+            .save_game(&other, GENERAL, &playing_game(day, 2))
+            .await
+            .unwrap();
+    }
+
+    store.wipe_games_and_picks().await.unwrap();
+
+    for day in days {
+        assert_eq!(store.picks_on(day).await.unwrap(), Vec::new());
+    }
+    for section in Section::ALL {
+        assert_eq!(store.pick_history(section).await.unwrap(), Vec::new());
+        assert_eq!(store.games(&one, section).await.unwrap(), Vec::new());
+    }
+    assert_eq!(store.games(&other, GENERAL).await.unwrap(), Vec::new());
+    // There is nothing left for a player to clear.
+    assert_eq!(store.delete_player(&one).await.unwrap(), 0);
+
+    // Wiping what is already empty is fine, and the store works on: a pick
+    // for a wiped day is a first pick, a game a first game.
+    store.wipe_games_and_picks().await.unwrap();
+    let again = pick(days[0], GENERAL, 200);
+    assert_eq!(store.save_pick(again).await.unwrap(), again);
+    let fresh = playing_game(days[0], 1);
+    store.save_game(&one, GENERAL, &fresh).await.unwrap();
+    assert_eq!(store.games(&one, GENERAL).await.unwrap(), vec![fresh]);
+}
+
+pub async fn wiping_leaves_the_song_pool_and_the_day_offset_alone(store: &dyn Store) {
+    add(store, 1, [Genre::Pop, Genre::Rock]).await;
+    add(store, 2, []).await;
+    store
+        .set_preview_failed_on(2, Some(date(2026, 10, 3)))
+        .await
+        .unwrap();
+    store.set_day_offset(12).await.unwrap();
+    store.save_pick(pick(DAY, POP, 1)).await.unwrap();
+    let pool = store.songs().await.unwrap();
+
+    store.wipe_games_and_picks().await.unwrap();
+
+    // Every song, its genre tags and its failed-preview day included.
+    assert_eq!(store.songs().await.unwrap(), pool);
+    assert_eq!(pool.len(), 2);
+    assert_eq!(pool[1].preview_failed_on, Some(date(2026, 10, 3)));
+    // Where the day goes after a reset is the caller's decision.
+    assert_eq!(store.day_offset().await.unwrap(), 12);
 }
