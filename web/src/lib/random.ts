@@ -1,7 +1,9 @@
-// Random mode as the page words it and decides about it: the session's score,
-// what a refused request calls for, and the mark that says this browser tab
-// has a session. Pure: no DOM and no imports, so `node --test` can load this
-// file directly (see web/test/). The numbers themselves are the server's.
+// Random mode as the page words it and decides about it: the session's score
+// and what a refused request calls for. Pure: no DOM and no imports, so
+// `node --test` can load this file directly (see web/test/). The numbers
+// themselves are the server's, and so is the session: it is the player's, in
+// whatever browser tab, and the server ends it after half an hour without
+// playing.
 
 /** The score the server sends with every random song. */
 export interface RandomScore {
@@ -87,11 +89,12 @@ export function songLine(song: { status: string; played: number } | null): strin
 // --- what a refused request calls for ----------------------------------------------
 
 /**
- * What the page does when the server refuses a random move or draw:
- * `reload` asks for the game again and says nothing; `tell` does the same and
- * says the song was changed elsewhere; `restart` starts a new session, because
- * the server has no game for this player any more; `empty` shows that there
- * is no song to play; `report` shows the server's sentence and changes nothing.
+ * What the page does when the server refuses a random request: `reload` asks
+ * for the game again and says nothing; `tell` does the same and says the song
+ * was changed elsewhere; `restart` asks for the session to play in, because
+ * the server has none for this player (they never played, the session ended
+ * while they were away, the data was cleared); `empty` shows that there is no
+ * song to play; `report` shows the server's sentence and changes nothing.
  */
 export type Remedy = 'reload' | 'tell' | 'restart' | 'empty' | 'report'
 
@@ -110,59 +113,5 @@ export function remedyFor(code: string): Remedy {
       return 'empty'
     default:
       return 'report'
-  }
-}
-
-// --- the session mark ---------------------------------------------------------------
-
-/** Under this key `sessionStorage` holds the mark. */
-export const SESSION_KEY = 'nd_random'
-
-/** As much of `Storage` as the mark needs. */
-export interface MarkStorage {
-  getItem(key: string): string | null
-  setItem(key: string, value: string): void
-  removeItem(key: string): void
-}
-
-/**
- * Whether this browser tab has a random session. A session is the tab's: the
- * mark lives in `sessionStorage`, which a reload keeps and closing the tab
- * drops, so a reload continues the session and a new visit starts one.
- *
- * `storage` hands over `sessionStorage`. It may throw (a browser that blocks
- * site data) or give nothing; then the mark is only remembered here, for as
- * long as the page lives, and every page load is a new session.
- */
-export function sessionMark(storage: () => MarkStorage | null | undefined) {
-  let held = false
-  return {
-    /** A session was started in this tab and not dropped since. */
-    known(): boolean {
-      if (held) return true
-      try {
-        return storage()?.getItem(SESSION_KEY) != null
-      } catch {
-        return false
-      }
-    },
-    /** A session has been started. */
-    keep(): void {
-      held = true
-      try {
-        storage()?.setItem(SESSION_KEY, '1')
-      } catch {
-        // Remembered above for this page load; that is all there is.
-      }
-    },
-    /** The session is over (Clear my data): the next look starts another. */
-    drop(): void {
-      held = false
-      try {
-        storage()?.removeItem(SESSION_KEY)
-      } catch {
-        // Nothing was stored, so there is nothing to remove.
-      }
-    },
   }
 }

@@ -133,6 +133,13 @@ impl AppState {
         self.0.daily.today().await.map_err(daily_failed)
     }
 
+    /// The real time, in seconds since the Unix epoch: what random mode
+    /// measures a session's idle time in. The day offset does not move it.
+    /// Read it once per request and pass it down, like the day.
+    pub fn now(&self) -> i64 {
+        self.0.daily.now().as_second()
+    }
+
     /// The song `section` plays on `day`, picking and loading it if needed.
     pub async fn song(&self, section: Section, day: Date) -> Result<Playing, ApiError> {
         self.0.daily.song(day, section).await.map_err(daily_failed)

@@ -1169,17 +1169,21 @@ pub async fn wiping_leaves_the_song_pool_and_the_day_offset_alone(store: &dyn St
 
 // --- random games ---------------------------------------------------------------
 
+/// When the sample random games were last played, in seconds since the Unix
+/// epoch. A store keeps it like the rest of the state and decides nothing by it.
+const NOW: i64 = 1_790_000_000;
+
 /// A random game in its `songs`th song of a first session, every earlier one
 /// won on the first try and the current one skipped once. The tracks are
 /// 1000, 1001, …
 fn random_game(songs: u64) -> RandomGame {
     let song = TrackMeta::new("The Song", "", "Someone");
-    let mut game = RandomGame::start(None, 1000, DAY);
+    let mut game = RandomGame::start(None, 1000, DAY, NOW);
     for track_id in 1001..1000 + songs {
-        game.guess(&song, &song).unwrap();
-        game = game.next(track_id, DAY).unwrap();
+        game.guess(&song, &song, NOW).unwrap();
+        game = game.next(track_id, DAY, NOW).unwrap();
     }
-    game.skip().unwrap();
+    game.skip(NOW).unwrap();
     game
 }
 
@@ -1206,16 +1210,22 @@ pub async fn a_saved_random_game_is_loaded_as_it_was_saved_and_replaced_by_the_n
     assert_eq!((loaded.run(), loaded.played(), loaded.won()), (2, 2, 2));
     assert_eq!(loaded.best_run(), 2);
     assert_eq!(loaded.recent(), [1000, 1001, 1002]);
+    assert_eq!(loaded.active_at(), NOW);
 
     // A player has one random game: a save replaces it, whole.
     let wrong = TrackMeta::new("Ünder \"Pressure\" \\ 圧力", "", "Queen & 椎名林檎");
-    game.guess(&TrackMeta::new("The Song", "", "Someone"), &wrong)
+    game.guess(&TrackMeta::new("The Song", "", "Someone"), &wrong, NOW + 60)
         .unwrap();
     store.save_random_game(&player, &game).await.unwrap();
     assert_eq!(store.random_game(&player).await.unwrap(), Some(game));
 
     // A new session over it is a replacement like any other.
-    let again = RandomGame::start(store.random_game(&player).await.unwrap().as_ref(), 7, DAY);
+    let again = RandomGame::start(
+        store.random_game(&player).await.unwrap().as_ref(),
+        7,
+        DAY,
+        NOW + 3_600,
+    );
     store.save_random_game(&player, &again).await.unwrap();
     let loaded = store.random_game(&player).await.unwrap().unwrap();
     assert_eq!(loaded, again);

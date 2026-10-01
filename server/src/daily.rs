@@ -44,7 +44,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use jiff::civil::Date;
+use jiff::{Timestamp, civil::Date};
 use serde::Serialize;
 use tokio::sync::{Mutex, RwLock, RwLockReadGuard};
 
@@ -72,33 +72,36 @@ const RETRY_AFTER: Duration = Duration::from_secs(10);
 /// a song that went is read back from the disk cache.
 const SONGS_IN_MEMORY: usize = 32;
 
-/// Today's date in UTC.
-pub fn today_utc() -> Date {
-    jiff::Timestamp::now()
-        .to_zoned(jiff::tz::TimeZone::UTC)
-        .date()
-}
-
-/// Where the real date comes from. The server reads the wall clock; a test
-/// hands in a date of its own, so that nothing depends on when it runs (or
-/// on midnight passing in the middle of it).
+/// Where the real time comes from, and with it the real date. The server
+/// reads the wall clock; a test hands in a time of its own, so that nothing
+/// depends on when it runs (or on midnight passing in the middle of it).
+///
+/// One source for both, so that they cannot disagree: the date is the UTC
+/// date of the time.
 #[derive(Clone)]
-pub struct Clock(Arc<dyn Fn() -> Date + Send + Sync>);
+pub struct Clock(Arc<dyn Fn() -> Timestamp + Send + Sync>);
 
 impl Clock {
-    /// The wall clock: today's date in UTC.
+    /// The wall clock.
     pub fn utc() -> Self {
-        Self::new(today_utc)
+        Self::new(Timestamp::now)
     }
 
-    /// A clock that asks `real_day` for the date every time it is read.
-    pub fn new(real_day: impl Fn() -> Date + Send + Sync + 'static) -> Self {
-        Self(Arc::new(real_day))
+    /// A clock that asks `now` for the time every time it is read.
+    pub fn new(now: impl Fn() -> Timestamp + Send + Sync + 'static) -> Self {
+        Self(Arc::new(now))
     }
 
-    /// The real date, before the day offset.
-    pub fn real_day(&self) -> Date {
+    /// The real time. The day offset does not move it: it is what "half an
+    /// hour ago" is measured in, whatever day the admin has made it.
+    pub fn now(&self) -> Timestamp {
         (self.0)()
+    }
+
+    /// The real date, before the day offset: the UTC date of
+    /// [`now`](Self::now).
+    pub fn real_day(&self) -> Date {
+        self.now().to_zoned(jiff::tz::TimeZone::UTC).date()
     }
 }
 
@@ -335,6 +338,13 @@ impl Daily {
     /// are keyed to. Read it once per request.
     pub async fn today(&self) -> Result<Date, DailyError> {
         Ok(self.days().await?.today)
+    }
+
+    /// The real time, from the clock the real date comes from. Nothing about
+    /// the day depends on it; random mode measures a session's idle time in
+    /// it, which the admin's day offset must not touch.
+    pub fn now(&self) -> Timestamp {
+        self.clock.now()
     }
 
     // --- the day's songs ----------------------------------------------------------

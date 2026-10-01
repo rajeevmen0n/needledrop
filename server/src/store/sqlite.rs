@@ -1448,10 +1448,12 @@ mod tests {
     /// second skipped once.
     fn random_game() -> RandomGame {
         let song = crate::game::TrackMeta::new("The Song", "", "Someone");
-        let mut game = RandomGame::start(None, 916_424, date(2026, 10, 1));
-        game.guess(&song, &song).unwrap();
-        let mut game = game.next(3_135_556, date(2026, 10, 1)).unwrap();
-        game.skip().unwrap();
+        let mut game = RandomGame::start(None, 916_424, date(2026, 10, 1), 1_790_899_200);
+        game.guess(&song, &song, 1_790_899_260).unwrap();
+        let mut game = game
+            .next(3_135_556, date(2026, 10, 1), 1_790_899_270)
+            .unwrap();
+        game.skip(1_790_899_300).unwrap();
         game
     }
 
@@ -1478,7 +1480,10 @@ mod tests {
         let store = SqliteStore::open(&path).unwrap();
         // Saved twice: one row per player, however often it is replaced.
         store
-            .save_random_game(&player, &RandomGame::start(None, 7, date(2026, 10, 1)))
+            .save_random_game(
+                &player,
+                &RandomGame::start(None, 7, date(2026, 10, 1), 1_790_899_200),
+            )
             .await
             .unwrap();
         store.save_random_game(&player, &game).await.unwrap();
@@ -1491,7 +1496,7 @@ mod tests {
                 concat!(
                     r#"{"round":2,"track_id":3135556,"#,
                     r#""game":{"day":"2026-10-01","attempts":[{"kind":"skip"}],"status":"playing"},"#,
-                    r#""run":1,"played":1,"won":1,"best_run":1,"recent":[916424,3135556]}"#
+                    r#""run":1,"played":1,"won":1,"best_run":1,"recent":[916424,3135556],"active_at":1790899300}"#
                 )
                 .to_owned()
             )]

@@ -11,8 +11,10 @@
 // Random mode is the fifth tab. To the record, the rail, the controls and the
 // tries it is a game like the others (`GameView`); what differs is where it
 // comes from. It has no day: a new day leaves it alone. It belongs to a
-// session, which is this browser tab's (see `sessionMark`), and a song is
-// followed by the next one for as long as the player likes.
+// session, which is the player's and the server's to keep: every browser tab
+// of the player is in the same one, and the server ends it after half an hour
+// without playing. A song is followed by the next one for as long as the
+// player likes.
 
 import {
   ApiError,
@@ -44,7 +46,7 @@ import type {
 import { ClipPlayer } from './audio'
 import type { ClipProgress } from './audio'
 import { clipLabel } from './clip'
-import { remedyFor, sessionMark } from './random'
+import { remedyFor } from './random'
 import { RANDOM, SECTIONS, TABS, isSection, tabState } from './sections'
 import type { Tab, TabInfo, TabState } from './sections'
 
@@ -63,7 +65,7 @@ export interface TabMark {
 }
 
 const SONG_CHANGED = 'This song was changed in another tab, so that move did not count.'
-const SESSION_GONE = 'That game was no longer there. A new session has started.'
+const SESSION_ENDED = 'That session ended after a while away. This is a new one.'
 
 function describe(err: unknown): string {
   return err instanceof ApiError ? err.message : 'Something went wrong. Try again.'
@@ -72,9 +74,6 @@ function describe(err: unknown): string {
 function codeOf(err: unknown): string {
   return err instanceof ApiError ? err.code : ''
 }
-
-/** Whether this browser tab has a random session; see `sessionMark`. */
-const session = sessionMark(() => sessionStorage)
 
 /** What was last heard about one tab's game. */
 class TabGame<View extends GameView> {
@@ -465,13 +464,14 @@ export class Game {
         await this.fetchRandom()
         break
       case 'tell':
-        // Another tab has moved on to another song, or started a session of its own.
+        // Another tab of this player has moved on to another song.
         game.info = SONG_CHANGED
         await this.fetchRandom()
         break
       case 'restart':
-        // The server has no game for this browser any more (the data was cleared, the admin reset).
-        game.info = SESSION_GONE
+        // The session on screen is over: nothing was played for half an hour
+        // (or the data was cleared elsewhere, or the admin reset everything).
+        game.info = SESSION_ENDED
         await this.startSession()
         break
       case 'empty':
@@ -553,12 +553,12 @@ export class Game {
   }
 
   /**
-   * Asks for the random song this browser is on. A browser tab without a
-   * session starts one instead, and so does a session the server has no game
-   * for. `quiet` as in `fetchGame`.
+   * Asks for the session the player is in, whichever browser tab began it.
+   * When the server has none (they never played, or it ended while they were
+   * away), one is started: without a word when nothing was on screen, and
+   * saying so when a game was. `quiet` as in `fetchGame`.
    */
   private async fetchRandom(quiet = false): Promise<void> {
-    if (!session.known()) return this.startSession()
     const game = this.games.random
     const id = ++game.request
     const epoch = this.randomEpoch
@@ -576,8 +576,8 @@ export class Game {
     } catch (err) {
       if (epoch !== this.randomEpoch || id !== game.request) return
       if (remedyFor(codeOf(err)) === 'restart') {
-        // What is on screen, if anything, was a game the server no longer has.
-        if (game.view) game.info = SESSION_GONE
+        // What is on screen, if anything, is a session that has ended.
+        if (game.view) game.info = SESSION_ENDED
         void this.startSession()
       } else if (quiet) return // Stale but usable.
       else if (game.view) game.moveError = describe(err)
@@ -588,8 +588,9 @@ export class Game {
   }
 
   /**
-   * Starts a random session: a first song, the run and the totals at zero. One
-   * at a time, so a tab opened twice in a hurry starts one session and not two.
+   * Asks for the session to play in: a new one, with a first song and the run
+   * and the totals at zero, or the one another browser tab has begun in the
+   * meantime. One request at a time, so a tab opened twice in a hurry asks once.
    */
   private async startSession(): Promise<void> {
     const game = this.games.random
@@ -609,7 +610,6 @@ export class Game {
       if (epoch !== this.randomEpoch) return
       const song = await startRandom()
       if (epoch !== this.randomEpoch) return
-      session.keep()
       this.receiveRandom(song)
     } catch (err) {
       if (epoch !== this.randomEpoch) return
@@ -736,7 +736,7 @@ export class Game {
     }
   }
 
-  /** Drops the random game and this browser tab's session: the player it belonged to is gone. */
+  /** Drops the random game: the player it belonged to is gone. */
   private forgetRandom(): void {
     this.randomEpoch++
     if (this.tab === RANDOM) {
@@ -744,7 +744,6 @@ export class Game {
       this.fresh = false
     }
     this.games.random.forget()
-    session.drop()
   }
 
   /** The server says the section has no song today. */

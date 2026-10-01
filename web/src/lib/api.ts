@@ -197,17 +197,20 @@ function post<T>(path: string, body?: object): Promise<T> {
 }
 
 /**
- * The random song this browser is on. Fails with `no_game` when the server
- * has none for it: nothing was started yet, or the data was cleared.
+ * The random song the player is on, in whichever browser tab the session was
+ * begun. Fails with `no_game` when the server has no session for them:
+ * nothing was started yet, it ended after half an hour without playing, or
+ * the data was cleared.
  */
 export function getRandom(): Promise<RandomSong> {
   return request<RandomSong>('/api/random', { cache: 'no-store' })
 }
 
 /**
- * Starts a random session: the run and the totals are back to zero, whatever
- * song was being played is left behind, and a song is drawn. Can take as long
- * as a download.
+ * The random session to play in. When the player has one that is still going
+ * (another browser tab began it), that one, as it stands. Otherwise a new
+ * one: the run and the totals are back to zero and a song is drawn, which can
+ * take as long as a download.
  */
 export function startRandom(): Promise<RandomSong> {
   return post<RandomSong>('/api/random/start')

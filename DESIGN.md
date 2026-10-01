@@ -154,7 +154,12 @@ the stacked layouts, so a phone reaches it without scrolling past the cover;
 in the side layout it stands beside the play control of the reveal. Either
 way it is before the score and the history. The score is the same line of
 four figures (run, best ever, played, won) and has no bars: only the longest
-run is kept beyond the session.
+run is kept beyond the session. A session is the player's, not a browser
+tab's: a second tab opens the same song and score, and half an hour without
+playing ends it. The page never counts the time down; coming back to an ended
+session shows a new song under the line "That session ended after a while
+away. This is a new one.", and the rules line under a finished song says how
+long a session lasts.
 
 The admin page at `/admin` is a tool for one person and is plain on purpose:
 the same black, type and tokens, with no sky, no record and no sound. One
@@ -261,7 +266,7 @@ play" the same way. Next song is a primary button that keeps its width while
 the next song is found ("Finding…") and cannot be pressed twice; when the song
 arrives the keyboard focus goes to the play control, never to the search
 field, which would raise a phone's keyboard. News the player did not cause (the song was replaced,
-the day changed) is one ivory line with a champagne rule at its left, above
+the day changed, a random session ended while they were away) is one ivory line with a champagne rule at its left, above
 the game, and is announced once.
 
 SongCombobox owns the song search drop-down for the game and for the admin

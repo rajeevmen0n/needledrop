@@ -24,7 +24,10 @@ use axum::{
     routing::get,
 };
 use axum_extra::extract::cookie::{Cookie, Key, PrivateCookieJar};
-use jiff::civil::{Date, date};
+use jiff::{
+    Timestamp,
+    civil::{Date, date},
+};
 use serde_json::{Value, json};
 use tokio::{net::TcpListener, task::JoinHandle};
 use tower::ServiceExt;
@@ -325,25 +328,47 @@ pub const LAUNCH: Date = date(2026, 10, 1);
 /// when midnight passes in the middle of it.
 pub const TODAY: Date = date(2026, 10, 3);
 
-/// The real date, as a test sets it.
+/// The real time, as a test sets it. It stands still until the test moves
+/// it, so nothing depends on how long a test takes.
 #[derive(Clone)]
-pub struct TestClock(Arc<Mutex<Date>>);
+pub struct TestClock(Arc<Mutex<Timestamp>>);
 
 impl TestClock {
+    /// A clock that says noon (UTC) on `day`.
     pub fn new(day: Date) -> Self {
-        Self(Arc::new(Mutex::new(day)))
+        Self(Arc::new(Mutex::new(noon(day))))
     }
 
-    /// Makes it another day: a real midnight, or several.
+    /// Makes it another day, at noon: a real midnight, or several.
     pub fn set(&self, day: Date) {
-        *self.0.lock().unwrap() = day;
+        *self.0.lock().unwrap() = noon(day);
     }
 
-    /// The clock a [`Daily`] reads this date through.
-    pub fn clock(&self) -> Clock {
-        let day = Arc::clone(&self.0);
-        Clock::new(move || *day.lock().unwrap())
+    /// Lets `minutes` pass (or takes them back, when negative: a clock that
+    /// was corrected). From noon, a few hours stay on the same day.
+    pub fn advance_minutes(&self, minutes: i64) {
+        let mut now = self.0.lock().unwrap();
+        *now += jiff::SignedDuration::from_mins(minutes);
     }
+
+    /// The time it says.
+    pub fn now(&self) -> Timestamp {
+        *self.0.lock().unwrap()
+    }
+
+    /// The clock a [`Daily`] reads this time through.
+    pub fn clock(&self) -> Clock {
+        let now = Arc::clone(&self.0);
+        Clock::new(move || *now.lock().unwrap())
+    }
+}
+
+/// Noon on `day`, in UTC.
+fn noon(day: Date) -> Timestamp {
+    day.at(12, 0, 0, 0)
+        .to_zoned(jiff::tz::TimeZone::UTC)
+        .unwrap()
+        .timestamp()
 }
 
 /// The whole router over a Deezer stand-in, a store the test can reach, a
@@ -644,7 +669,8 @@ impl Player {
         self.get("/api/random/audio").await
     }
 
-    /// `POST /api/random/start`, with no body: a new session.
+    /// `POST /api/random/start`, with no body: the session to play in, a new
+    /// one unless one is still going.
     pub async fn random_start(&mut self) -> Reply {
         let request = Request::post("/api/random/start")
             .body(Body::empty())

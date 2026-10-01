@@ -3,17 +3,15 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import {
-  SESSION_KEY,
   remedyFor,
   runCount,
   runLine,
   scoreFigures,
-  sessionMark,
   songLine,
   songNumber,
   winPercent,
 } from '../src/lib/random.ts'
-import type { MarkStorage, RandomScore } from '../src/lib/random.ts'
+import type { RandomScore } from '../src/lib/random.ts'
 
 const NONE: RandomScore = { run: 0, bestRun: 0, played: 0, won: 0 }
 const SOME: RandomScore = { run: 3, bestRun: 7, played: 8, won: 6 }
@@ -125,7 +123,7 @@ test('a move for a song that is no longer played is told, and the game loaded ag
   assert.equal(remedyFor('changed'), 'tell')
 })
 
-test('a game the server no longer has starts a new session', () => {
+test('a session that has ended, or never was, asks for the session to play in', () => {
   assert.equal(remedyFor('no_game'), 'restart')
 })
 
@@ -137,91 +135,4 @@ test('every other failure is reported and changes nothing', () => {
   for (const code of ['upstream', 'internal', 'bad_request', 'unknown_track', 'network', 'bad_response', '']) {
     assert.equal(remedyFor(code), 'report', code)
   }
-})
-
-// --- the session mark ---------------------------------------------------------------
-
-/** A `sessionStorage` stand-in over a map the test can look into. */
-function storageOver(items: Map<string, string>): MarkStorage {
-  return {
-    getItem: (key) => items.get(key) ?? null,
-    setItem: (key, value) => void items.set(key, value),
-    removeItem: (key) => void items.delete(key),
-  }
-}
-
-test('a browser tab has no session until one is started', () => {
-  const mark = sessionMark(() => storageOver(new Map()))
-  assert.equal(mark.known(), false)
-})
-
-test('a started session is kept under the key and known', () => {
-  const items = new Map<string, string>()
-  const mark = sessionMark(() => storageOver(items))
-  mark.keep()
-  assert.equal(mark.known(), true)
-  assert.equal(SESSION_KEY, 'nd_random')
-  assert.equal(items.has(SESSION_KEY), true)
-})
-
-test('a reload finds the session of the same browser tab', () => {
-  const items = new Map<string, string>()
-  sessionMark(() => storageOver(items)).keep()
-  // The page is loaded again: a new mark over the same storage.
-  assert.equal(sessionMark(() => storageOver(items)).known(), true)
-})
-
-test('a dropped session is gone, for this page and the next', () => {
-  const items = new Map<string, string>()
-  const mark = sessionMark(() => storageOver(items))
-  mark.keep()
-  mark.drop()
-  assert.equal(mark.known(), false)
-  assert.equal(items.has(SESSION_KEY), false)
-  assert.equal(sessionMark(() => storageOver(items)).known(), false)
-})
-
-test('without storage the session lasts as long as the page', () => {
-  for (const storage of [() => null, () => undefined]) {
-    const mark = sessionMark(storage)
-    assert.equal(mark.known(), false)
-    mark.keep()
-    assert.equal(mark.known(), true)
-    mark.drop()
-    assert.equal(mark.known(), false)
-    // The next page load has nothing to find.
-    assert.equal(sessionMark(storage).known(), false)
-  }
-})
-
-test('storage that throws breaks nothing', () => {
-  const blocked = (): MarkStorage => {
-    throw new Error('The operation is insecure.')
-  }
-  const mark = sessionMark(blocked)
-  assert.equal(mark.known(), false)
-  assert.doesNotThrow(() => mark.keep())
-  assert.equal(mark.known(), true)
-  assert.doesNotThrow(() => mark.drop())
-  assert.equal(mark.known(), false)
-})
-
-test('storage whose methods throw breaks nothing either', () => {
-  const full: MarkStorage = {
-    getItem: () => {
-      throw new Error('denied')
-    },
-    setItem: () => {
-      throw new Error('quota')
-    },
-    removeItem: () => {
-      throw new Error('denied')
-    },
-  }
-  const mark = sessionMark(() => full)
-  assert.equal(mark.known(), false)
-  assert.doesNotThrow(() => mark.keep())
-  assert.equal(mark.known(), true)
-  assert.doesNotThrow(() => mark.drop())
-  assert.equal(mark.known(), false)
 })

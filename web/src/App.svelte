@@ -267,8 +267,8 @@
             {#if !game.finished}
               Each skip or wrong guess unlocks a longer clip.
             {:else if game.random}
-              A miss ends the run. Closing this tab ends the session; your best
-              run is kept.
+              A miss ends the run. A session ends after half an hour away; your
+              best run is kept.
             {:else if more}
               {label} is back tomorrow. Today's other sections are still open.
             {:else}
