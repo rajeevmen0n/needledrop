@@ -21,6 +21,7 @@
 //!
 //! [`contract`] holds the test suite every backend has to pass.
 
+#[cfg(test)]
 mod memory;
 mod seed;
 mod sqlite;
@@ -35,8 +36,10 @@ use jiff::civil::Date;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 #[cfg(test)]
+pub use self::memory::MemoryStore;
+#[cfg(test)]
 pub use self::seed::SEED_SONGS;
-pub use self::{memory::MemoryStore, seed::seed_if_empty, sqlite::SqliteStore};
+pub use self::{seed::seed_if_empty, sqlite::SqliteStore};
 use crate::{config::StoreKind, game::GameState};
 
 /// A genre a song can be tagged with. Each one is also a daily section whose
@@ -448,8 +451,8 @@ fn decode_game(player: &PlayerId, section: Section, day: &str, json: &str) -> Op
     }
 }
 
-/// Opens the backend the config names. For SQLite that is the file at
-/// `database` (`Config::store_path`): its directory and the file itself are
+/// Opens the requested backend. For SQLite that is the file at
+/// `database` (`Config::store_path()`): its directory and the file itself are
 /// created when they are missing and the schema is brought up to date; a
 /// database that cannot be used is an error, so the server stops at startup
 /// instead of failing on the first request. The in-memory backend has no file
@@ -457,6 +460,7 @@ fn decode_game(player: &PlayerId, section: Section, day: &str, json: &str) -> Op
 pub fn open(kind: StoreKind, database: &Path) -> Result<Arc<dyn Store>, StoreError> {
     Ok(match kind {
         StoreKind::Sqlite => Arc::new(SqliteStore::open(database)?),
+        #[cfg(test)]
         StoreKind::Memory => Arc::new(MemoryStore::new()),
     })
 }

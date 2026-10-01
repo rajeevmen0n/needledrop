@@ -539,7 +539,7 @@ fn serve(
 /// A browser: it keeps the player cookie between requests.
 pub struct Player {
     pub app: Router,
-    /// `gts_player=<value>`, as last set by the server.
+    /// `nd_player=<value>`, as last set by the server.
     pub cookie: Option<String>,
 }
 

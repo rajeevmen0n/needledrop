@@ -1007,7 +1007,7 @@ mod tests {
         assert_eq!(reply.header(header::CACHE_CONTROL), "no-store");
         // The cookie that comes with it is `player::tests`' subject; here it
         // only matters that it gives nothing away.
-        assert!(reply.header(header::SET_COOKIE).starts_with("gts_player="));
+        assert!(reply.header(header::SET_COOKIE).starts_with("nd_player="));
         reply.assert_no_secrets();
     }
 
@@ -2341,7 +2341,7 @@ mod tests {
         assert_eq!(harness.deezer.api_hits(), 0);
         assert_eq!(harness.store.picks_on(TODAY).await.unwrap(), Vec::new());
         // Like the daily state, it makes a browser a player.
-        assert!(reply.header(header::SET_COOKIE).starts_with("gts_player="));
+        assert!(reply.header(header::SET_COOKIE).starts_with("nd_player="));
         let id = harness.player_id(&player).unwrap();
 
         // One section's game asked for: the sections up to it in the pick

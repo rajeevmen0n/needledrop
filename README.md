@@ -16,13 +16,13 @@ just dev             # server with auto-reload + Vite dev server; Ctrl-C stops b
 
 | What | Where |
 |---|---|
-| Rust API | http://127.0.0.1:4810 (`GTS_BIND` overrides it) |
+| Rust API | http://127.0.0.1:4810 (`ND_BIND` overrides it) |
 | Vite dev server | http://127.0.0.1:4811 (proxies `/api` to the API) — open this one |
 
-Both bind `127.0.0.1` only. To reach the game under a public hostname, put a TLS-terminating reverse proxy in front (`/` → 4811, `/api/` → 4810) and set `public_url` to that address in `config.local.toml` (git-ignored; a copy of `config.toml` with the blank `public_url` filled in) or in `GTS_PUBLIC_URL`. It is the only place the hostname is written, both servers read it, and it is never committed. `AGENTS.md` has the details.
+Both bind `127.0.0.1` only. To reach the game under a public hostname, put a TLS-terminating reverse proxy in front (`/` → 4811, `/api/` → 4810) and set `ND_PUBLIC_URL=https://needledrop.example` for both processes. Vite uses it to accept the public host and connect hot reload. `AGENTS.md` has the details.
 
 Other recipes: `just server`, `just web`, `just test`, `just check`, `just build`, `just fmt`. Run `just` to list them.
 
-Settings live in `config.toml`; one machine's own go in `config.local.toml` next to it, which wins and is git-ignored. `AGENTS.md` has the architecture, conventions and current progress.
+Runtime settings use environment variables. `ND_BIND` defaults to `127.0.0.1:4810`, `ND_DATA_DIR` defaults to `data`, and `ND_PUBLIC_URL` is unset by default. The launch date is fixed at 2026-10-01 and the store is SQLite. `AGENTS.md` has the architecture, conventions and current progress.
 
-For a deployment, put the whole runtime data directory on persistent storage by setting `data_dir = "/mnt/needledrop"` in `config.local.toml`, or by setting `GTS_DATA_DIR=/mnt/needledrop` in the server environment. The environment variable wins over either config file. The server stores cached previews and its cookie key there, and uses `<data_dir>/needledrop.db` for SQLite when `[store] path` is blank. If `[store] path` or `GTS_STORE_PATH` names a database file, that file stays at its configured location. Keep the existing data when changing the directory so returning players retain their games.
+For a deployment, set `ND_DATA_DIR=/var/lib/needledrop` in the server environment. The server stores cached previews, its cookie key, and `needledrop.db` there. Copy existing data before changing the directory to retain the song pool and game records. The renamed `nd_player` cookie gives existing browsers a fresh player ID on their first visit after this release.

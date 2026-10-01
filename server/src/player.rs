@@ -32,7 +32,7 @@ use crate::{
 /// The cookie of the first version of the game, `gts_daily`, held the whole
 /// game state. It is not read any more, and it expires by itself two days
 /// after it was last set.
-pub(crate) const COOKIE_NAME: &str = "gts_player";
+pub(crate) const COOKIE_NAME: &str = "nd_player";
 
 /// How long a browser keeps the cookie after a visit. Every visit sets it
 /// again, so it only runs out for a player who stays away this long. 400 days
@@ -188,20 +188,14 @@ pub struct KeyFormatError;
 
 /// The key the player cookie is encrypted with.
 ///
-/// `secret` is `GTS_SECRET`: 128 hexadecimal characters, that is 64 random
-/// bytes (`openssl rand -hex 64`). Without it the key lives in
-/// `<data_dir>/secret.key`, in the same format, and is generated on the first
-/// start. The file is created readable by its owner only.
+/// The key lives in `<data_dir>/secret.key` as 128 hexadecimal characters
+/// (64 random bytes), and is generated on the first start. The file is
+/// created readable by its owner only.
 ///
 /// Changing the key makes every existing cookie undecryptable, which the game
 /// treats as "no cookie": each browser becomes a new player. The games of the
 /// old ones stay in the database, out of anyone's reach.
-pub fn session_key(secret: Option<&str>, data_dir: &Path) -> anyhow::Result<Key> {
-    if let Some(secret) = secret {
-        // The error does not repeat the value: it would end up in the log.
-        return parse_key(secret).context("GTS_SECRET is not a usable cookie key");
-    }
-
+pub fn session_key(data_dir: &Path) -> anyhow::Result<Key> {
     let path = data_dir.join(KEY_FILE);
     match std::fs::read_to_string(&path) {
         Ok(text) => parse_key(&text).with_context(|| {
@@ -307,7 +301,7 @@ mod tests {
         let cookies: Vec<_> = reply.headers.get_all(header::SET_COOKIE).iter().collect();
         assert_eq!(cookies.len(), 1, "{cookies:?}");
         let cookie = reply.header(header::SET_COOKIE);
-        assert!(cookie.starts_with("gts_player="), "{cookie}");
+        assert!(cookie.starts_with("nd_player="), "{cookie}");
         // 400 days, the longest a browser keeps a cookie.
         for attribute in ["HttpOnly", "SameSite=Lax", "Path=/", "Max-Age=34560000"] {
             assert!(cookie.contains(attribute), "{attribute} missing: {cookie}");
@@ -408,16 +402,16 @@ mod tests {
 
         for garbage in [
             // Not a cookie this server made.
-            "gts_player=not-even-base64!!".to_owned(),
-            "gts_player=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            "nd_player=not-even-base64!!".to_owned(),
+            "nd_player=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
             // A bare ID: the client names a player without the key.
-            format!("gts_player={id}"),
+            format!("nd_player={id}"),
             // A real cookie with its end cut off.
             real[..real.len() - 6].to_owned(),
             // Properly encrypted, but what is inside is not an ID.
-            harness.cookie_holding("gts_player", "not-an-id"),
-            harness.cookie_holding("gts_player", &id.as_str().to_uppercase()),
-            harness.cookie_holding("gts_player", ""),
+            harness.cookie_holding("nd_player", "not-an-id"),
+            harness.cookie_holding("nd_player", &id.as_str().to_uppercase()),
+            harness.cookie_holding("nd_player", ""),
         ] {
             player.cookie = Some(garbage.clone());
             let reply = player.get("/api/daily/general").await;
@@ -477,7 +471,7 @@ mod tests {
         // The only cookie set is the player's; the old one is left to expire.
         let cookies: Vec<_> = reply.headers.get_all(header::SET_COOKIE).iter().collect();
         assert_eq!(cookies.len(), 1, "{cookies:?}");
-        assert!(reply.header(header::SET_COOKIE).starts_with("gts_player="));
+        assert!(reply.header(header::SET_COOKIE).starts_with("nd_player="));
     }
 
     // --- DELETE /api/player -------------------------------------------------
@@ -586,7 +580,7 @@ mod tests {
         other.skip().await;
 
         let mut player = harness.player();
-        for cookie in [None, Some("gts_player=garbage".to_owned())] {
+        for cookie in [None, Some("nd_player=garbage".to_owned())] {
             player.cookie = cookie;
             let reply = player.clear().await;
             assert_eq!(reply.status, StatusCode::NO_CONTENT);
@@ -742,7 +736,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let data_dir = dir.path().join("data");
 
-        let first = session_key(None, &data_dir).unwrap();
+        let first = session_key(&data_dir).unwrap();
         let path = data_dir.join("secret.key");
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text.trim().len(), 128);
@@ -750,36 +744,9 @@ mod tests {
         assert_eq!(mode & 0o777, 0o600);
 
         // A restart reads the same key, so cookies survive it.
-        let second = session_key(None, &data_dir).unwrap();
+        let second = session_key(&data_dir).unwrap();
         assert_eq!(first.master(), second.master());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
-    }
-
-    #[test]
-    fn the_secret_variable_wins_and_writes_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-        let secret = "0123456789abcdef".repeat(8);
-        let key = session_key(Some(&secret), dir.path()).unwrap();
-        assert_eq!(encode_hex(key.master()), secret);
-        assert!(!dir.path().join("secret.key").exists());
-
-        // The key file's own format works as the variable, newline and all.
-        let generated = session_key(None, dir.path()).unwrap();
-        let text = std::fs::read_to_string(dir.path().join("secret.key")).unwrap();
-        let from_env = session_key(Some(&text), dir.path()).unwrap();
-        assert_eq!(generated.master(), from_env.master());
-    }
-
-    #[test]
-    fn an_unusable_secret_is_an_error_that_does_not_repeat_it() {
-        let dir = tempfile::tempdir().unwrap();
-        for secret in ["hunter2", &"ab".repeat(63), &"zz".repeat(64)] {
-            let error = session_key(Some(secret), dir.path()).unwrap_err();
-            let message = format!("{error:#}");
-            assert!(message.contains("GTS_SECRET"), "{message}");
-            assert!(message.contains("128 hexadecimal"), "{message}");
-            assert!(!message.contains(secret), "{message}");
-        }
     }
 
     #[test]
@@ -788,7 +755,7 @@ mod tests {
         let path = dir.path().join("secret.key");
         std::fs::write(&path, "truncated").unwrap();
 
-        let error = session_key(None, dir.path()).unwrap_err();
+        let error = session_key(dir.path()).unwrap_err();
         assert!(format!("{error:#}").contains("secret.key"), "{error:#}");
         // Left alone for the operator to look at.
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "truncated");

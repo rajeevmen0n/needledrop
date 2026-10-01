@@ -2,9 +2,7 @@
   // The admin page: the clock, today's picks with the re-roll, adding a song
   // from Deezer, and finding a song in the pool to change or remove it. main.ts mounts it for /admin and never the game, and fetches
   // it only there, so nothing here is in the player's bundle.
-  //
-  // It is a tool for one person and it is not protected: whoever can open it
-  // sees the day's answers and can change everything.
+  // The deployment's reverse proxy protects this page and /api/admin/.
   import './lib/admin/admin.css'
   import AddSong from './lib/admin/AddSong.svelte'
   import ClockPanel from './lib/admin/ClockPanel.svelte'
@@ -26,10 +24,6 @@
       <h1>Needledrop <span>admin</span></h1>
       <a class="back" href="/">Back to the game</a>
     </div>
-    <p class="open">
-      This page is not protected. Anyone who can reach it sees today's answers
-      and can change everything on it.
-    </p>
   </header>
   <main>
     {#if desk.state}
@@ -87,12 +81,6 @@
     align-items: center;
     min-height: var(--target);
     font-size: 0.875rem;
-  }
-
-  .open {
-    max-width: 44rem;
-    color: var(--muted);
-    font-size: var(--text-small);
   }
 
   main {

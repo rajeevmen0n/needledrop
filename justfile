@@ -1,5 +1,5 @@
 # Run everything from inside the dev shell: `nix develop -c just <recipe>`.
-# All recipes run from the repo root, so the server finds `config.toml` and `data/` there.
+# All recipes run from the repo root, so the default `data/` directory is here.
 
 manifest := "--manifest-path server/Cargo.toml"
 

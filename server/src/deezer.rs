@@ -24,7 +24,7 @@ const API_BASE: &str = "https://api.deezer.com";
 /// The start of the user agent sent with every request, so Deezer can tell
 /// who is calling. [`user_agent`] adds where the game lives, when that is
 /// configured.
-const USER_AGENT: &str = concat!("guessthesong/", env!("CARGO_PKG_VERSION"));
+const USER_AGENT: &str = concat!("needledrop/", env!("CARGO_PKG_VERSION"));
 
 /// The user agent of a server whose game is at `public_url`: the conventional
 /// `name/version (+contact URL)`, or the name and version alone for a server
@@ -467,10 +467,10 @@ mod tests {
     #[test]
     fn the_user_agent_names_the_public_address_when_there_is_one() {
         let version = env!("CARGO_PKG_VERSION");
-        assert_eq!(user_agent(None), format!("guessthesong/{version}"));
+        assert_eq!(user_agent(None), format!("needledrop/{version}"));
         assert_eq!(
             user_agent(Some("https://needledrop.example")),
-            format!("guessthesong/{version} (+https://needledrop.example)")
+            format!("needledrop/{version} (+https://needledrop.example)")
         );
     }
 
