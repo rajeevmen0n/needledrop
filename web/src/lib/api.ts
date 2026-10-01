@@ -1,7 +1,12 @@
 // Typed fetch wrappers for the server's `/api` routes.
 //
-// The game state lives in an HttpOnly cookie the server sets. Same-origin
-// `fetch` sends it by itself, so nothing here handles it.
+// Who is playing is an HttpOnly cookie the server sets. Same-origin `fetch`
+// sends it by itself, so nothing here handles it.
+
+import type { Section, TabInfo } from './sections'
+import type { Stats } from './stats'
+
+export type { Section, Stats }
 
 export type Status = 'playing' | 'won' | 'lost'
 
@@ -18,11 +23,13 @@ export interface Answer {
   link: string
 }
 
+/** One section's game today. */
 export interface Daily {
-  /** UTC date, "2026-10-01". */
+  /** The server's day, "2026-10-01". */
   day: string
   /** 1 on launch day. */
   number: number
+  section: Section
   /** Clip length in seconds for each turn. */
   ladder: number[]
   attempts: Attempt[]
@@ -30,6 +37,21 @@ export interface Daily {
   /** The clip length unlocked right now; the last ladder step once finished. */
   clipSeconds: number
   answer: Answer | null
+  /** The player's record in this section, in every state. */
+  stats: Stats
+}
+
+/** One section in the overview: where the player stands there today, and whether it has a song. */
+export interface TodaySection extends TabInfo {
+  section: Section
+}
+
+/** The overview behind the tabs. Nothing in it comes from a song. */
+export interface Today {
+  day: string
+  number: number
+  /** One entry per section, in tab order. */
+  sections: TodaySection[]
 }
 
 /** One autocomplete result. */
@@ -46,9 +68,10 @@ export type Move = { trackId: number } | { skip: true }
 
 /**
  * A failed request. `code` is the server's `error` field (`bad_request`,
- * `unknown_track`, `finished`, `upstream`) or one made up here: `network` when
- * nothing answered, `bad_response` when the answer was not the expected JSON.
- * `message` is a sentence fit to show the player.
+ * `unknown_track`, `not_found`, `no_song`, `finished`, `changed`, `upstream`,
+ * `internal`) or one made up here: `network` when nothing answered,
+ * `bad_response` when the answer was not the expected JSON. `message` is a
+ * sentence fit to show the player.
  */
 export class ApiError extends Error {
   readonly code: string
@@ -83,7 +106,8 @@ async function errorFrom(res: Response): Promise<ApiError> {
   return new ApiError('bad_response', 'The server had a problem. Try again in a moment.', res.status)
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+/** Sends a request and hands back the response if the server said yes. */
+async function send(path: string, init?: RequestInit): Promise<Response> {
   let res: Response
   try {
     res = await fetch(path, init)
@@ -93,6 +117,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     throw new ApiError('network', "Couldn't reach the server. Check your connection and try again.", 0)
   }
   if (!res.ok) throw await errorFrom(res)
+  return res
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await send(path, init)
   try {
     return (await res.json()) as T
   } catch (err) {
@@ -101,18 +130,34 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   }
 }
 
-/** Today's game as the cookie has it. A page reload restores the game from this alone. */
-export function getDaily(): Promise<Daily> {
-  return request<Daily>('/api/daily', { cache: 'no-store' })
+/** Where the player stands in each of today's four games. Fast: it never waits for a song. */
+export function getToday(): Promise<Today> {
+  return request<Today>('/api/today', { cache: 'no-store' })
 }
 
-/** Skip or guess. Resolves with the game after the move. */
-export function postGuess(move: Move): Promise<Daily> {
-  return request<Daily>('/api/daily/guess', {
+/**
+ * A section's game today. A page reload restores the game from this alone.
+ * The first request of a day can take seconds: that is when the song is picked.
+ */
+export function getDaily(section: Section): Promise<Daily> {
+  return request<Daily>(`/api/daily/${section}`, { cache: 'no-store' })
+}
+
+/** Skip or guess in a section. Resolves with the game after the move. */
+export function postGuess(section: Section, move: Move): Promise<Daily> {
+  return request<Daily>(`/api/daily/${section}/guess`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(move),
   })
+}
+
+/**
+ * Clear my data: deletes every game stored for this browser and makes it a
+ * new player. The day's songs stay the same.
+ */
+export async function clearPlayer(): Promise<void> {
+  await send('/api/player', { method: 'DELETE' })
 }
 
 /** Up to 8 songs matching the text; none for fewer than 2 characters. */
@@ -121,9 +166,10 @@ export function searchTracks(query: string, signal?: AbortSignal): Promise<Track
 }
 
 /**
- * Where the currently unlocked clip is. The audio changes after every move
- * while the path stays the same, so the query makes each state its own URL.
+ * Where a game's currently unlocked clip is. The audio changes after every
+ * move and every midnight while the path stays the same, so the query, which
+ * the server ignores, makes each state its own URL.
  */
 export function audioUrl(daily: Daily): string {
-  return `/api/daily/audio?t=${daily.attempts.length}-${daily.status}`
+  return `/api/daily/${daily.section}/audio?t=${daily.day}-${daily.attempts.length}-${daily.status}`
 }

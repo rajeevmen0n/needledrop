@@ -191,6 +191,31 @@ button:disabled {
   transform: translateY(1px);
 }
 
+/* A quiet text button for things at the edge of the page: the footer's switches. */
+.quiet-button {
+  min-height: var(--target);
+  padding: 0 var(--space-2);
+  border-radius: 4px;
+  color: var(--muted);
+  font-size: 0.75rem;
+  white-space: nowrap;
+}
+
+.quiet-button:disabled {
+  opacity: 0.6;
+}
+
+@media (hover: hover) {
+  .quiet-button:not(:disabled):hover {
+    background: var(--surface);
+    color: var(--paper);
+  }
+}
+
+.quiet-button:not(:disabled):active {
+  transform: translateY(1px);
+}
+
 /* Ivory focus with a dark gap stays visible on every interactive surface. */
 :focus-visible {
   outline: 3px solid var(--paper);

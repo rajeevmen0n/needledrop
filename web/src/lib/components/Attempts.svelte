@@ -1,8 +1,11 @@
 <script lang="ts">
   // The seven tries, one row each, in the order of the record's bands. Every
   // state has its own mark and words, so none is told apart by colour alone.
+  //
+  // While the game is open the heading also carries the section's streak.
   import { clipShort } from '../clip'
   import type { Game } from '../game.svelte'
+  import { streakLine } from '../stats'
 
   let { game }: { game: Game } = $props()
 </script>
@@ -12,7 +15,10 @@
     {game.finished
       ? 'Your listening notes'
       : `Try ${game.turn} of ${game.ladder.length}`}<span
-      >{game.finished ? "Today's pressing" : 'Trust your ears'}</span
+      class="numeric"
+      >{game.finished
+        ? "Today's pressing"
+        : streakLine(game.stats) || 'Trust your ears'}</span
     >
   </h2>
   <ol>

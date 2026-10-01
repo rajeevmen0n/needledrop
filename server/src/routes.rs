@@ -48,13 +48,6 @@ use crate::{
     store::{PlayerId, Section, Store, StoreError},
 };
 
-/// The section the routes without a section in their address play.
-///
-/// LEGACY, to be removed with those routes by task 13: the web client that
-/// was written before there were sections calls `/api/daily`,
-/// `/api/daily/audio` and `/api/daily/guess`.
-const LEGACY_SECTION: Section = Section::General;
-
 /// Autocomplete rows sent to the client.
 const SEARCH_RESULTS: usize = 8;
 
@@ -168,14 +161,6 @@ pub fn router(state: AppState) -> Router {
         .route("/api/daily/{section}", get(daily))
         .route("/api/daily/{section}/audio", get(audio))
         .route("/api/daily/{section}/guess", post(guess))
-        // LEGACY: the three routes of the client from before the sections,
-        // as aliases of the General section. Task 13 removes them. "audio"
-        // and "guess" are not section slugs, and the router prefers a fixed
-        // segment to `{section}`, so the two sets do not get in each other's
-        // way.
-        .route("/api/daily", get(legacy_daily))
-        .route("/api/daily/audio", get(legacy_audio))
-        .route("/api/daily/guess", post(legacy_guess))
         .route("/api/player", delete(player::clear))
         .route("/api/search", get(search))
         .merge(admin::routes())
@@ -589,15 +574,6 @@ async fn daily(
     show_game(&app, named(section)?, jar, headers).await
 }
 
-/// LEGACY alias of `GET /api/daily/general`; see [`LEGACY_SECTION`].
-async fn legacy_daily(
-    State(app): State<AppState>,
-    jar: PrivateCookieJar,
-    headers: HeaderMap,
-) -> Result<Response, ApiError> {
-    show_game(&app, LEGACY_SECTION, jar, headers).await
-}
-
 async fn show_game(
     app: &AppState,
     section: Section,
@@ -643,14 +619,6 @@ async fn audio(
     jar: PrivateCookieJar,
 ) -> Result<Response, ApiError> {
     play_clip(&app, named(section)?, jar).await
-}
-
-/// LEGACY alias of `GET /api/daily/general/audio`; see [`LEGACY_SECTION`].
-async fn legacy_audio(
-    State(app): State<AppState>,
-    jar: PrivateCookieJar,
-) -> Result<Response, ApiError> {
-    play_clip(&app, LEGACY_SECTION, jar).await
 }
 
 async fn play_clip(
@@ -726,16 +694,6 @@ async fn guess(
     body: Result<Json<GuessRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     make_move(&app, named(section)?, jar, headers, body).await
-}
-
-/// LEGACY alias of `POST /api/daily/general/guess`; see [`LEGACY_SECTION`].
-async fn legacy_guess(
-    State(app): State<AppState>,
-    jar: PrivateCookieJar,
-    headers: HeaderMap,
-    body: Result<Json<GuessRequest>, JsonRejection>,
-) -> Result<Response, ApiError> {
-    make_move(&app, LEGACY_SECTION, jar, headers, body).await
 }
 
 async fn make_move(
@@ -2788,65 +2746,55 @@ mod tests {
         assert_eq!(harness.store.pick_history(POP).await.unwrap().len(), 2);
     }
 
-    // --- the legacy routes ----------------------------------------------------
+    // --- the routes from before the sections -----------------------------------
 
     #[tokio::test]
-    async fn the_routes_without_a_section_are_the_general_section() {
+    async fn the_routes_without_a_section_are_gone() {
         let harness = four_sections().await;
         let mut player = harness.player();
 
-        // LEGACY: the client from before the sections. Task 13 removes
-        // these routes, and this test with them.
-        let reply = player.get("/api/daily").await;
+        // The client from before the sections asked for these three. They
+        // were aliases of General until the client moved to the per-section
+        // routes; now they are addresses like any other the server lacks.
+        player
+            .get("/api/daily")
+            .await
+            .assert_error(StatusCode::NOT_FOUND, "not_found");
+        player
+            .get("/api/daily/")
+            .await
+            .assert_error(StatusCode::NOT_FOUND, "not_found");
+        // "audio" and "guess" are read as section slugs, which they are not.
+        player
+            .get("/api/daily/audio?t=0-playing")
+            .await
+            .assert_error(StatusCode::NOT_FOUND, "not_found");
+        player
+            .get("/api/daily/guess")
+            .await
+            .assert_error(StatusCode::NOT_FOUND, "not_found");
+        // A move sent to the old address finds no route, or one ("guess" as
+        // a section's game) that has no POST: axum's 405 with an empty body,
+        // as for any method a route does not have.
+        let skip = json!({ "skip": true }).to_string();
+        player
+            .post_to("/api/daily", "application/json", skip.clone())
+            .await
+            .assert_error(StatusCode::NOT_FOUND, "not_found");
+        let reply = player
+            .post_to("/api/daily/guess", "application/json", skip)
+            .await;
+        assert_eq!(reply.status, StatusCode::METHOD_NOT_ALLOWED);
+        assert!(reply.body.is_empty());
+
+        // None of it was a visit or a move: no cookie, no pick, no game.
+        assert_eq!(player.cookie, None);
+        assert_eq!(harness.deezer.api_hits(), 0);
+        assert_eq!(harness.store.picks_on(TODAY).await.unwrap(), Vec::new());
+        // The section's own routes are where the game is.
+        let reply = player.daily(Section::General).await;
         assert_eq!(reply.status, StatusCode::OK);
         assert_eq!(reply.json()["section"], "general");
-        assert!(reply.header(header::SET_COOKIE).starts_with("gts_player="));
-        reply.assert_no_secrets();
-        assert_eq!(reply.json(), player.daily(Section::General).await.json());
-
-        // A move through the old route is a move in General...
-        let request = |body: Value| {
-            Request::post("/api/daily/guess")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap()
-        };
-        let reply = player.send(request(json!({ "skip": true }))).await;
-        assert_eq!(reply.status, StatusCode::OK);
-        assert_eq!(reply.json()["attempts"], json!([{ "kind": "skip" }]));
-        reply.assert_no_secrets();
-        let general = player.daily(Section::General).await.json();
-        assert_eq!(general["attempts"], json!([{ "kind": "skip" }]));
-        assert_eq!(player.get("/api/daily").await.json(), general);
-        // ...and in no other section.
-        assert_eq!(player.daily(POP).await.json()["attempts"], json!([]));
-
-        // The old audio route is General's clip.
-        let clip = player.get("/api/daily/audio?t=1-playing").await;
-        assert_eq!(clip.status, StatusCode::OK);
-        assert_eq!(clip.header(header::CONTENT_TYPE), "audio/mpeg");
-        assert_eq!(clip.body, reference_mp3().prefix(300));
-        assert_eq!(clip.body, player.audio(Section::General).await.body);
-
-        // General's song wins there, Pop's does not.
-        let reply = player.send(request(json!({ "trackId": POP_SONG }))).await;
-        assert_eq!(reply.json()["status"], "playing");
-        let reply = player.send(request(json!({ "trackId": ANSWER_ID }))).await;
-        assert_eq!(reply.json()["status"], "won");
-        assert_eq!(reply.json()["answer"]["artist"], "The Answers");
-        player
-            .send(request(json!({ "skip": true })))
-            .await
-            .assert_error(StatusCode::CONFLICT, "finished");
-        player
-            .send(request(json!({})))
-            .await
-            .assert_error(StatusCode::BAD_REQUEST, "bad_request");
-
-        let id = harness.player_id(&player).unwrap();
-        let stored = harness.store.games(&id, Section::General).await.unwrap();
-        assert_eq!(stored.len(), 1);
-        assert_eq!(stored[0].status(), Status::Won);
     }
 
     // --- a song replaced under a request --------------------------------------

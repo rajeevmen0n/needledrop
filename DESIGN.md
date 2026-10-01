@@ -81,6 +81,11 @@ The dark `--ink` token is foreground on champagne and ivory.
 Material highlights inside the record painter are expressive illustration
 colors, not additional UI semantic tokens.
 
+Champagne is for playing: the play control, Guess, unlocked clips, the selected
+tab's line, a win, today's bar in the stats. It is never the colour of a
+destructive action. The button that confirms a deletion is outlined in ivory,
+and there is no red: a problem is ivory text with the "!" mark.
+
 Control boundaries map to `--control-border` (#666666), keeping the search field
 boundary above 3:1 against graphite and black. Decorative dividers retain the
 quieter `--border` value.
@@ -110,8 +115,9 @@ wrap the reveal and attempt history and truncate autocomplete rows only.
 
 ## Layout
 
-Desktop: header across the page, a fully visible record on the left, a focused
-game column on the right, and a quiet footer. At 40rem with landscape aspect
+Desktop: header across the page, the row of section tabs under it, a fully
+visible record on the left, a focused game column on the right, and a quiet
+footer. At 40rem with landscape aspect
 ratio, switch to two columns; other viewports stack the record over the controls.
 Document scrolling owns overflow; never lock the game to a fixed viewport.
 
@@ -120,10 +126,21 @@ Safe-area gutters, 44px minimum targets, 56px main controls, and 16px input text
 support touch. Seven equal clip segments communicate the ladder at a glance;
 history shows used and current attempts without seven empty visual rows.
 
+The four sections (General, Pop, Rock, Hip-hop) are tabs between two hairlines
+under the header: four equal columns on a phone, their own width at the left
+from 40rem. They must fit a 320px screen at 44px tall, so a tab is one short
+word and one 14px mark. The record, the rail, the controls and the history
+below always belong to the selected tab, and each tab has its own address.
+
+A finished section shows its stats between the result and the history: four
+figures on one line parted by hairlines, then "Wins by try". No boxes, no
+tiles. While a game is open only the streak shows, in the history's heading.
+
 ## Elevation & Depth
 
 Static content sits directly on black. Borders quietly establish structure.
-The search popup alone gets a restrained dark shadow. Reflections, groove
+Only what floats gets a restrained dark shadow: the search popup, and the
+confirmation dialog over a 72% black backdrop. Reflections, groove
 hairlines, bearing details, and layered metal highlights give the canvas physical
 depth; keep this realism concentrated in the record.
 
@@ -173,12 +190,43 @@ have 6px corners. No generic rounded card containers. Use fine strokes and
 precise simple icons, with an arrow for the secondary skip action. The header
 mark is a small champagne record with a four-point glint on its rim.
 
+A tab's mark is the state of its game, in the shapes the history already uses:
+a ring for not played, a ring with a champagne dot for in progress, a check on
+a champagne disc for won, a cross for lost, a dash for no song today. The
+selected tab is marked by a 2px champagne line on the row's rule, not by a
+filled shape or a pill.
+
+Bars in the stats are thin (10px), square at the baseline and rounded 4px at
+the end the count sits at. Grey bars are context; the one champagne bar is
+today's win, and the word "Today" says so as well.
+
 ## Components
 
 Shared owners: Play is used both before and after the reveal; GuessInput owns
 autocomplete and its authored listbox; Skip owns progression; Attempts owns
-readable history; Record owns animation and the canvas painter. API and game
-state remain the established behavioral authority in AGENTS.md.
+readable history; Record owns animation and the canvas painter; SectionTabs
+owns the tabs and their keyboard pattern; Stats owns the figures and the bars;
+Confirm owns the one dialog pattern, for anything that cannot be undone. API
+and game state remain the established behavioral authority in AGENTS.md.
+
+Tabs follow the WAI-ARIA pattern with manual activation: the arrows, Home and
+End move the focus, Enter or Space opens the tab, because opening one stops the
+clip and may wait for the server. Each tab is a link to its own address. Its
+state is in its accessible name ("Pop, won"), never in the mark alone.
+
+Numbers drawn large or as bars are decoration to a screen reader; each has a
+sentence beside it ("Current streak: 3 days", "Try 3: 4 wins, including
+today's"). Text beside a bar wears text colours, never the bar's.
+
+A confirmation is a modal dialog on the graphite surface: the question as its
+heading, what will happen in a sentence or two, Cancel first and focused, then
+the action named in full ("Clear my data", not "OK"). A failure is reported
+inside it and leaves the page untouched. Never use the browser's own confirm.
+
+A section without a song says "No song today" where the game would be, and
+offers to check again. News the player did not cause (the song was replaced,
+the day changed) is one ivory line with a champagne rule at its left, above
+the game, and is announced once.
 
 Search is transient game input, deliberately absent from URL state. It has a
 clear button, debounced requests, cancellation, IME safety, keyboard selection,
@@ -204,4 +252,7 @@ keeping game state and playback progress available.
 - Let the real object do the visual work; avoid extra ornamental widgets.
 - Keep the server authoritative and never reveal answer data while playing.
 - Preserve the listening and guessing order across viewports.
+- Keep the tab row to one line of four at every width; do not add a fifth
+  control to it.
+- Do not put the stats in cards or tiles, and do not colour more than one bar.
 - Verify sound quality by ear with the owner; a headless browser cannot do that.

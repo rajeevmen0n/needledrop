@@ -51,9 +51,11 @@
   let coverReady = false
   /** Seconds the reveal has run; `null` when none is in flight. */
   let reveal: number | null = null
-  /** False until the first game state has been shown; that one appears without animation. */
+  /** False until the first state of the game on screen has been shown; that one appears without animation. */
   let shown = false
   let wasFinished = false
+  /** The game the record is showing: a section on a day. Another one is put on without ceremony. */
+  let scene = ''
 
   let still = false
   let stale = true
@@ -298,11 +300,26 @@
     const ladder = game.ladder
     const unlocked = game.clipSeconds
     const finished = game.finished
-    const day = game.daily?.day
-    if (ladder.length === 0) return
+    const day = game.day ?? undefined
+    const now = `${game.section} ${day}`
+    if (now !== scene) {
+      // Another tab or another day: a different record, not this one changing.
+      scene = now
+      shown = false
+      reveal = null
+    }
+    stamp = dayStamp(day)
+    if (ladder.length === 0) {
+      // Nothing is known of this game yet (or it has no song): a blank side.
+      lit = lit.map(() => 0)
+      targets = [...lit]
+      delays = lit.map(() => 0)
+      wasFinished = false
+      wake()
+      return
+    }
 
     labels = ladder.map(figure)
-    stamp = dayStamp(day)
     targets = ladder.map((seconds) => (seconds <= unlocked + 1e-6 ? 1 : 0))
     if (!shown || lit.length !== targets.length) {
       lit = [...targets]

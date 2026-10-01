@@ -12,8 +12,9 @@
   const LONG_TITLE = 22
 
   let heading = $state<HTMLHeadingElement>()
-  // The sequence runs only for the player who just made the last move.
-  const fresh = $derived(game.moves > 0)
+  // The sequence runs only for the player who just made the last move, and
+  // only once: coming back to this tab later shows the settled text.
+  const fresh = $derived(game.fresh)
 
   const result = $derived.by(() => {
     if (game.status !== 'won') return 'No tries left. The song was'

@@ -1,21 +1,94 @@
 <script lang="ts">
   import { onMount } from 'svelte'
+  // The game page: the four sections as tabs, and the game of the one on
+  // screen. Which section that is comes from the address (see main.ts) and
+  // goes back into it: opening a tab is an entry in the browser's history.
   import Atmosphere from './lib/components/Atmosphere.svelte'
   import Attempts from './lib/components/Attempts.svelte'
+  import ClearData from './lib/components/ClearData.svelte'
   import GuessInput from './lib/components/GuessInput.svelte'
   import Play from './lib/components/Play.svelte'
   import Record from './lib/components/Record.svelte'
   import Reveal from './lib/components/Reveal.svelte'
+  import SectionTabs from './lib/components/SectionTabs.svelte'
   import Skip from './lib/components/Skip.svelte'
+  import Stats from './lib/components/Stats.svelte'
   import { game } from './lib/game.svelte'
+  import {
+    pageTitle,
+    routeFor,
+    sectionLabel,
+    sectionPath,
+    tabId,
+  } from './lib/sections'
+  import type { Section } from './lib/sections'
+  import { winningTry } from './lib/stats'
+
+  /** The section the address asked for when the page loaded. */
+  let { section }: { section: Section } = $props()
+
+  const PANEL = 'game-panel'
+
+  const CLEARED = 'Your data was cleared. This browser is now a new player.'
+
   let motionPaused = $state(false)
+  /** Clear my data went through, and nothing has been played since. */
+  let cleared = $state(false)
+
+  const label = $derived(sectionLabel(game.section))
+  /** Another section still has a game to play today. */
+  const more = $derived(
+    game.tabs.some(
+      (tab) =>
+        tab.section !== game.section &&
+        (tab.state === 'unplayed' || tab.state === 'playing'),
+    ),
+  )
+  // One sentence at a time for a screen reader: news the player did not cause, else what the last move did.
+  const spoken = $derived(game.info ?? (game.finished ? '' : game.notice))
+
+  /** Clear my data. Resolves to `null` when it is done, or to why it failed. */
+  async function clear(): Promise<string | null> {
+    cleared = false
+    const failure = await game.clearData()
+    cleared = failure === null
+    return failure
+  }
+
+  // The line that says so stays until the new player has a game on record.
+  $effect(() => {
+    if (game.tabs.some((tab) => tab.state !== 'unknown' && tab.state !== 'unplayed' && tab.state !== 'none'))
+      cleared = false
+  })
+
+  /** A tab was chosen on the page: the address follows it. */
+  function choose(next: Section) {
+    if (next === game.section) return
+    history.pushState(null, '', sectionPath(next))
+    game.select(next)
+  }
+
   onMount(() => {
-    void game.load()
+    game.open(section)
     const onvisible = () => {
-      if (document.visibilityState === 'visible') void game.refresh()
+      if (document.visibilityState === 'visible') game.refresh()
+    }
+    // Back and forward: the address has changed already, and the page follows it.
+    const onpop = () => {
+      const route = routeFor(location.pathname)
+      if (route.page === 'game') game.select(route.section)
+      else location.reload()
     }
     document.addEventListener('visibilitychange', onvisible)
-    return () => document.removeEventListener('visibilitychange', onvisible)
+    window.addEventListener('popstate', onpop)
+    return () => {
+      document.removeEventListener('visibilitychange', onvisible)
+      window.removeEventListener('popstate', onpop)
+    }
+  })
+
+  $effect(() => {
+    document.title = pageTitle(game.section)
   })
 </script>
 
@@ -23,6 +96,7 @@
   playing={game.playing}
   paused={motionPaused}
   status={game.daily ? game.status : 'loading'}
+  scene={game.section}
   analyser={() => game.player.analyser}
 />
 <div class="page" class:still={motionPaused}>
@@ -41,11 +115,19 @@
       Needledrop<span class="brand-note">The daily listening game</span>
     </h1>
     <p class="number numeric" data-sky-calm>
-      <span>Daily pressing</span>{game.daily
-        ? `No. ${String(game.daily.number).padStart(3, '0')}`
+      <span>Daily pressing</span>{game.number !== null
+        ? `No. ${String(game.number).padStart(3, '0')}`
         : 'No. —'}
     </p>
   </header>
+  <div class="sections">
+    <SectionTabs
+      tabs={game.tabs}
+      selected={game.section}
+      panel={PANEL}
+      onselect={choose}
+    />
+  </div>
   <div class="stage" class:playing={game.playing} aria-hidden="true">
     <!-- Tells the sky where the record is: left/top is its centre, width its radius. -->
     <span class="origin" data-sky-origin></span>
@@ -57,73 +139,114 @@
     </div>
   </div>
   <main data-sky-calm>
-    {#if game.daily}
-      {#if game.finished}<Reveal {game} />
-      {:else}
-        <div class="intro">
-          <p class="eyebrow">Put your music memory to the test</p>
-          <h2>Know it from <br /><span>the first note?</span></h2>
-          <p>Listen closely. Name today's mystery song.</p>
-        </div>
-        <div class="clip-steps" aria-hidden="true">
-          {#each game.ladder as seconds, i}<div
-              class:unlocked={seconds <= game.clipSeconds}
-              class:current={i === game.turn - 1}
+    <!-- Always there, so that what it comes to say is announced. -->
+    <p class="sr-only" role="status">{spoken}</p>
+    {#key game.section}
+      <div
+        class="panel"
+        id={PANEL}
+        role="tabpanel"
+        aria-labelledby={tabId(game.section)}
+      >
+        {#if game.info}<p class="info" aria-hidden="true">{game.info}</p>{/if}
+        {#if game.daily}
+          {#if game.finished}
+            <Reveal {game} />
+            {#if game.stats}
+              <Stats
+                stats={game.stats}
+                title="Your {label} stats"
+                todaysTry={winningTry(game.status, game.attempts.length)}
+              />
+            {/if}
+          {:else}
+            <div class="intro">
+              <p class="eyebrow">Put your music memory to the test</p>
+              <h2>Know it from <br /><span>the first note?</span></h2>
+              <p>Listen closely. Name today's mystery song.</p>
+            </div>
+            <div class="clip-steps" aria-hidden="true">
+              {#each game.ladder as seconds, i}<div
+                  class:unlocked={seconds <= game.clipSeconds}
+                  class:current={i === game.turn - 1}
+                >
+                  <span class="step-line"></span><span class="numeric"
+                    >{seconds}<span class="unit">s</span></span
+                  >
+                </div>{/each}
+            </div>
+            <Play {game} />
+            <GuessInput
+              onguess={(track) => game.guess(track)}
+              busy={game.submitting}
+            />
+            <Skip {game} />
+            {#if game.moveError}<p class="error" role="alert">
+                {game.moveError}
+              </p>{/if}
+          {/if}
+          <Attempts {game} />
+          <p class="rules">
+            {#if !game.finished}
+              Each skip or wrong guess unlocks a longer clip.
+            {:else if more}
+              {label} is back tomorrow. Today's other sections are still open.
+            {:else}
+              Come back tomorrow for four fresh games.
+            {/if}
+          </p>
+        {:else if game.noSong}
+          <div class="empty">
+            <h2>No song today</h2>
+            <p>
+              {label} has nothing to play today. Try another section, or come
+              back tomorrow.
+            </p>
+            {#if game.loadError}<p class="error" role="alert">
+                {game.loadError}
+              </p>{/if}
+            <button
+              class="button outline"
+              type="button"
+              onclick={() => game.load()}
+              disabled={game.loading}
+              >{game.loading ? 'Checking…' : 'Check again'}</button
             >
-              <span class="step-line"></span><span class="numeric"
-                >{seconds}<span class="unit">s</span></span
-              >
-            </div>{/each}
-        </div>
-        <Play {game} />
-        <GuessInput
-          onguess={(track) => game.guess(track)}
-          busy={game.submitting}
-        />
-        <Skip {game} />
-        {#if game.moveError}<p class="error" role="alert">
-            {game.moveError}
-          </p>{/if}
-      {/if}
-      <p class="sr-only" role="status">{game.finished ? '' : game.notice}</p>
-      <Attempts {game} />
-      <p class="rules">
-        {#if game.finished}
-          Come back tomorrow for a fresh game.
-        {:else}
-          Each skip or wrong guess unlocks a longer clip.
-        {/if}
-      </p>
-    {:else if game.loadError}
-      <div class="failed" role="alert">
-        <p class="error">{game.loadError}</p>
-        <button class="button solid" type="button" onclick={() => game.load()}
-          >Try again</button
-        >
+          </div>
+        {:else if game.loadError}
+          <div class="failed" role="alert">
+            <p class="error">{game.loadError}</p>
+            <button
+              class="button solid"
+              type="button"
+              onclick={() => game.load()}>Try again</button
+            >
+          </div>
+        {:else}<p class="loading" role="status">Loading today's song…</p>{/if}
       </div>
-    {:else}<p role="status">Loading today's song…</p>{/if}
+    {/key}
   </main>
   <footer data-sky-calm>
     <span>A little sound. A familiar feeling.</span><span
       >Music previews by Deezer</span
     >
-    <button class="motion-toggle" type="button" onclick={() => (motionPaused = !motionPaused)}>
-      {motionPaused ? 'Resume motion' : 'Pause motion'}
-    </button>
+    <div class="switches">
+      <ClearData onclear={clear} disabled={game.busy} />
+      <button
+        class="quiet-button motion-toggle"
+        type="button"
+        onclick={() => (motionPaused = !motionPaused)}
+      >
+        {motionPaused ? 'Resume motion' : 'Pause motion'}
+      </button>
+    </div>
+    <!-- The live region is there before it has anything to say, so the sentence is announced when it arrives. -->
+    <p class="sr-only" role="status">{cleared ? CLEARED : ''}</p>
+    {#if cleared}<p class="cleared" aria-hidden="true">{CLEARED}</p>{/if}
   </footer>
 </div>
 
 <style>
-  .motion-toggle {
-    min-height: var(--target);
-    padding: 0 .5rem;
-    color: var(--muted);
-    border-radius: 4px;
-    font-size: .75rem;
-    white-space: nowrap;
-  }
-  .motion-toggle:hover { color: var(--paper); background: var(--surface); }
-  .motion-toggle:active { transform: translateY(1px); }
   @media (prefers-reduced-motion: reduce) { .motion-toggle { display: none; } }
   .page {
     position: relative;
@@ -134,6 +257,8 @@
     padding: 0 var(--gutter);
     display: grid;
     grid-template-columns: minmax(0, 1fr);
+    /* Header, tabs, record, game, footer: room to spare goes to the game, not to the bars above it. */
+    grid-template-rows: auto auto auto 1fr auto;
     /* The light behind the record is larger than its stage; it must not lengthen the page. */
     overflow-y: clip;
   }
@@ -147,6 +272,9 @@
   /* One arrival, in order: the header, the record rising with its light, the game. */
   header {
     animation: arrive 700ms var(--ease-out) backwards;
+  }
+  .sections {
+    animation: arrive 700ms var(--ease-out) var(--reveal-step) backwards;
   }
   .stage {
     animation: rise 1100ms var(--ease-out) calc(var(--reveal-step) * 2)
@@ -290,14 +418,51 @@
     display: none;
   }
   main {
-    display: grid;
     width: 100%;
     max-width: 34rem;
     justify-self: center;
-    gap: 1.25rem;
-    align-content: start;
     padding: 0 0 2rem;
     min-width: 0;
+  }
+  /* One section's game. A tab that is opened fades in; nothing slides. */
+  .panel {
+    display: grid;
+    gap: 1.25rem;
+    align-content: start;
+    min-width: 0;
+    animation: arrive 260ms var(--ease-out);
+  }
+  /* News the player did not cause: a replaced song, a new day. */
+  .info {
+    padding-left: 0.75rem;
+    border-left: 2px solid var(--accent);
+    font-size: 0.875rem;
+    line-height: 1.4;
+  }
+  .loading {
+    color: var(--muted);
+  }
+  .empty {
+    display: grid;
+    justify-items: start;
+    gap: 0.75rem;
+  }
+  .empty h2 {
+    font-size: 1.65rem;
+    font-weight: 600;
+    letter-spacing: -0.03em;
+    line-height: 1.1;
+  }
+  .empty > p:not(.error) {
+    max-width: 25rem;
+    color: var(--muted);
+    font-size: 0.875rem;
+  }
+  .empty .button {
+    min-height: var(--target);
+    margin-top: 0.25rem;
+    border-color: var(--control-border);
+    font-size: 0.875rem;
   }
   .intro {
     display: grid;
@@ -407,11 +572,26 @@
     color: var(--muted);
     font-size: 0.6875rem;
   }
+  .switches {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.25rem;
+    /* The buttons' own padding stays out of the page's edge. */
+    margin: 0 -0.5rem;
+  }
+  /* A line of its own under the footer's row. */
+  .cleared {
+    flex-basis: 100%;
+    color: var(--paper);
+    font-size: 0.75rem;
+  }
   @media (prefers-reduced-motion: reduce) {
     header,
+    .sections,
     .stage,
     .stage::before,
     main,
+    .panel,
     footer,
     .current .step-line,
     .current .step-line::after {
@@ -431,7 +611,7 @@
     .intro > p:last-child {
       display: none;
     }
-    main {
+    .panel {
       gap: 1rem;
     }
     .stage {
@@ -443,7 +623,11 @@
       grid-template-columns: minmax(0, 1.14fr) minmax(0, 1fr);
       column-gap: clamp(2rem, 6vw, 6rem);
     }
+    .page {
+      grid-template-rows: auto auto 1fr auto;
+    }
     header,
+    .sections,
     footer {
       grid-column: 1/-1;
     }
@@ -456,7 +640,7 @@
     }
     .stage {
       grid-column: 1;
-      grid-row: 2;
+      grid-row: 3;
       margin: 0;
       align-self: center;
       height: calc(var(--record-r) * 2.8);
@@ -473,7 +657,7 @@
     }
     main {
       grid-column: 2;
-      grid-row: 2;
+      grid-row: 3;
       max-width: 29rem;
       padding: 3.5rem 0;
     }
@@ -500,6 +684,8 @@
   @media (max-height: 600px) and (min-width: 40rem) and (min-aspect-ratio: 6/5) {
     main {
       padding: 1.5rem 0;
+    }
+    .panel {
       gap: 0.8rem;
     }
     .intro h2 {
@@ -528,13 +714,14 @@
     .intro {
       display: none;
     }
+    /* The tabs took a row: the header gives some of it back, so Skip still fits a 320×568 screen. */
     header {
-      padding: 1rem 0;
+      padding: 0.625rem 0;
     }
     .stage {
       height: calc(var(--record-r) * 2.3);
     }
-    main {
+    .panel {
       gap: 0.75rem;
     }
   }

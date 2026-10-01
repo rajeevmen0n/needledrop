@@ -20,6 +20,7 @@
     playing = false,
     paused = false,
     status = 'loading',
+    scene = '',
     analyser = () => null,
   }: {
     /** A clip is sounding: the sky picks up pace and brightens. */
@@ -28,6 +29,8 @@
     paused?: boolean
     /** The game's status, or `loading` before the first state arrives. */
     status?: Phase
+    /** Which game the status is about. A status that changes because the game on screen did is not news. */
+    scene?: string
     /** The audio analyser, once there is one; the stars breathe with its level. */
     analyser?: () => AnalyserNode | null
   } = $props()
@@ -64,6 +67,7 @@
   let measuredAt = 0
   let scrolledAt = -Infinity
   let previous: Phase = 'loading'
+  let previousScene = ''
   /** A win is waiting for the next frame, which knows where the record is. */
   let pending = false
   const samples = new Float32Array(256)
@@ -247,8 +251,11 @@
   // A win made on this page, not one found on reload, sets off the stardust.
   $effect(() => {
     const now = status
-    if (previous === 'playing' && now === 'won') pending = true
+    const here = scene
+    if (here === previousScene && previous === 'playing' && now === 'won')
+      pending = true
     previous = now
+    previousScene = here
     // Every change of status rearranges the game column.
     remeasure()
   })
