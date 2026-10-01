@@ -1,0 +1,13 @@
+# bacon restarts the server when its sources or config change (`just dev`).
+# It runs from the repo root so `config.toml` and `data/` resolve the same way
+# as under `just server`.
+
+default_job = "server"
+
+[jobs.server]
+command = ["cargo", "run", "--manifest-path", "server/Cargo.toml"]
+watch = ["server/src", "server/Cargo.toml", "config.toml"]
+need_stdout = true
+allow_warnings = true
+background = false
+on_change_strategy = "kill_then_restart"
