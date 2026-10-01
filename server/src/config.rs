@@ -4,7 +4,8 @@
 //! committed and holds what every machine shares; `config.local.toml` next to
 //! it, which is git-ignored and holds what belongs to one machine (the public
 //! hostname, above all); and the environment, where `GTS_BIND`,
-//! `GTS_PUBLIC_URL` and `GTS_SECRET` override or add to what the files say.
+//! `GTS_PUBLIC_URL`, `GTS_STORE_PATH` and `GTS_SECRET` override or add to
+//! what the files say.
 //! Keys the server does not know are
 //! ignored, which is what lets a config file from before the song database
 //! (with its `track_id` and `playlists`) still start the server.
@@ -25,6 +26,11 @@ const DEFAULT_PATH: &str = "config.toml";
 const ENV_CONFIG: &str = "GTS_CONFIG";
 const ENV_BIND: &str = "GTS_BIND";
 const ENV_PUBLIC_URL: &str = "GTS_PUBLIC_URL";
+const ENV_STORE_PATH: &str = "GTS_STORE_PATH";
+
+/// The database file of the SQLite backend when no path is configured, under
+/// the data directory.
+const DATABASE_FILE: &str = "needledrop.db";
 const ENV_SECRET: &str = "GTS_SECRET";
 
 /// Which backend keeps the persistent data: `[store] kind` in the file.
@@ -68,6 +74,13 @@ pub struct Config {
     /// The backend that keeps the song pool, the games, the picks and the
     /// day offset.
     pub store: StoreKind,
+    /// The database file of the SQLite backend: `[store] path` or
+    /// `GTS_STORE_PATH` when one is set, so a deployment can keep its data
+    /// where it wants, and otherwise `needledrop.db` under the data
+    /// directory, which the server creates and seeds on its first start.
+    /// Relative paths are relative to the working directory, like
+    /// `data_dir`. The in-memory backend does not use it.
+    pub store_path: PathBuf,
     /// `GTS_SECRET` when set: the cookie key (see `player::session_key` for
     /// the format). Only ever taken from the environment, because
     /// `config.toml` is committed.
@@ -83,6 +96,7 @@ impl fmt::Debug for Config {
             .field("launch_date", &self.launch_date)
             .field("public_url", &self.public_url)
             .field("store", &self.store)
+            .field("store_path", &self.store_path)
             .field("secret", &self.secret.as_ref().map(|_| "<redacted>"))
             .finish()
     }
@@ -124,10 +138,12 @@ struct FileConfig {
     store: FileStore,
 }
 
-/// The `[store]` table. Without it, or without `kind`, the store is SQLite.
+/// The `[store]` table. Without it, or without `kind`, the store is SQLite;
+/// without `path`, its file is under the data directory.
 #[derive(Default, Deserialize)]
 struct FileStore {
     kind: Option<String>,
+    path: Option<PathBuf>,
 }
 
 fn default_bind() -> String {
@@ -218,12 +234,23 @@ impl Config {
             None => StoreKind::default(),
         };
 
+        // Blank means the same as leaving it out, in the file as in the
+        // environment: the database the server makes under the data directory.
+        let store_path = env(ENV_STORE_PATH)
+            .map(|path| PathBuf::from(path.trim()))
+            .or(file
+                .store
+                .path
+                .filter(|path| !path.as_os_str().to_string_lossy().trim().is_empty()))
+            .unwrap_or_else(|| file.data_dir.join(DATABASE_FILE));
+
         Ok(Self {
             bind,
             data_dir: file.data_dir,
             launch_date: file.launch_date,
             public_url,
             store,
+            store_path,
             secret: env(ENV_SECRET),
         })
     }
@@ -347,6 +374,7 @@ mod tests {
                 launch_date: date(2026, 10, 1),
                 public_url: None,
                 store: StoreKind::Sqlite,
+                store_path: PathBuf::from("data/needledrop.db"),
                 secret: None,
             }
         );
@@ -559,6 +587,10 @@ mod tests {
         let config = Config::from_sources(&text, no_env).unwrap();
         assert_eq!(config.bind, "127.0.0.1:4810");
         assert_eq!(config.store, StoreKind::Sqlite);
+        // Run from the repo, the server uses the database it bootstraps
+        // itself: the path is there, blank, for a deployment to fill in.
+        assert!(text.contains("path = \"\""), "{text}");
+        assert_eq!(config.store_path, config.data_dir.join("needledrop.db"));
         // The keys that went with the hard-coded track are gone from it.
         assert!(!text.contains("track_id"), "{text}");
         assert!(!text.contains("playlists"), "{text}");
@@ -659,6 +691,70 @@ mod tests {
     }
 
     #[test]
+    fn the_database_is_under_the_data_directory_unless_a_path_is_set() {
+        // Nothing said, or said blank: the file the server makes for itself.
+        for file in [
+            MINIMAL.to_owned(),
+            format!("{MINIMAL}[store]\nkind = \"sqlite\"\n"),
+            format!("{MINIMAL}[store]\npath = \"\"\n"),
+            format!("{MINIMAL}[store]\npath = \"  \"\n"),
+        ] {
+            let config = Config::from_sources(&file, no_env).unwrap();
+            assert_eq!(
+                config.store_path,
+                PathBuf::from("data/needledrop.db"),
+                "{file}"
+            );
+        }
+        // It follows the data directory.
+        let file = format!("{MINIMAL}data_dir = \"/var/lib/needledrop\"\n");
+        let config = Config::from_sources(&file, no_env).unwrap();
+        assert_eq!(
+            config.store_path,
+            PathBuf::from("/var/lib/needledrop/needledrop.db")
+        );
+
+        // A path of its own, absolute or relative, wherever the data directory is.
+        for path in ["/srv/needledrop/game.sqlite", "db/game.sqlite"] {
+            let file = format!(
+                "{MINIMAL}data_dir = \"/var/lib/needledrop\"\n[store]\npath = \"{path}\"\n"
+            );
+            let config = Config::from_sources(&file, no_env).unwrap();
+            assert_eq!(config.store_path, PathBuf::from(path));
+            assert_eq!(config.data_dir, PathBuf::from("/var/lib/needledrop"));
+            assert_eq!(config.store, StoreKind::Sqlite);
+        }
+    }
+
+    #[test]
+    fn the_database_path_comes_from_the_local_file_or_the_environment_first() {
+        let committed = format!("{MINIMAL}[store]\nkind = \"sqlite\"\npath = \"\"\n");
+
+        // The local file names it without repeating the rest of the table.
+        let local = "[store]\npath = \"/srv/needledrop/game.sqlite\"\n";
+        let config = Config::from_layers(&committed, Some(local), no_env).unwrap();
+        assert_eq!(
+            config.store_path,
+            PathBuf::from("/srv/needledrop/game.sqlite")
+        );
+        assert_eq!(config.store, StoreKind::Sqlite);
+
+        // The variable wins over both files; a blank one changes nothing.
+        let env = env_of(&[("GTS_STORE_PATH", " /mnt/volume/needledrop.db ")]);
+        let config = Config::from_layers(&committed, Some(local), env).unwrap();
+        assert_eq!(
+            config.store_path,
+            PathBuf::from("/mnt/volume/needledrop.db")
+        );
+        let env = env_of(&[("GTS_STORE_PATH", "  ")]);
+        let config = Config::from_layers(&committed, Some(local), env).unwrap();
+        assert_eq!(
+            config.store_path,
+            PathBuf::from("/srv/needledrop/game.sqlite")
+        );
+    }
+
+    #[test]
     fn an_unknown_store_kind_names_the_key_and_the_value() {
         for kind in ["postgres", "SQLite", ""] {
             let file = format!("{MINIMAL}[store]\nkind = \"{kind}\"\n");
@@ -678,6 +774,7 @@ mod tests {
     fn a_store_setting_of_the_wrong_type_is_an_error() {
         for (store, key) in [
             ("[store]\nkind = 3\n", "kind"),
+            ("[store]\npath = 3\n", "path"),
             ("store = \"sqlite\"\n", "store"),
         ] {
             let file = format!("{MINIMAL}{store}");

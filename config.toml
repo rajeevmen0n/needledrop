@@ -28,11 +28,19 @@ launch_date = "2026-10-01"
 public_url = ""
 
 # Where the song pool, the players' games, the daily picks and the day offset
-# are kept. "sqlite" (the default when this table is left out) is one file,
-# needledrop.db, under data_dir: the server creates it and puts six seed songs
-# into an empty pool. "memory" keeps nothing between starts, so every restart
-# forgets every player's games and draws the day's songs again.
+# are kept. "sqlite" (the default when this table is left out) is one file:
+# the server creates it and puts six seed songs into an empty pool. "memory"
+# keeps nothing between starts, so every restart forgets every player's games
+# and draws the day's songs again.
 # This table stays at the end of the file, because every key written after a
 # table header belongs to that table.
 [store]
 kind = "sqlite"
+
+# The SQLite file. Blank, as here, is needledrop.db under data_dir: the
+# database the server bootstraps for itself, which is what a local run uses.
+# A deployment names its own file, absolute or relative to the working
+# directory, in config.local.toml or with `GTS_STORE_PATH`; the server creates
+# the file and its directory if they are missing. The previews and the cookie
+# key stay under data_dir either way.
+path = ""

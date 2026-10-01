@@ -46,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
 
     // A database that cannot be used stops the server here, like a bad config,
     // rather than on the first request that needs it.
-    let store = store::open(config.store, &config.data_dir).context("opening the store")?;
+    let store = store::open(config.store, &config.store_path).context("opening the store")?;
     let seeded = store::seed_if_empty(store.as_ref())
         .await
         .context("seeding the song pool")?;

@@ -39,9 +39,6 @@ pub use self::seed::SEED_SONGS;
 pub use self::{memory::MemoryStore, seed::seed_if_empty, sqlite::SqliteStore};
 use crate::{config::StoreKind, game::GameState};
 
-/// The database file of the SQLite backend, under the data directory.
-const SQLITE_FILE: &str = "needledrop.db";
-
 /// A genre a song can be tagged with. Each one is also a daily section whose
 /// pool is the songs carrying the tag; every song is in the General pool
 /// whatever its tags.
@@ -451,13 +448,15 @@ fn decode_game(player: &PlayerId, section: Section, day: &str, json: &str) -> Op
     }
 }
 
-/// Opens the backend the config names. For SQLite that creates the data
-/// directory and the database file when they are missing and brings the
-/// schema up to date; a database that cannot be used is an error, so the
-/// server stops at startup instead of failing on the first request.
-pub fn open(kind: StoreKind, data_dir: &Path) -> Result<Arc<dyn Store>, StoreError> {
+/// Opens the backend the config names. For SQLite that is the file at
+/// `database` (`Config::store_path`): its directory and the file itself are
+/// created when they are missing and the schema is brought up to date; a
+/// database that cannot be used is an error, so the server stops at startup
+/// instead of failing on the first request. The in-memory backend has no file
+/// and does not look at the path.
+pub fn open(kind: StoreKind, database: &Path) -> Result<Arc<dyn Store>, StoreError> {
     Ok(match kind {
-        StoreKind::Sqlite => Arc::new(SqliteStore::open(&data_dir.join(SQLITE_FILE))?),
+        StoreKind::Sqlite => Arc::new(SqliteStore::open(database)?),
         StoreKind::Memory => Arc::new(MemoryStore::new()),
     })
 }
@@ -636,16 +635,17 @@ mod tests {
     #[tokio::test]
     async fn the_config_chooses_the_backend() {
         let dir = tempfile::tempdir().unwrap();
-        let data_dir = dir.path().join("data");
+        // Wherever the config says, directories that are not there included.
+        let database = dir.path().join("deep/down/game.sqlite");
 
-        let memory = open(StoreKind::Memory, &data_dir).unwrap();
+        let memory = open(StoreKind::Memory, &database).unwrap();
         assert!(memory.songs().await.unwrap().is_empty());
         // The in-memory backend keeps nothing on disk.
-        assert!(!data_dir.exists());
+        assert!(!dir.path().join("deep").exists());
 
-        let sqlite = open(StoreKind::Sqlite, &data_dir).unwrap();
+        let sqlite = open(StoreKind::Sqlite, &database).unwrap();
         assert!(sqlite.songs().await.unwrap().is_empty());
-        assert!(data_dir.join("needledrop.db").is_file());
+        assert!(database.is_file());
     }
 
     #[test]
