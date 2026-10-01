@@ -1,11 +1,13 @@
 //! Needledrop server: config load, shared state, router, tracing.
 
+mod admin;
 mod config;
 mod daily;
 mod deezer;
 mod game;
 mod mp3;
 mod routes;
+mod store;
 #[cfg(test)]
 mod testutil;
 
@@ -32,7 +34,21 @@ async fn main() -> anyhow::Result<()> {
     let key = routes::session_key(config.secret.as_deref(), &config.data_dir)?;
     let deezer = Deezer::new().context("building the Deezer client")?;
     let daily = Daily::new(deezer.clone(), &config.data_dir, config.track_id);
-    let state = AppState::new(deezer, daily, config.launch_date, key);
+
+    // A database that cannot be used stops the server here, like a bad config,
+    // rather than on the first request that needs it.
+    let store = store::open(config.store, &config.data_dir).context("opening the store")?;
+    let seeded = store::seed_if_empty(store.as_ref())
+        .await
+        .context("seeding the song pool")?;
+    if seeded > 0 {
+        tracing::info!(
+            songs = seeded,
+            "the song pool was empty; added the seed songs"
+        );
+    }
+
+    let state = AppState::new(deezer, daily, store, config.launch_date, key);
 
     let listener = TcpListener::bind(&config.bind)
         .await

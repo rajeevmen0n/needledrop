@@ -4,7 +4,7 @@
 # `GTS_BIND` overrides this.
 bind = "127.0.0.1:4810"
 
-# Cached previews and the cookie key live here (git-ignored).
+# Cached previews, the cookie key and the database live here (git-ignored).
 data_dir = "data"
 
 # Day 1 of the game, as a UTC date; the day number counts from it.
@@ -21,3 +21,11 @@ playlists = [
   11535307124, # "Rolling Stone: Best Songs of All Time" — 493 tracks, 290 playable (59%)
   5123717724,  # "Most Popular Songs of All Time: Greatest Hits [Upd…" — 501 tracks, 356 playable (71%)
 ]
+
+# Where the song pool is kept. "sqlite" (the default when this table is left
+# out) is one file, needledrop.db, under data_dir: the server creates it and
+# puts six seed songs into an empty pool. "memory" keeps nothing between starts.
+# This table stays at the end of the file, because every key written after a
+# table header belongs to that table.
+[store]
+kind = "sqlite"

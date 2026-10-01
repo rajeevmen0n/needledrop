@@ -1,4 +1,4 @@
-//! Settings from `config.toml` and the environment: bind address, data dir, launch date, track ID.
+//! Settings from `config.toml` and the environment: bind address, data dir, launch date, track ID, store backend.
 //!
 //! The file is the base and the environment wins: `GTS_BIND`, `GTS_TRACK_ID`
 //! and `GTS_SECRET` override or add to what the file says. Keys the server
@@ -19,17 +19,41 @@ const ENV_BIND: &str = "GTS_BIND";
 const ENV_TRACK_ID: &str = "GTS_TRACK_ID";
 const ENV_SECRET: &str = "GTS_SECRET";
 
+/// Which backend keeps the persistent data: `[store] kind` in the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StoreKind {
+    /// `"sqlite"`: one database file under the data directory. The default.
+    #[default]
+    Sqlite,
+    /// `"memory"`: nothing is kept; every start begins with the seed songs.
+    Memory,
+}
+
+impl StoreKind {
+    /// The kind `[store] kind` names, if it is one.
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "sqlite" => Some(Self::Sqlite),
+            "memory" => Some(Self::Memory),
+            _ => None,
+        }
+    }
+}
+
 /// Everything the server needs to start.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Config {
     /// Address to listen on, `host:port`.
     pub bind: String,
-    /// Directory for cached previews and the cookie key. Created on demand.
+    /// Directory for cached previews, the cookie key and the database.
+    /// Created on demand.
     pub data_dir: PathBuf,
     /// Day 1 of the game, a UTC date.
     pub launch_date: Date,
     /// Deezer ID of the song the server plays.
     pub track_id: u64,
+    /// The backend that keeps the song pool.
+    pub store: StoreKind,
     /// `GTS_SECRET` when set: the cookie key (see `routes::session_key` for
     /// the format). Only ever taken from the environment, because
     /// `config.toml` is committed.
@@ -44,6 +68,7 @@ impl fmt::Debug for Config {
             .field("data_dir", &self.data_dir)
             .field("launch_date", &self.launch_date)
             .field("track_id", &self.track_id)
+            .field("store", &self.store)
             .field("secret", &self.secret.as_ref().map(|_| "<redacted>"))
             .finish()
     }
@@ -66,6 +91,8 @@ pub enum ConfigError {
     ZeroTrackId,
     #[error("`bind` is empty: expected an address such as 127.0.0.1:4810")]
     EmptyBind,
+    #[error("`store.kind` is {0:?}: expected \"sqlite\" or \"memory\"")]
+    UnknownStoreKind(String),
 }
 
 /// `config.toml` as written. Everything but the launch date can be left out.
@@ -77,6 +104,14 @@ struct FileConfig {
     data_dir: PathBuf,
     launch_date: Date,
     track_id: Option<u64>,
+    #[serde(default)]
+    store: FileStore,
+}
+
+/// The `[store]` table. Without it, or without `kind`, the store is SQLite.
+#[derive(Default, Deserialize)]
+struct FileStore {
+    kind: Option<String>,
 }
 
 fn default_bind() -> String {
@@ -126,11 +161,17 @@ impl Config {
             return Err(ConfigError::EmptyBind);
         }
 
+        let store = match file.store.kind {
+            Some(kind) => StoreKind::from_name(&kind).ok_or(ConfigError::UnknownStoreKind(kind))?,
+            None => StoreKind::default(),
+        };
+
         Ok(Self {
             bind,
             data_dir: file.data_dir,
             launch_date: file.launch_date,
             track_id,
+            store,
             secret: env(ENV_SECRET),
         })
     }
@@ -156,7 +197,13 @@ mod tests {
           11535307124, # a comment
           5123717724,
         ]
+
+        [store]
+        kind = "sqlite"
     "#;
+
+    /// The smallest file that loads.
+    const MINIMAL: &str = "launch_date = \"2026-10-01\"\ntrack_id = 7\n";
 
     fn no_env(_: &str) -> Option<String> {
         None
@@ -181,6 +228,7 @@ mod tests {
                 data_dir: PathBuf::from("data"),
                 launch_date: date(2026, 10, 1),
                 track_id: 136_889_400,
+                store: StoreKind::Sqlite,
                 secret: None,
             }
         );
@@ -193,6 +241,7 @@ mod tests {
         let config = Config::from_sources(&text, no_env).unwrap();
         assert_eq!(config.bind, "127.0.0.1:4810");
         assert!(config.track_id > 0);
+        assert_eq!(config.store, StoreKind::Sqlite);
     }
 
     #[test]
@@ -281,6 +330,52 @@ mod tests {
             Config::from_sources("launch_date = ", no_env),
             Err(ConfigError::Toml(_))
         ));
+    }
+
+    #[test]
+    fn the_store_is_sqlite_unless_the_file_says_otherwise() {
+        // No `[store]` table, an empty one, and one that names the default.
+        for file in [
+            MINIMAL.to_owned(),
+            format!("{MINIMAL}[store]\n"),
+            format!("{MINIMAL}[store]\nkind = \"sqlite\"\n"),
+        ] {
+            let config = Config::from_sources(&file, no_env).unwrap();
+            assert_eq!(config.store, StoreKind::Sqlite, "{file}");
+        }
+
+        let file = format!("{MINIMAL}[store]\nkind = \"memory\"\n");
+        let config = Config::from_sources(&file, no_env).unwrap();
+        assert_eq!(config.store, StoreKind::Memory);
+    }
+
+    #[test]
+    fn an_unknown_store_kind_names_the_key_and_the_value() {
+        for kind in ["postgres", "SQLite", ""] {
+            let file = format!("{MINIMAL}[store]\nkind = \"{kind}\"\n");
+            let error = Config::from_sources(&file, no_env).unwrap_err();
+            assert!(
+                matches!(&error, ConfigError::UnknownStoreKind(found) if found == kind),
+                "{error}"
+            );
+            let message = error.to_string();
+            assert!(message.contains("store.kind"), "{message}");
+            assert!(message.contains(&format!("{kind:?}")), "{message}");
+            assert!(message.contains("\"sqlite\" or \"memory\""), "{message}");
+        }
+    }
+
+    #[test]
+    fn a_store_setting_of_the_wrong_type_is_an_error() {
+        for (store, key) in [
+            ("[store]\nkind = 3\n", "kind"),
+            ("store = \"sqlite\"\n", "store"),
+        ] {
+            let file = format!("{MINIMAL}{store}");
+            let error = Config::from_sources(&file, no_env).unwrap_err();
+            assert!(matches!(error, ConfigError::Toml(_)), "{error}");
+            assert!(error.to_string().contains(key), "{error}");
+        }
     }
 
     #[test]

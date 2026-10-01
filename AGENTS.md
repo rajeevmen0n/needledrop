@@ -10,7 +10,7 @@ Decisions already made, and why:
 
 - **The server is authoritative.** The browser never sees the answer's Deezer ID, title or preview URL until the game is over. A client-only game would leak the answer through the network tab.
 - **The server sends only the audio unlocked so far.** If the full preview reached the browser, anyone could play all 30 seconds. The server cuts the MP3 to the current clip length on every request.
-- **No accounts.** Everyone plays without logging in and each device is remembered. *Today* the whole game state is an encrypted, HttpOnly cookie and there is no database. *Planned (task 11):* the cookie holds only an anonymous player ID and the games and stats live in the server's database. Accepted limit either way: clearing cookies or using a private window gives a fresh player.
+- **No accounts.** Everyone plays without logging in and each device is remembered. *Today* the whole game state is an encrypted, HttpOnly cookie, and the database holds only the song pool, which the game does not read yet. *Planned (task 11):* the cookie holds only an anonymous player ID and the games and stats live in the server's database. Accepted limit either way: clearing cookies or using a private window gives a fresh player.
 - **Daily mode, one song per UTC day for everyone.** *Today* the server plays one hard-coded track (`track_id` in `config.toml`) every day; the game is still keyed to the UTC date, so it resets each day even though the song does not change. *Planned (tasks 10 and 12):* four daily sections — General, Pop, Rock, Hip-hop — each with its own song of the day, drawn from a curated song database. The agreed requirements are in **Roadmap** below; read it before building any of tasks 10–14.
 - **Ladder: 0.1 / 0.3 / 1 / 3 / 8 / 16 / 30 seconds — seven attempts.** The first clips are deliberately tiny; that is the game.
 - **A guess is correct when the normalized title and primary artist both match.** Remasters, live cuts and album variants of the same song have different Deezer IDs, so comparing IDs would reject right answers.
@@ -23,7 +23,7 @@ Decisions already made, and why:
 ```
 browser ─▶ Vite dev server 127.0.0.1:4811 (Svelte SPA) ── /api ─▶ axum server 127.0.0.1:4810 ─▶ api.deezer.com / preview CDN
                                                                       │
-                                                                      └─ data/  (cached mp3 + track JSON, cookie key)
+                                                                      └─ data/  (cached mp3 + track JSON, cookie key, needledrop.db)
 ```
 
 Both processes speak plain HTTP on loopback. Vite proxies `/api` to 4810, so `http://127.0.0.1:4811` is the whole app in development.
@@ -34,23 +34,29 @@ To serve it under a public hostname, put a TLS-terminating reverse proxy in fron
 flake.nix, flake.lock   dev shell: cargo, rustc, clippy, rustfmt, rust-analyzer, bacon, nodejs_24, pnpm, just
 justfile                recipes (below)
 bacon.toml              the `server` job `just dev` uses: restarts the server when server/src, Cargo.toml or config.toml change
-config.toml             bind address, data dir, launch date, the track to play, playlist IDs (not read yet)
+config.toml             bind address, data dir, launch date, the track to play, the store backend, playlist IDs (not read yet)
 server/                 Rust crate `guessthesong-server`
 web/                    Vite + Svelte 5 + TypeScript SPA (plain Vite, not SvelteKit), pnpm
-data/                   runtime state, git-ignored, created by the server
+data/                   runtime state, git-ignored, created by the server: audio/, secret.key, needledrop.db
 ```
 
 ### Server modules (`server/src/`)
 
 | File | Responsibility |
 |---|---|
-| `main.rs` | Tracing, config load, cookie key, shared state, router. Starts loading the song in the background so the first request does not wait for Deezer. No static file serving yet. |
-| `config.rs` | `Config::load()`: `config.toml` (path from `GTS_CONFIG`) with `GTS_BIND`, `GTS_TRACK_ID` and `GTS_SECRET` on top. Fields `bind`, `data_dir`, `launch_date`, `track_id`, `secret`. `Config::from_sources(text, env_lookup)` is the pure, tested part. A bad config stops the server at startup with a message naming the key or variable. `playlists` is not parsed. |
+| `main.rs` | Tracing, config load, cookie key, the store (`store::open`, then `store::seed_if_empty`, both before the listener is bound), shared state, router. Starts loading the song in the background so the first request does not wait for Deezer. No static file serving yet. |
+| `config.rs` | `Config::load()`: `config.toml` (path from `GTS_CONFIG`) with `GTS_BIND`, `GTS_TRACK_ID` and `GTS_SECRET` on top. Fields `bind`, `data_dir`, `launch_date`, `track_id`, `store`, `secret`. `store` is a `StoreKind` (`Sqlite` or `Memory`) read from `[store] kind`: SQLite when the table or the key is left out, and any other value is an error naming `store.kind`. `Config::from_sources(text, env_lookup)` is the pure, tested part. A bad config stops the server at startup with a message naming the key or variable. `playlists` is not parsed. |
 | `deezer.rs` | `Deezer`, a typed client over one `reqwest::Client` (10 s timeout, user agent): `search_tracks(q, limit)`, `track(id)`, `track_meta(id)`, `download_preview(url)`. Reads Deezer's 200-with-error bodies (`DeezerError::NotFound` for code 800, `Api` for the rest). Search results are cached for 10 minutes (500 queries), and the title and artist of every track seen are kept (10,000 tracks, 24 h) so a guess picked from autocomplete needs no request. A request budget (40 per 5 s) refuses to call Deezer near its rate limit: `DeezerError::Throttled`. Nothing retries. No `playlist_tracks` yet. |
 | `mp3.rs` | Pure. `Mp3::parse(bytes)` once per song: skip ID3v2, walk frame headers, keep only the audio frames (no tags, no Xing/Info frame, no partial last frame). `Mp3::prefix(ms)` → the leading frames covering the duration plus 4 padding frames (bit reservoir and encoder delay), as a zero-copy `Bytes`. |
 | `daily.rs` | `Daily::song_for(day)` → `Arc<Song>` (`meta` for matching, `answer` for the reveal, the parsed `mp3`). Today every day is the configured track: `Daily::pick(day)` is the one place the real daily pick will replace. Loads lazily and keeps the song in memory: from `data/audio/<track_id>.mp3` + `<track_id>.json` when both are there and usable, otherwise `/track/{id}` then the preview download, parsed before it is cached (a body that is not an MP3 is a failed download and is not written). A failed load is logged and returned, and the next request after 10 s tries again. `today_utc()` lives here. Its error messages name the track, so they go to the log, never to a client. |
 | `game.rs` | Pure logic: the ladder, `GameState` (the cookie payload) and its transitions, `day_number`, and `normalize_title` / `normalize_artist` (lowercase, strip diacritics, use `title_short`, drop bracketed / "feat." / "- remaster" suffixes, strip non-alphanumerics). Match = normalized title **and** primary artist equal (`is_match`, `TrackMeta::match_key`). It does not care how the track was chosen, so later modes can reuse it. |
-| `routes.rs` | `AppState`, `router(state)`, the handlers, `ApiError`, the cookie session (`load_game` / `store_game`) and `session_key`. `DailyView::new` is the only place the answer is handed out. A guess's metadata is resolved server-side from `trackId` (`Deezer::track_meta`: the cache filled by searches, else `/track/{id}`). |
+| `routes.rs` | `AppState` (the Deezer client, `Daily`, the `Arc<dyn Store>`, the launch date and the cookie key; `deezer()` and `store()` let other modules reach the first and third), `router(state)` (the player's routes plus `admin::routes()`), the player's handlers, `ApiError`, the cookie session (`load_game` / `store_game`) and `session_key`. `find_tracks` is the query trimming and the Deezer search that the player's and the admin's search share. `DailyView::new` is the only place the answer is handed out. A guess's metadata is resolved server-side from `trackId` (`Deezer::track_meta`: the cache filled by searches, else `/track/{id}`). |
+| `admin.rs` | The admin API (see **Admin API** below): `routes()` and the handlers for the pool list, add / retag, remove and the admin search. It reaches the data only through `AppState::store()`. A `StoreError` is logged and answered with 500 `internal` (`store_failed`). The admin routes still to come (state, re-roll, next day, reset) belong here. |
+| `store/mod.rs` | The `Store` trait (async, usable as `dyn Store` through the `async-trait` crate), the only way the server touches persistent data, and its domain types: `Genre` (`pop` / `rock` / `hip-hop`; `slug()`, `from_slug()`, `ALL`), `Genres` (a `BTreeSet<Genre>`), `NewSong`, `PoolSong`, and the opaque `StoreError` (a sentence for the log, nothing to match on). `open(kind, data_dir)` builds the configured backend as an `Arc<dyn Store>`. The signatures are under **Next up**. |
+| `store/memory.rs` | `MemoryStore`: a `Mutex<BTreeMap>`. The backend for handler tests and for `kind = "memory"`. |
+| `store/sqlite.rs` | `SqliteStore`: `<data_dir>/needledrop.db` through rusqlite, with SQLite compiled into the server (the `bundled` feature). One connection behind a mutex; every operation runs in `spawn_blocking`. `open(path)` creates the directory and the file, switches foreign keys on and migrates inside one transaction: `MIGRATIONS` is a list of `(version, script)`, and SQLite's `user_version` records how far a file has got. All SQL and every rusqlite type stay in this file. The scripts are in `store/sqlite/` (`001_songs.sql`: the tables `songs` and `song_genres`). |
+| `store/seed.rs` | `SEED_SONGS`, the six starting songs as plain data, and `seed_if_empty(store)`, which adds them through the trait when the pool has no song at all. |
+| `store/contract.rs` | Test-only. The contract of `Store` as 15 cases over `&dyn Store`, and `contract_tests!(fixture)`, which turns them into tests for one backend. `memory.rs` and `sqlite.rs` both call it; a new backend must too. |
 | `testutil.rs` | Test-only (`#[cfg(test)]`): `synthetic_mp3(frames)` and `MockDeezer`, a Deezer stand-in on a loopback port (`/track/{id}`, `/search/track`, preview downloads, a switch that makes it answer with the rate-limit error). Handler and loader tests run against it, so no test touches the network. |
 
 ### API
@@ -74,13 +80,36 @@ Errors are `{ "error": "<code>", "message": "<sentence>" }`. The messages are fi
 | 404 | `not_found` | No such route. |
 | 409 | `finished` | A move on a game that is already won or lost. Checked before anything is looked up. |
 | 502 | `upstream` | Deezer failed or this server's request budget is used up (search, guess lookup), or the song could not be loaded (`/api/daily`, audio, guess). |
-| 500 | `internal` | Should not happen. |
+| 500 | `internal` | Should not happen on the player's routes. On the admin routes: the store failed, and the reason is in the log. |
 
 **Anti-leak rule:** while `status` is `playing`, nothing sent to the client may contain the answer's Deezer ID, title, artist, album, cover or preview URL — JSON, headers, cookie and error messages alike. `routes::tests` assert it on every playing-state response; keep those assertions when adding routes.
 
 Cookie: named `gts_daily`, holding `game::GameState` as JSON — `{"day":"2026-10-01","attempts":[{"kind":"skip"},{"kind":"wrong","title":"…","artist":"…"}],"status":"playing"}` — encrypted with axum-extra's `PrivateCookieJar`. Attributes: `HttpOnly; SameSite=Lax; Path=/; Max-Age=172800` (2 days), plus `Secure` when the request has `X-Forwarded-Proto: https`. A TLS-terminating reverse proxy in front must send that header (in nginx, `proxy_set_header X-Forwarded-Proto $scheme`). On plain HTTP (the Vite dev server on localhost) the cookie is not `Secure`, or the browser would drop it. Stored titles and artists are cut to 80 characters and 160 bytes, so the worst case (seven wrong guesses) is under 2.7 kB of JSON; a test checks that the whole `Set-Cookie` header for that case stays under 4096 bytes (axum-extra percent-encodes the base64, which adds about 6%). A cookie that is missing, does not decrypt or does not deserialize (impossible states, such as `playing` with seven attempts, are rejected too) is a fresh game, and so is one for another day (`.for_day(today)` is always applied). Unlocked clip length = `ladder[attempts.len()]`.
 
 Cookie key: 64 random bytes written as 128 hexadecimal characters. `GTS_SECRET` if set (`openssl rand -hex 64`), else `<data_dir>/secret.key`, generated on the first start with mode 0600 and reused after that, so cookies survive restarts. A malformed `GTS_SECRET` or key file stops the server at startup; delete the file to get a new key. A new key means every player's game for the day starts again.
+
+### Admin API
+
+Built in task 10: the song half. The clock, the picks and the re-roll are still to come (see **Roadmap → Admin**). **These routes are not protected**, and the anti-leak rule does not apply to them. The conventions are the ones above: camelCase keys, the same error body with fixed messages, and `Cache-Control: no-store` on every response, errors included.
+
+A song row is `{ trackId, title, artist, album, genres, previewFailedOn }`. `title` is Deezer's full title. `genres` is an array of the slugs `pop`, `rock`, `hip-hop`, always in that order, and empty for a song that is in the General pool only. `previewFailedOn` is `"YYYY-MM-DD"` or `null`; nothing sets it until the daily pick exists.
+
+| Route | Behaviour |
+|---|---|
+| `GET /api/admin/songs` | 200 with every song row, sorted by artist, then title, ignoring case, then track ID. |
+| `POST /api/admin/songs` | JSON `{ "trackId": 123, "genres": ["pop", "hip-hop"] }` → 200 with the stored song row. `genres` may be left out, `null` or `[]` (no tags); a slug given twice counts once. A song already in the pool only has its genres replaced: no Deezer request is made, and its stored title, artist, album and `previewFailedOn` are kept. Otherwise the track is fetched from Deezer (`/track/{id}`, one request against the budget) for its title, short title, artist and album, and stored. **It never checks `readable` or `preview`:** a track without a preview is added like any other. Other fields in the body are ignored. The response does not say whether the song was new. |
+| `DELETE /api/admin/songs/{trackId}` | 204 with no body. The song and its genre tags are gone; adding it again starts from nothing. |
+| `GET /api/admin/search?q=` | 200 `[{ id, title, artist, album, cover, playable }]`: the rows of the player's search plus `playable` (`readable` and a non-empty `preview`, read from the search result itself, so there is no request per row). The `q` rules are those of `/api/search`, and both searches share one cached Deezer answer of 25 tracks, but here every release is listed, in Deezer's order, up to all 25. Tracks with a blank title are dropped. |
+
+| Status | `error` | When |
+|---|---|---|
+| 400 | `bad_request` | Add: a body that is not JSON, is not `application/json`, has no whole-number `trackId`, or names a genre that is not one of the three slugs. Nothing is looked up or changed. Remove: a track ID in the path that is not a whole number. |
+| 404 | `unknown_track` | Add: Deezer has no track with that ID, or the track has a blank title. |
+| 404 | `unknown_song` | Remove: the pool has no song with that track ID. |
+| 502 | `upstream` | Add of a song that is not in the pool yet, or search: Deezer failed or the request budget is used up. Nothing is added. |
+| 500 | `internal` | The store failed. |
+
+A method a route does not have (`GET /api/admin/songs/123`) gets axum's 405 with an empty body, as on the player's routes.
 
 ### Frontend (`web/src/`)
 
@@ -131,9 +160,11 @@ All recipes run from the repo root, so the server's working directory is the rep
 - **Before a commit, both must pass:** `nix develop -c just check` and `nix develop -c just test`.
 - **Real-preview test fixture:** `mp3::tests::real_preview_fixture` checks the frame walker against `server/tests/fixtures/preview.mp3` when that file exists, and prints a note and passes when it does not. The file is copyrighted audio and git-ignored (`server/tests/fixtures/*.mp3`); never commit it. Any Deezer `preview` download works as the fixture. All other MP3 tests build synthetic streams.
 - **The machine may run other services**, including other Vite processes. Stop only what you started, by PID; never `pkill -f vite` or similar.
-- Environment variables: `GTS_CONFIG` (config file path, default `config.toml` in the working directory), `GTS_BIND` (overrides `bind`), `GTS_TRACK_ID` (overrides `track_id`, the Deezer track being played), `GTS_SECRET` (cookie key, 128 hex characters; see the cookie notes above), `RUST_LOG` (tracing filter, default `info,tower_http=debug`). A variable that is set but blank counts as unset.
+- Environment variables: `GTS_CONFIG` (config file path, default `config.toml` in the working directory), `GTS_BIND` (overrides `bind`), `GTS_TRACK_ID` (overrides `track_id`, the Deezer track being played), `GTS_SECRET` (cookie key, 128 hex characters; see the cookie notes above), `RUST_LOG` (tracing filter, default `info,tower_http=debug`). A variable that is set but blank counts as unset. The store backend has no variable: it is `[store] kind` in `config.toml`, `"sqlite"` (the default) or `"memory"`. That table has to stay at the end of the file, because in TOML every key after a table header belongs to the table.
 - **What the song is:** the server logs it at `info` on startup (`loaded the song from … title=… artist=…`). That log line is the only place to find the answer without playing.
 - **Deezer cache on disk:** `data/audio/<track_id>.mp3` and `.json` are reused on every start, so restarts (bacon restarts the server on each source change) cost Deezer nothing. Delete the two files to fetch again.
+- **The database:** `data/needledrop.db` (SQLite). The server creates it at startup, brings its schema up to date and, when the pool has no song at all, adds the six seed songs. Delete the file to start again from the seed. A file the server cannot use (not a database, a schema newer than the server knows, tables of another shape) stops it at startup with a message and is left as it was. Any SQLite client can read the file; `node:sqlite` in the dev shell's Node works. Tests never touch it: they use the in-memory store or a database in a temporary directory.
+- **`just server` does not reload.** Only `just dev` (bacon) rebuilds and restarts the API when `server/src`, `server/Cargo.toml` or `config.toml` change. A server started with `just server` runs the binary it was started with until someone restarts it, so check which one is running before expecting a change to be live.
 
 ## Conventions
 
@@ -206,13 +237,13 @@ Agreed with the owner on 2026-10-01. This is the specification for tasks 10–14
 - Only "this track has no preview" skips a song. Deezer being unreachable or over the request budget is not a verdict on the song: the pick fails with 502 `upstream` and is retried, as the song load is today, rather than burning through the pool *(assumed)*.
 - A skipped song stays in the database and is tried again on later days; the day it last failed is recorded and shown in the admin pool list so the owner can remove it *(assumed)*.
 - A section with no pickable song after the day's exclusions and skips answers with an error the UI shows as "No song today" *(assumed)*.
-- **Seed:** six songs, two per genre, in `server/seed.sql` together with the `songs` and `song_genres` tables (chosen on 2026-10-01; that day each was `readable` and its preview downloaded as a full 479,827-byte MP3): Pop — "Billie Jean" (Michael Jackson, `4603408`), "Toxic" (Britney Spears, `15391618`); Rock — "Bohemian Rhapsody" (Queen, `4091937401`), "Back In Black" (AC/DC, `92720046`); Hip-hop — "Lose Yourself" (Eminem, `1109731`), "Juicy" (The Notorious B.I.G., `3616616`). A test database built from that file is at `data/needledrop.db` on the machine where it was made; `data/` is git-ignored, so on a fresh clone run the file through any SQLite client (`node:sqlite` in the dev shell's Node works) until the server creates the database itself. The schema is a starting point that task 10 may extend. The seed is inserted only when the songs table is empty, so later removals stick.
+- **Seed:** six songs, two per genre, in `server/src/store/seed.rs` (`SEED_SONGS`; chosen on 2026-10-01; that day each was `readable` and its preview downloaded as a full 479,827-byte MP3): Pop — "Billie Jean" (Michael Jackson, `4603408`), "Toxic" (Britney Spears, `15391618`); Rock — "Bohemian Rhapsody" (Queen, `4091937401`), "Back In Black" (AC/DC, `92720046`); Hip-hop — "Lose Yourself" (Eminem, `1109731`), "Juicy" (The Notorious B.I.G., `3616616`). The server inserts them at startup, through the `Store` trait, when the pool has no song at all, so later removals stick (removing every song brings the six back at the next start). A database had been built by hand from the old `server/seed.sql`, with the same two tables and no schema version; the SQLite backend adopts such a file as schema version 1 and keeps its rows.
 - **The database stores track IDs and display metadata only — never audio or preview URLs.** Preview URLs are signed and expire in minutes; the MP3 is downloaded when a song is picked for a day and cached under `data/audio/`, as today. With the seed alone, each genre alternates its two songs and General picks one of the three the genres did not take that day.
 - `track_id` in `config.toml`, `GTS_TRACK_ID` and the `playlists` key go away once picks come from the database.
 
 ### Storage
 
-SQLite, one file under `data_dir` *(the SQLite crate is the builder's choice; it must not need a system library or a separate service)*. It holds the songs and their genres, the picks, the players, their games and the day offset. The parsed-preview disk cache in `data/audio/` stays as it is.
+SQLite, one file under `data_dir` *(the SQLite crate is the builder's choice; it must not need a system library or a separate service)*. It holds the songs and their genres, the picks, the players, their games and the day offset. The parsed-preview disk cache in `data/audio/` stays as it is. Built so far (task 10): the trait, both backends, the contract suite and the song operations, on rusqlite with its `bundled` SQLite. Tasks 11 and 12 add the picks, players, games and day offset to the same trait.
 
 **The database sits behind one abstraction**, so MySQL, Postgres, a document store or Firebase can replace SQLite later by writing one new implementation and nothing else (asked for by the owner on 2026-10-01):
 
@@ -222,7 +253,7 @@ SQLite, one file under `data_dir` *(the SQLite crate is the builder's choice; it
 - The only atomicity a backend must provide is single-record: "save this pick unless the day and section already have one" (two requests at midnight must agree on the song), and "replace this game". No multi-table transactions.
 - Two implementations from the start: `SqliteStore`, and an in-memory one for tests. One shared test suite runs against both and is the contract a future backend has to pass.
 - The backend is chosen in `config.toml` (for example `[store] kind = "sqlite"`), defaulting to SQLite.
-- The seed songs are inserted through the trait from a backend-neutral list, so every backend is seeded the same way. `server/seed.sql` is where they are recorded for now; task 10 splits it into that list and the SQLite backend's own schema.
+- The seed songs are inserted through the trait from a backend-neutral list (`store/seed.rs`), so every backend is seeded the same way. The schema belongs to the SQLite backend (`store/sqlite/001_songs.sql`).
 
 **Stats are derived from the stored games, not kept as counters.** Re-rolling a pick or resetting the clock deletes games, and derived stats then correct themselves.
 
@@ -243,7 +274,7 @@ SQLite, one file under `data_dir` *(the SQLite crate is the builder's choice; it
 
 `/admin` in the web app, and `/api/admin/*` on the server. **Unprotected for now** by the owner's choice; it must be protected or disabled before any public deployment, because it can show the day's answers and wipe every player's data. The anti-leak rule applies to the player routes, not to these.
 
-Admin API (route names are a proposal; the behaviour is the requirement):
+Admin API (route names are a proposal; the behaviour is the requirement). The song and search routes are built as written here, and their exact shapes and error codes are under **Admin API** near the top of this file. State, re-roll, next day and reset are task 12:
 
 | Route | Behaviour |
 |---|---|
@@ -285,10 +316,10 @@ The single-game routes become per-section. Proposal: `GET /api/daily/{section}`,
 - [x] **7. Animated background atmosphere** — 2026-10-01. Added oversized sound trails, continuously sweeping champagne highlights and twenty independently drifting dust motes. Playback strengthens the wave; the footer offers Pause motion / Resume motion. Decoration scrolls with the record, with masks protecting the control area, hidden-tab suspension and reduced-motion support. The owner requested more visible idle animation after the initial restrained version. **Final stronger-motion revision was not tested or screenshotted at the owner's explicit request; the owner will verify it.** Existing API/audio/game logic and preview ports are unchanged.
 - [x] **8. Playback-only musical notes** — 2026-10-01. Replaced dust with small authored SVG eighth notes and beamed pairs floating slowly at varied depths. Notes, champagne sweeps and the wave now move only while audio plays and pause in place between clips. Pause override, hidden-tab suspension and reduced-motion support remain. **No tests or screenshots run, as requested by the owner.**
 - [x] **9. Deep-space atmosphere** — 2026-10-01. The owner disliked the floating notes and groove circles and asked for tasteful "space vibes". `Atmosphere.svelte` is now a canvas night sky (`lib/sky.ts` model, `lib/starfield.ts` painter): seeded three-depth starfield with twinkle and slow drift, playback-reactive pace and brightness, shooting stars, two CSS hazes, stars dimmed behind text, and a stardust burst on a win. `App.svelte` gained the eclipse light behind the record, a new SVG header mark (the `◎` glyph is gone), a one-time arrival sequence and a living current step on the clip rail; Play and Guess have glow / light-sweep states. Record, game store, API client and audio engine untouched; `Atmosphere` gained the `status` and `analyser` props. `just check` and `pnpm --dir web test` (45 tests, 31 new for `lib/sky.ts`) pass. Bundle: JS 88.52 kB (33.58 gzip), CSS 23.73 kB (5.77 gzip). **NOT visually verified: no browser was run and no screenshot taken, at the owner's request.** Every size, alpha and timing was chosen by reasoning and one rough offline rasterisation of star positions, so expect tuning. The owner should look at: star density and brightness at idle on a 1× desktop monitor and on a phone (constants at the top of `lib/sky.ts`); whether the idle drift is unnoticeable while typing; the light behind the record at idle and during a long clip (it must read as an eclipse, not a ring); the hazes (the page must still read as black, without banding); a shooting star; the win burst; the arrival sequence; the rail's current step; Play and Guess hover; Pause motion; and scrolling on a phone (the sky is viewport-fixed, the record's light scrolls with the record).
+- [x] **10. Song database (server)** — 2026-10-01. `store/`: the async `Store` trait with the song operations (list, get, add or retag, set genres, remove, record or clear the day a preview check failed), `SqliteStore` (rusqlite 0.40 with SQLite compiled in, schema versioned by `user_version`) and `MemoryStore`, a 15-case contract suite that runs against both, the backend-neutral seed list, and `[store] kind` in `config.toml`. `admin.rs`: `GET` and `POST /api/admin/songs`, `DELETE /api/admin/songs/{trackId}` and `GET /api/admin/search` (see **Admin API**). `server/seed.sql` is gone. Nothing reads the pool: the player routes and `Daily` are unchanged and the game still plays `track_id`. 213 server tests (77 new: 51 store, 23 admin, 3 config); `just check` and `just test` pass. A copy of the hand-built `data/needledrop.db` was opened with the new backend: adopted as schema version 1, its six songs listed, nothing seeded again. **Not run on the live server or against real Deezer.** The API on 4810 had been started with `just server`, which does not reload, and this task was told not to restart it, so the admin routes are proven only by handler tests against the Deezer stand-in. After a restart the owner should check: the server starts on the existing database, `GET /api/admin/songs` lists the six seed songs, and an add, a retag, a remove and an admin search work against real Deezer.
 
 The remaining tasks implement the **Roadmap** section above, in this order. Each is one subagent-sized task and ends with a report to the owner saying what he should test.
 
-- [ ] **10. Song database (server)** — the `Store` trait with its SQLite and in-memory implementations and the shared contract tests (see Storage), the database created under `data_dir` and seeded with the six songs recorded in `server/seed.sql`, and the song half of the admin API: list, add (never validated: callers check playability themselves), change genres, remove, and admin search with the `playable` flag. Nothing reads the pool yet; the game still plays `track_id`.
 - [ ] **11. Anonymous players and stats (server)** — the cookie becomes a player ID; games move from the cookie into the database; stats (current and best streak, played, win rate, guess distribution) are derived from the stored games and returned with the daily state; a route for Clear my data. Still one game per day.
 - [ ] **12. Sections, daily picks and the day clock (server)** — the four sections and the per-section player routes; the pick rules (fixed order, no song twice in a day, no repeat until the pool is used up, a song without a preview skipped for the day); stored picks; the effective day with its offset; the rest of the admin API (state, re-roll, next day, reset to day 1). Removes `track_id`, `GTS_TRACK_ID` and `playlists`.
 - [ ] **13. Player UI: sections, stats, clear data** — the four tabs with their URLs and per-section state, the stats display, the streak while playing, the Clear my data button with its confirmation, "No song today".
@@ -297,10 +328,17 @@ The remaining tasks implement the **Roadmap** section above, in this order. Each
 ### Next up
 
 - The owner reviews the UI on a physical phone and desktop: the night sky (see task 9), the record during a longer clip, reveal, autocomplete with the real keyboard, and first-tap audio in iOS Safari. Follow-up polish should use `DESIGN.md`.
-- Task 10, then 11–14 in order. What they need to know about the code as it stands:
+- Tasks 11–14 in order. What they need to know about the code as it stands:
+  - The store. Handlers reach it through `AppState::store()` (a `&dyn Store`) and turn a `StoreError` into 500 `internal` after logging it (`admin::store_failed`). "Not there" is `None` or `false`, never an error. The trait's signatures are in the reference block below.
+  - Adding to the store takes four steps: a method on the trait in `store/mod.rs` (a domain operation over plain types, atomic for one record); its implementation in `memory.rs` and in `sqlite.rs`; when it needs a table, a new numbered script in `store/sqlite/` appended to `MIGRATIONS` (never edit `001_songs.sql`, because existing databases have already run it); and cases in `store/contract.rs`, with their names added to the list inside `contract_tests!`. `BrokenStore` in `admin::tests` implements the trait too and needs each new method.
+  - The SQLite backend has one connection, so a trait method is atomic by being one closure passed to `SqliteStore::run`. "Save this pick unless the day and section already have one" is an `INSERT … ON CONFLICT DO NOTHING` followed by a read, which is how `add_song` treats a song that is already there.
+  - `Store::set_preview_failed_on` and `Store::song` are implemented and covered by the contract, but nothing in the server calls them until the daily pick does.
+  - A `PoolSong` has `title`, `title_short` and `artist`, which is what `TrackMeta::new` takes. The pick still has to fetch the track from Deezer for the preview URL and the cover.
+  - Handler tests build the whole router over a `MemoryStore`. `routes::tests::Harness` and `admin::tests::Harness` are separate and alike; when task 11 changes the session they could move into `testutil.rs` as one.
+  - `MockTrack::preview(Preview::None)` makes the Deezer stand-in serve a track that is not readable and has no preview.
   - `Daily::pick(day) -> u64` in `daily.rs` is the only thing that decides the track. `song_for`, the disk cache keyed by track ID and the routes already work per day and per track, but `Daily` keeps one song in memory; with sections it needs up to four.
   - `pick` is synchronous and infallible today. A database-backed pick that verifies the preview becomes async and fallible; `song_for` already holds a lock for the whole load and already has the fail / pause 10 s / retry path to hang that on.
-  - `Track::is_playable()` is the readable-and-has-a-preview check. Deezer search results carry `readable` and `preview` too, so the admin search can flag results without a request per row.
+  - `Track::is_playable()` is the readable-and-has-a-preview check. Deezer search results carry `readable` and `preview` too, which is how the admin search flags results without a request per row.
   - Every Deezer call goes through `Deezer::get_json` and counts against the 40-per-5-s request budget, admin routes included.
   - `daily::today_utc()` is read once per request and passed down; the game module has no clock on purpose. The effective day replaces it at that one point.
   - `game::GameState` is the cookie payload today and serializes to JSON; the same value can be stored per player, day and section.
@@ -308,7 +346,7 @@ The remaining tasks implement the **Roadmap** section above, in this order. Each
   - The frontend is plain Vite with no router, and Vite's dev server already answers unknown paths with `index.html`, so `/admin` and `/pop` reach the app; a production build served by the Rust server will need the same fallback.
   - `GuessInput.svelte` knows nothing about the game (it takes `onguess` and `busy`), so the admin search can reuse it or its pattern.
   - `web/mock/` mirrors the single-game API and will need the same changes, or retiring.
-- The two pure modules' public API, for reference:
+- The public API of the two pure modules and of the store, for reference:
 
 ```rust
 // mp3.rs — parse once per song, keep the `Mp3` in shared state, slice per request.
@@ -351,6 +389,27 @@ impl TrackMeta {
 pub fn is_match(answer: &TrackMeta, guess: &TrackMeta) -> bool;
 pub fn normalize_title(title: &str) -> String;
 pub fn normalize_artist(artist: &str) -> String;
+
+// store/mod.rs — the only way to persistent data. Re-exports MemoryStore, SqliteStore, seed_if_empty.
+pub enum Genre { Pop, Rock, HipHop }                             // serde and slug(): "pop" | "rock" | "hip-hop"; Ord in this order
+impl Genre { pub const ALL: [Genre; 3]; pub fn slug(self) -> &'static str; pub fn from_slug(slug: &str) -> Option<Genre>; }
+pub type Genres = std::collections::BTreeSet<Genre>;
+pub struct NewSong { pub track_id: u64, pub title: String, pub title_short: String, pub artist: String, pub album: String }
+pub struct PoolSong { /* the NewSong fields, then */ pub genres: Genres, pub preview_failed_on: Option<Date> }
+impl PoolSong { pub fn new(song: NewSong, genres: Genres) -> PoolSong; }   // no failed check on record
+pub struct StoreError;                                           // opaque; Display is a sentence for the log, never for a client
+impl StoreError { pub fn new(what: impl Display, cause: impl Display) -> StoreError; }
+#[async_trait]
+pub trait Store: Send + Sync {
+    async fn songs(&self) -> Result<Vec<PoolSong>, StoreError>;                  // by ascending track ID
+    async fn song(&self, track_id: u64) -> Result<Option<PoolSong>, StoreError>;
+    async fn add_song(&self, song: NewSong, genres: Genres) -> Result<PoolSong, StoreError>;   // already there: genres replaced, the rest kept
+    async fn set_song_genres(&self, track_id: u64, genres: Genres) -> Result<Option<PoolSong>, StoreError>;   // None: no such song
+    async fn remove_song(&self, track_id: u64) -> Result<bool, StoreError>;      // false: it was not there
+    async fn set_preview_failed_on(&self, track_id: u64, day: Option<Date>) -> Result<bool, StoreError>;
+}
+pub fn open(kind: config::StoreKind, data_dir: &Path) -> Result<Arc<dyn Store>, StoreError>;
+pub async fn seed_if_empty(store: &dyn Store) -> Result<usize, StoreError>;      // how many songs it added: 6 or 0
 ```
 
   Rules the routes follow, which new routes must keep:
@@ -373,7 +432,15 @@ pub fn normalize_artist(artist: &str) -> String;
 - A preview is 29.988 s, so on the last ladder step the client must clamp playback to the decoded buffer's length rather than assume 30 s.
 - Matching drops every `(…)` and `[…]` segment, so "(Remix)" and "(Instrumental)" variants count as the same song as the original, and titles differing only in a bracketed part ("Da Doo Ron Ron (When He Walked Me Home)") lose it. Checked offline against the 2,710 distinct tracks cached during playlist research: 37 key collisions, all the same song in another release, no false merges.
 - `jiff` is the date crate, with its `serde` feature on (`civil::Date` serializes as `"YYYY-MM-DD"`). `rand` is 0.10 and `reqwest` is 0.13, whose APIs and feature names differ from older examples (`rustls`, not `rustls-tls`; `query` is its own feature).
-- reqwest's rustls backend builds `aws-lc-sys` (C code), which makes the first server build take about a minute.
+- reqwest's rustls backend builds `aws-lc-sys` and rusqlite's `bundled` feature builds SQLite, both C code, so the first server build takes one to two minutes.
+- **The admin API is open.** `/api/admin/*` has no authentication, and since task 10 it exists: anyone who can reach port 4810, directly or through the Vite proxy or a reverse proxy's `/api/`, can add and remove songs. Keep the server on loopback until the routes are protected.
+- The admin routes have not been run on the live server or against real Deezer (see task 10 in Progress).
+- Removing every song from the pool brings the six seed songs back at the next start: the rule is "the pool is empty", and nothing records that a pool was seeded before.
+- A song's stored title, artist and album are never refreshed from Deezer, and a retag keeps them. Remove the song and add it again to refetch them.
+- `POST /api/admin/songs` answers 200 for a new song and for a retag alike.
+- The admin search shows at most the 25 tracks Deezer returns for the query; there is no paging.
+- `songs.added_at` is in the SQLite schema (inherited from the hand-built database) but the server neither reads it nor exposes it; the pool is listed by artist and title, not by when a song was added.
+- The SQLite backend cannot hold a track ID above `i64::MAX`: adding one is a store error (500), where the in-memory backend accepts it. Deezer's IDs are around 2³².
 - Audio: the owner confirmed by ear on 2026-10-01, in his own browser, that the plain UI of task 4 worked, clips included. The design pass did not touch `audio.ts`, but nobody has listened since the restyle, and which browsers he used is not recorded: Firefox, Safari / iOS remain unverified. In headless Chromium the truncated clip decodes and an offline render gives the exact clip lengths and fades.
 - iOS: the silent switch mutes Web Audio. No workaround is in place.
 - The record's seven bands are equally wide, not a linear 30 s scale (the first three steps would share 3% of the width), so the needle crosses the early bands quickly and the last ones slowly.

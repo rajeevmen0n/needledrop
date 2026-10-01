@@ -1,4 +1,6 @@
-//! HTTP handlers, the shared state and the encrypted-cookie game session.
+//! The player's HTTP handlers, the shared state and the encrypted-cookie game session.
+//!
+//! The admin routes live in [`crate::admin`] and are mounted by [`router`].
 //!
 //! The rule every handler here keeps: while a game is `playing`, nothing that
 //! identifies the song leaves the server. The answer goes out through one
@@ -29,9 +31,11 @@ use jiff::civil::Date;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    admin,
     daily::{Answer, Daily, Song, today_utc},
     deezer::{Deezer, DeezerError, Track},
     game::{self, Attempt, GameError, GameState, MAX_ATTEMPTS, Status},
+    store::Store,
 };
 
 /// The session cookie: the player's [`GameState`] as JSON, encrypted.
@@ -68,18 +72,38 @@ pub struct AppState(Arc<Shared>);
 struct Shared {
     deezer: Deezer,
     daily: Daily,
+    store: Arc<dyn Store>,
     launch_date: Date,
     key: Key,
 }
 
 impl AppState {
-    pub fn new(deezer: Deezer, daily: Daily, launch_date: Date, key: Key) -> Self {
+    pub fn new(
+        deezer: Deezer,
+        daily: Daily,
+        store: Arc<dyn Store>,
+        launch_date: Date,
+        key: Key,
+    ) -> Self {
         Self(Arc::new(Shared {
             deezer,
             daily,
+            store,
             launch_date,
             key,
         }))
+    }
+
+    /// The Deezer client every handler shares, with its caches and its
+    /// request budget.
+    pub fn deezer(&self) -> &Deezer {
+        &self.0.deezer
+    }
+
+    /// The persistent data. Nothing on the player's routes reads it yet: the
+    /// game still plays the configured track.
+    pub fn store(&self) -> &dyn Store {
+        self.0.store.as_ref()
     }
 
     /// The song played on `day`, loading it if needed.
@@ -109,6 +133,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/daily/audio", get(audio))
         .route("/api/daily/guess", post(guess))
         .route("/api/search", get(search))
+        .merge(admin::routes())
         .fallback(not_found)
         .with_state(state)
 }
@@ -123,8 +148,10 @@ pub fn router(state: AppState) -> Router {
 pub enum ApiError {
     /// 400: the request is not one the route understands.
     BadRequest(&'static str),
-    /// 404: Deezer has no track with the guessed ID.
+    /// 404: Deezer has no track with the given ID.
     UnknownTrack,
+    /// 404: the song pool has no song with the given track ID.
+    UnknownSong,
     /// 404: no such route.
     NotFound,
     /// 409: a move on a game that is already won or lost.
@@ -144,6 +171,11 @@ impl ApiError {
                 StatusCode::NOT_FOUND,
                 "unknown_track",
                 "Deezer has no such track. Pick a song from the list.",
+            ),
+            Self::UnknownSong => (
+                StatusCode::NOT_FOUND,
+                "unknown_song",
+                "That song is not in the pool.",
             ),
             Self::NotFound => (StatusCode::NOT_FOUND, "not_found", "There is nothing here."),
             Self::Finished => (
@@ -176,7 +208,7 @@ impl IntoResponse for ApiError {
 
 /// `Cache-Control: no-store`: every response here depends on the cookie or
 /// changes with the next move, and the site sits behind a CDN.
-fn no_store() -> [(header::HeaderName, HeaderValue); 1] {
+pub(crate) fn no_store() -> [(header::HeaderName, HeaderValue); 1] {
     [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))]
 }
 
@@ -484,10 +516,37 @@ async fn guess(
 
 // --- GET /api/search ------------------------------------------------------------
 
+/// The query string of the two search routes: `?q=`.
 #[derive(Debug, Deserialize)]
-struct SearchParams {
+pub(crate) struct SearchParams {
     #[serde(default)]
     q: String,
+}
+
+/// What Deezer finds for a search request, best match first: up to
+/// [`SEARCH_FETCH`] tracks, as they came. The player's search and the admin's
+/// both start here, so they trim the query alike and share one cached answer.
+///
+/// `q` is trimmed and cut at [`MAX_QUERY_CHARS`]. Fewer than
+/// [`MIN_QUERY_CHARS`] characters find nothing, and Deezer is not asked.
+pub(crate) async fn find_tracks(
+    app: &AppState,
+    params: Result<Query<SearchParams>, QueryRejection>,
+) -> Result<Arc<[Track]>, ApiError> {
+    let Query(params) =
+        params.map_err(|_| ApiError::BadRequest("The search needs one `q` parameter."))?;
+    let query: String = params.q.trim().chars().take(MAX_QUERY_CHARS).collect();
+    if query.chars().count() < MIN_QUERY_CHARS {
+        return Ok(Arc::from(Vec::new()));
+    }
+
+    app.deezer()
+        .search_tracks(&query, SEARCH_FETCH)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "Deezer search failed");
+            ApiError::Upstream("The song search is not answering. Try again in a moment.")
+        })
 }
 
 /// One autocomplete row.
@@ -531,22 +590,7 @@ async fn search(
     State(app): State<AppState>,
     params: Result<Query<SearchParams>, QueryRejection>,
 ) -> Result<Json<Vec<SearchHit>>, ApiError> {
-    let Query(params) =
-        params.map_err(|_| ApiError::BadRequest("The search needs one `q` parameter."))?;
-    let query: String = params.q.trim().chars().take(MAX_QUERY_CHARS).collect();
-    if query.chars().count() < MIN_QUERY_CHARS {
-        return Ok(Json(Vec::new()));
-    }
-
-    let tracks = app
-        .0
-        .deezer
-        .search_tracks(&query, SEARCH_FETCH)
-        .await
-        .map_err(|error| {
-            tracing::warn!(%error, "Deezer search failed");
-            ApiError::Upstream("The song search is not answering. Try again in a moment.")
-        })?;
+    let tracks = find_tracks(&app, params).await?;
     Ok(Json(search_hits(&tracks, SEARCH_RESULTS)))
 }
 
@@ -556,6 +600,7 @@ mod tests {
     use crate::{
         game::{FULL_CLIP_MS, LADDER_MS, TrackMeta},
         mp3::Mp3,
+        store::MemoryStore,
         testutil::{ID3_MARKER, MockDeezer, MockTrack, PREVIEW_FRAMES, synthetic_mp3},
     };
     use axum::{
@@ -628,7 +673,8 @@ mod tests {
             let client = deezer.client();
             let daily = Daily::new(client.clone(), data_dir.path(), ANSWER_ID)
                 .with_retry_after(std::time::Duration::ZERO);
-            let state = AppState::new(client, daily, LAUNCH, Key::generate());
+            let store = Arc::new(MemoryStore::new());
+            let state = AppState::new(client, daily, store, LAUNCH, Key::generate());
             Self {
                 deezer,
                 app: router(state),
