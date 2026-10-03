@@ -84,7 +84,8 @@ colors, not additional UI semantic tokens.
 Champagne is for playing: the play control, Guess, random mode's Next song,
 unlocked clips, the selected tab's line, a win, today's bar in the stats. It is never the colour of a
 destructive action. The button that confirms a deletion is outlined in ivory,
-and there is no red: a problem is ivory text with the "!" mark.
+and there is no red: a problem is ivory text with the "!" mark. A setting is
+not playing either: random mode's chosen genre is ivory, with an ivory line.
 
 Control boundaries map to `--control-border` (#666666), keeping the search field
 boundary above 3:1 against graphite and black. Decorative dividers retain the
@@ -161,6 +162,21 @@ session shows a new song under the line "That session ended after a while
 away. This is a new one.", and the rules line under a finished song says how
 long a session lasts.
 
+Random mode can be kept to one genre (added at the owner's request on
+2026-10-03). The choice is "Genre": All, Pop, Rock or Hip-hop, four equal
+steps on one hairline, the label on a line of its own above them, about 66px
+tall in all. It is for the songs that follow and never replaces the one being
+played, so it sits after everything about this song. While a song is open it
+comes after the history, with "Applies from the next song" in muted type at
+the end of the label's line; Play, the search, Guess and Skip stay where they
+were. Once the song is over it comes straight after Next song, the button it
+decides for: under it and before the cover in the stacked layouts, under the
+row of the play control and Next song in the side layout. Next song itself
+does not move. With "No song to play" it stands between the sentence and
+"Check again", because another genre is the way out; the sentence then names
+the genre that has nothing. The choice belongs to the session, so every
+browser tab shows the same one.
+
 The admin page at `/admin` is a tool for one person and is plain on purpose:
 the same black, type and tokens, with no sky, no record and no sound. One
 column, at most 60rem wide, of panels that are a heading over a hairline, never
@@ -232,6 +248,11 @@ word "endless" for a screen reader and the tooltip. It is never won or lost. The
 selected tab is marked by a 2px champagne line on the row's rule, not by a
 filled shape or a pill.
 
+Random mode's genre is the tab row's quieter relative: words on a rule, the
+chosen one ivory with a 2px ivory line over the rule, the rest muted silver.
+No box, no fill, no pill, no champagne. The line is the shape that says
+"chosen"; the colour only repeats it.
+
 Bars in the stats are thin (10px), square at the baseline and rounded 4px at
 the end the count sits at. Grey bars are context; the one champagne bar is
 today's win, and the word "Today" says so as well.
@@ -243,6 +264,7 @@ autocomplete and its authored listbox; Skip owns progression; Attempts owns
 readable history; Record owns animation and the canvas painter; SectionTabs
 owns the tabs and their keyboard pattern; Figures owns the line of figures,
 Stats a section's record around it with the bars, Score a random session's;
+PoolPicker owns random mode's genre choice and its keyboard pattern;
 Confirm owns the one dialog pattern, for anything that cannot be undone. API
 and game state remain the established behavioral authority in AGENTS.md.
 
@@ -250,6 +272,15 @@ Tabs follow the WAI-ARIA pattern with manual activation: the arrows, Home and
 End move the focus, Enter or Space opens the tab, because opening one stops the
 clip and may wait for the server. Each tab is a link to its own address. Its
 state is in its accessible name ("Pop, won"), never in the mark alone.
+
+The genre choice is a radio group named by its visible label, with the same
+manual activation and for the same reason: the arrows (all four), Home and End
+move the focus, and Space, Enter or a click chooses, because a choice asks the
+server. The option pressed shows as chosen at once and the group is busy until
+the server has answered; if the choice failed, the option that stands is shown
+again and the move-error line says why. Its options are never disabled, only
+marked so, so the keyboard focus stays where it was. A change is announced in
+the page's status line ("Genre set to Rock. It applies from the next song.").
 
 Numbers drawn large or as bars are decoration to a screen reader; each has a
 sentence beside it ("Current streak: 3 days", "Try 3: 4 wins, including
@@ -262,7 +293,7 @@ inside it and leaves the page untouched. Never use the browser's own confirm.
 
 A section without a song says "No song today" where the game would be, and
 offers to check again; random mode with nothing to draw says "No song to
-play" the same way. Next song is a primary button that keeps its width while
+play" the same way, with the genre choice above "Check again". Next song is a primary button that keeps its width while
 the next song is found ("Finding…") and cannot be pressed twice; when the song
 arrives the keyboard focus goes to the play control, never to the search
 field, which would raise a phone's keyboard. News the player did not cause (the song was replaced,
@@ -306,6 +337,8 @@ keeping game state and playback progress available.
 - Preserve the listening and guessing order across viewports.
 - Keep the tab row to one line of five at every width; do not add a sixth
   control to it.
+- Keep the genre choice below Play, the search, Guess and Skip while a song is
+  open, and after Next song once it is over; it must push neither down.
 - Do not put the stats in cards or tiles, and do not colour more than one bar.
 - Do not list the song pool on the admin page, by tabs, pages or "show more":
   the owner asked for a search box and its results only.

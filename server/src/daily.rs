@@ -200,10 +200,11 @@ pub enum DailyError {
     /// preview check today.
     #[error("the {section} section has no song to play on {day}")]
     NoSong { day: Date, section: Section },
-    /// Random mode has nothing to draw: the pool is empty, or everything in
-    /// it plays in a section that day or failed the preview check that day.
-    #[error("there is no song to draw for random mode on {day}")]
-    NoRandomSong { day: Date },
+    /// Random mode has nothing to draw from the pool of `section`, the one
+    /// the player chose: that pool is empty, or everything in it plays in a
+    /// section that day or failed the preview check that day.
+    #[error("there is no song to draw for random mode from the {section} pool on {day}")]
+    NoRandomSong { day: Date, section: Section },
     #[error("looking up track {track_id}: {source}")]
     Lookup {
         track_id: u64,
@@ -605,12 +606,16 @@ impl Daily {
     /// Draws the next song of a random game on `day` and loads it: the track
     /// and its song, ready to be played.
     ///
-    /// `recent` is what the player was given lately, oldest first; see
-    /// [`pick::draw_random`] for what it and the day's picks keep out of the
-    /// draw. So that "the day's picks" means all four, the sections that
-    /// have none yet get their turn first, as a daily request would give it
-    /// to them. One that cannot be picked (Deezer does not answer, or it has
-    /// no song today) does not stop the draw.
+    /// `section` names the pool the player draws from: General for every
+    /// song, a genre for the songs tagged with it. `recent` is what the
+    /// player was given lately, oldest first; see [`pick::draw_random`] for
+    /// what it and the day's picks keep out of the draw. So that "the day's
+    /// picks" means all four, the sections that have none yet get their turn
+    /// first, as a daily request would give it to them, whichever pool the
+    /// draw is from: a rock song that General plays today is as much a
+    /// daily answer as the one Rock plays. A section that cannot be picked
+    /// (Deezer does not answer, or it has no song today) does not stop the
+    /// draw.
     ///
     /// The drawn song is checked as a daily pick is, by loading it. A track
     /// Deezer has no preview for is marked as failed for the day, which takes
@@ -623,6 +628,7 @@ impl Daily {
     pub async fn random_song(
         &self,
         day: Date,
+        section: Section,
         recent: &[u64],
     ) -> Result<(u64, Arc<Song>), DailyError> {
         if self.store.picks_on(day).await?.len() < PICK_ORDER.len() {
@@ -643,11 +649,11 @@ impl Daily {
                 // In a block of its own: the generator must not be alive
                 // across an `await`.
                 let mut rng = rand::rng();
-                pick::draw_random(day, &pool, &taken, recent, &mut rng)
+                pick::draw_random(section, day, &pool, &taken, recent, &mut rng)
             };
             let Some(track_id) = drawn else {
-                tracing::debug!(%day, "no song to draw for random mode");
-                return Err(DailyError::NoRandomSong { day });
+                tracing::debug!(%day, %section, "no song to draw for random mode");
+                return Err(DailyError::NoRandomSong { day, section });
             };
 
             match self.load(&mut work, track_id).await {
@@ -661,7 +667,7 @@ impl Daily {
                     }
                     // One line per song of every player: not for the default log.
                     tracing::debug!(
-                        %day, track_id,
+                        %day, %section, track_id,
                         title = %song.answer.title,
                         artist = %song.answer.artist,
                         "drew a song for random mode"
@@ -1743,9 +1749,15 @@ mod tests {
     impl Bench {
         /// Makes `track_id` what General plays on [`DAY`], without loading it.
         async fn general_plays(&self, track_id: u64) {
+            self.plays(Section::General, track_id).await;
+        }
+
+        /// Makes `track_id` what `section` plays on [`DAY`], without loading
+        /// it.
+        async fn plays(&self, section: Section, track_id: u64) {
             let pick = Pick {
                 day: DAY,
-                section: Section::General,
+                section,
                 track_id,
             };
             assert_eq!(self.store.save_pick(pick).await.unwrap(), pick);
@@ -1801,7 +1813,7 @@ mod tests {
 
         // Nobody has asked for a daily game yet, so nothing is picked.
         assert_eq!(bench.store.picks_on(DAY).await.unwrap(), Vec::new());
-        let (track_id, song) = daily.random_song(DAY, &[]).await.unwrap();
+        let (track_id, song) = daily.random_song(DAY, Section::General, &[]).await.unwrap();
 
         // The day's four picks were made on the way, and the genres had one
         // song each to take; General took one of the two that were left.
@@ -1817,7 +1829,10 @@ mod tests {
 
         // And it stays that one, however often it is drawn.
         for _ in 0..5 {
-            let (again, _) = daily.random_song(DAY, &[track_id]).await.unwrap();
+            let (again, _) = daily
+                .random_song(DAY, Section::General, &[track_id])
+                .await
+                .unwrap();
             assert_eq!(again, track_id);
         }
         // Drawing stores no pick and leaves no mark on the pool.
@@ -1833,15 +1848,21 @@ mod tests {
 
         // One song is neither today's nor recent.
         for _ in 0..5 {
-            let (track_id, _) = daily.random_song(DAY, &[101, 102, 103]).await.unwrap();
+            let (track_id, _) = daily
+                .random_song(DAY, Section::General, &[101, 102, 103])
+                .await
+                .unwrap();
             assert_eq!(track_id, 104);
         }
         // All four are recent: the one played longest ago comes back.
-        let (track_id, _) = daily.random_song(DAY, &[102, 101, 103, 104]).await.unwrap();
+        let (track_id, _) = daily
+            .random_song(DAY, Section::General, &[102, 101, 103, 104])
+            .await
+            .unwrap();
         assert_eq!(track_id, 102);
         // Today's song does not, however long ago it was played here.
         let (track_id, _) = daily
-            .random_song(DAY, &[100, 102, 101, 103, 104, 102])
+            .random_song(DAY, Section::General, &[100, 102, 101, 103, 104, 102])
             .await
             .unwrap();
         assert_eq!(track_id, 101);
@@ -1862,7 +1883,10 @@ mod tests {
 
         // The one playable candidate is recent, so the three that are not
         // are drawn first, each found without a preview, each marked.
-        let (track_id, _) = daily.random_song(DAY, &[101]).await.unwrap();
+        let (track_id, _) = daily
+            .random_song(DAY, Section::General, &[101])
+            .await
+            .unwrap();
         assert_eq!(track_id, 101);
         for failed in [NOT_AN_MP3, WITHDRAWN, UNKNOWN] {
             assert_eq!(bench.failed_on(failed).await, Some(DAY), "track {failed}");
@@ -1872,7 +1896,10 @@ mod tests {
 
         // Marked for the day, they are not asked about again.
         let hits = bench.deezer.api_hits();
-        let (track_id, _) = daily.random_song(DAY, &[101]).await.unwrap();
+        let (track_id, _) = daily
+            .random_song(DAY, Section::General, &[101])
+            .await
+            .unwrap();
         assert_eq!(track_id, 101);
         assert_eq!(bench.deezer.api_hits(), hits);
     }
@@ -1888,7 +1915,11 @@ mod tests {
             .await
             .unwrap();
 
-        let (track_id, _) = bench.daily().random_song(DAY, &[]).await.unwrap();
+        let (track_id, _) = bench
+            .daily()
+            .random_song(DAY, Section::General, &[])
+            .await
+            .unwrap();
         assert_eq!(track_id, 101);
         assert_eq!(bench.failed_on(101).await, None);
     }
@@ -1901,7 +1932,10 @@ mod tests {
         let daily = bench.eager();
 
         bench.deezer.set_failing(true);
-        let error = daily.random_song(DAY, &[]).await.unwrap_err();
+        let error = daily
+            .random_song(DAY, Section::General, &[])
+            .await
+            .unwrap_err();
         assert!(matches!(error, DailyError::Lookup { .. }), "{error}");
         // Nothing is concluded about either song.
         assert_eq!(bench.failed_on(100).await, None);
@@ -1910,13 +1944,16 @@ mod tests {
         // The random song can be had while General's cannot: only the track
         // of the random one is on the disk.
         bench.deezer.set_failing(false);
-        let (track_id, _) = daily.random_song(DAY, &[]).await.unwrap();
+        let (track_id, _) = daily.random_song(DAY, Section::General, &[]).await.unwrap();
         assert_eq!(track_id, 101);
         std::fs::remove_file(bench.dir.path().join("audio/100.mp3")).unwrap();
         bench.deezer.set_failing(true);
         let restarted = bench.eager();
         assert!(restarted.song(DAY, Section::General).await.is_err());
-        let (track_id, _) = restarted.random_song(DAY, &[]).await.unwrap();
+        let (track_id, _) = restarted
+            .random_song(DAY, Section::General, &[])
+            .await
+            .unwrap();
         assert_eq!(track_id, 101);
     }
 
@@ -1924,18 +1961,166 @@ mod tests {
     async fn random_mode_has_nothing_to_draw_when_the_day_took_everything() {
         // An empty pool.
         let bench = Bench::new(&[]).await;
-        let error = bench.daily().random_song(DAY, &[]).await.unwrap_err();
+        let error = bench
+            .daily()
+            .random_song(DAY, Section::General, &[])
+            .await
+            .unwrap_err();
         assert!(
-            matches!(error, DailyError::NoRandomSong { day } if day == DAY),
+            matches!(error, DailyError::NoRandomSong { day, section } if day == DAY && section == Section::General),
             "{error}"
         );
         assert!(!error.condemns_the_song());
 
         // One song, and General plays it: the pick was made by the draw.
         let bench = Bench::new(&[(100, &[])]).await;
-        let error = bench.daily().random_song(DAY, &[]).await.unwrap_err();
+        let error = bench
+            .daily()
+            .random_song(DAY, Section::General, &[])
+            .await
+            .unwrap_err();
         assert!(matches!(error, DailyError::NoRandomSong { .. }), "{error}");
         assert_eq!(bench.pick(DAY, Section::General).await, Some(100));
+    }
+
+    #[tokio::test]
+    async fn a_random_song_from_a_genre_is_one_of_its_songs_and_none_of_the_days() {
+        let bench = Bench::new(&[
+            (100, &[Genre::Pop]),
+            (101, &[Genre::Pop]),
+            (102, &[Genre::Pop, Genre::Rock]),
+            (103, &[Genre::Rock]),
+            (104, &[]),
+            (105, &[]),
+            (106, &[Genre::HipHop]),
+        ])
+        .await;
+        // The day's four songs stand, one of each pool.
+        bench.plays(POP, 100).await;
+        bench.plays(ROCK, 103).await;
+        bench.plays(HIP_HOP, 106).await;
+        bench.general_plays(104).await;
+        let daily = bench.daily();
+
+        // Pop has two songs that no section plays, and nothing else is drawn.
+        let mut drawn = BTreeSet::new();
+        for _ in 0..40 {
+            let (track_id, song) = daily.random_song(DAY, POP, &[]).await.unwrap();
+            assert_eq!(song.answer.title, format!("Song {track_id}"));
+            drawn.insert(track_id);
+        }
+        assert_eq!(drawn, BTreeSet::from([101, 102]));
+        // The recent songs are avoided inside the genre: the untagged 105 is
+        // not what is left, and when both pop songs are recent the one
+        // played longer ago comes back.
+        for _ in 0..5 {
+            let (track_id, _) = daily.random_song(DAY, POP, &[101]).await.unwrap();
+            assert_eq!(track_id, 102);
+            let (track_id, _) = daily.random_song(DAY, POP, &[101, 102]).await.unwrap();
+            assert_eq!(track_id, 101);
+            let (track_id, _) = daily.random_song(DAY, POP, &[102, 105, 101]).await.unwrap();
+            assert_eq!(track_id, 102);
+        }
+
+        // Rock's own song is its pick today: the one it shares with Pop is
+        // all there is, recent or not.
+        for recent in [&[][..], &[102]] {
+            let (track_id, _) = daily.random_song(DAY, ROCK, recent).await.unwrap();
+            assert_eq!(track_id, 102);
+        }
+        // Hip-hop has one song and plays it today: nothing to draw there,
+        // and the error says where.
+        let error = daily.random_song(DAY, HIP_HOP, &[]).await.unwrap_err();
+        assert!(
+            matches!(error, DailyError::NoRandomSong { day, section } if day == DAY && section == HIP_HOP),
+            "{error}"
+        );
+        assert!(error.to_string().contains("hip-hop"), "{error}");
+        // The whole pool still has the songs of every genre and of none.
+        let (track_id, _) = daily
+            .random_song(DAY, Section::General, &[101, 102])
+            .await
+            .unwrap();
+        assert_eq!(track_id, 105);
+
+        // Drawing stored no pick and left no mark on the pool.
+        assert_eq!(bench.store.picks_on(DAY).await.unwrap().len(), 4);
+        for track_id in 100..=106 {
+            assert_eq!(bench.failed_on(track_id).await, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_draw_from_a_genre_makes_all_four_of_the_days_picks_first() {
+        // Three pop songs and one rock song, and nothing picked yet.
+        let bench = Bench::new(&[
+            (100, &[Genre::Pop]),
+            (101, &[Genre::Pop]),
+            (102, &[Genre::Pop]),
+            (103, &[Genre::Rock]),
+        ])
+        .await;
+        let daily = bench.daily();
+        assert_eq!(bench.store.picks_on(DAY).await.unwrap(), Vec::new());
+
+        let (track_id, _) = daily.random_song(DAY, POP, &[]).await.unwrap();
+
+        // Pop took one of its songs and Rock its only one, so General, which
+        // draws on everything, took a second pop song. That one is a daily
+        // answer too: the random song is the third.
+        let pop = bench.pick(DAY, POP).await.unwrap();
+        let general = bench.pick(DAY, Section::General).await.unwrap();
+        assert_eq!(bench.pick(DAY, ROCK).await, Some(103));
+        assert_eq!(bench.pick(DAY, HIP_HOP).await, None);
+        assert_ne!(pop, general);
+        assert_eq!(track_id, 100 + 101 + 102 - pop - general);
+        for _ in 0..5 {
+            let (again, _) = daily.random_song(DAY, POP, &[track_id]).await.unwrap();
+            assert_eq!(again, track_id);
+        }
+        // Rock's one song is its pick, so there is no rock to draw today.
+        let error = daily.random_song(DAY, ROCK, &[]).await.unwrap_err();
+        assert!(
+            matches!(error, DailyError::NoRandomSong { section, .. } if section == ROCK),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_draw_from_a_genre_marks_a_song_without_a_preview_and_draws_another_of_the_genre() {
+        let bench = Bench::new(&[
+            (100, &[]),
+            (101, &[Genre::Pop]),
+            (WITHDRAWN, &[Genre::Pop]),
+            (102, &[]),
+        ])
+        .await;
+        // Pop plays a song that has left the pool since, so that neither of
+        // its two is taken.
+        bench.general_plays(100).await;
+        bench.plays(POP, ID).await;
+        let daily = bench.daily();
+
+        // The withdrawn track is the pop song that is not recent, so it is
+        // drawn first, found without a preview and marked. What follows is
+        // the other pop song, recent as it is, and not the untagged one that
+        // the player has never had.
+        let (track_id, _) = daily.random_song(DAY, POP, &[101]).await.unwrap();
+        assert_eq!(track_id, 101);
+        assert_eq!(bench.failed_on(WITHDRAWN).await, Some(DAY));
+        assert_eq!(bench.failed_on(101).await, None);
+        assert_eq!(bench.failed_on(102).await, None);
+
+        // With the only playable pop song gone, the genre has nothing left
+        // today, and the whole pool has.
+        assert!(bench.store.remove_song(101).await.unwrap());
+        let error = daily.random_song(DAY, POP, &[]).await.unwrap_err();
+        assert!(
+            matches!(error, DailyError::NoRandomSong { section, .. } if section == POP),
+            "{error}"
+        );
+        let (track_id, _) = daily.random_song(DAY, Section::General, &[]).await.unwrap();
+        assert_eq!(track_id, 102);
     }
 
     // --- pure pieces ------------------------------------------------------------------

@@ -670,12 +670,24 @@ impl Player {
     }
 
     /// `POST /api/random/start`, with no body: the session to play in, a new
-    /// one unless one is still going.
+    /// one unless one is still going, drawing from the pool it has.
     pub async fn random_start(&mut self) -> Reply {
         let request = Request::post("/api/random/start")
             .body(Body::empty())
             .unwrap();
         self.send(request).await
+    }
+
+    /// `POST /api/random/start` with `{ "pool": <slug> }`: the session to
+    /// play in, drawing its next songs from the pool of `pool`.
+    pub async fn random_start_from(&mut self, pool: Section) -> Reply {
+        self.random_start_with(json!({ "pool": pool })).await
+    }
+
+    /// `POST /api/random/start` with a JSON body.
+    pub async fn random_start_with(&mut self, body: Value) -> Reply {
+        self.post_to("/api/random/start", "application/json", body.to_string())
+            .await
     }
 
     /// A skip of the random song `round`.

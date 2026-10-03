@@ -1,16 +1,27 @@
 //! Random mode: one song after another, for as long as the player likes.
 //!
 //! The game is the daily one (the same ladder, the same matching, a skip or
-//! a wrong guess costs a try), played against a song drawn from the whole
+//! a wrong guess costs a try), played against a song drawn from the song
 //! pool instead of the day's pick. When a song is over the player asks for
 //! the next, without limit. Nothing here has a day: a random game belongs to
 //! a player and to nothing else.
 //!
 //! **The state** is one [`RandomGame`] per player, kept in the store and
 //! replaced whole: the song being played and the tries used on it, the score
-//! of the session, when the session was last played, and the two things that
-//! outlast a session, the longest run and the songs played lately. It is
-//! pure: no I/O and no clock; whoever plays says what time it is.
+//! of the session, when the session was last played, the pool its songs are
+//! drawn from, and the two things that outlast a session, the longest run
+//! and the songs played lately. It is pure: no I/O and no clock; whoever
+//! plays says what time it is.
+//!
+//! **The pool** is the player's choice of what to be given: every song
+//! (`general`, which it is until they choose), or only the songs of one
+//! genre. It is a [`Section`], because those are the four pools the song
+//! database has. The choice is about the songs to come. It travels on
+//! `POST /api/random/start`, and changing it in the middle of a song draws
+//! nothing: the song being played stays, with its tries, and the session,
+//! its run and its score go on across genres. So a change of genre is no
+//! way to give up a song, which the owner did not want random mode to have.
+//! Nor is it playing: it does not keep a session alive.
 //!
 //! **A session** is the player's, in whatever browser tab, and it ends by
 //! itself: one that has not been played for [`SESSION_IDLE`] is over. Playing
@@ -33,6 +44,10 @@
 //! through one place only ([`RandomView::new`]), and only once the song is
 //! won or lost; the round is a counter and says nothing about the track.
 //!
+//! The pool a session draws from is in every view, and it is not a part of
+//! that secret: it is what the player asked for, it is about the next song,
+//! and the song on screen may well have been drawn from another.
+//!
 //! Drawing and loading the songs is [`crate::daily`]'s work, because a random
 //! song must not be one of the day's four and comes from the same Deezer.
 
@@ -40,6 +55,7 @@ use std::{sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
+    body::Bytes,
     extract::{State, rejection::JsonRejection},
     http::{HeaderMap, HeaderValue, header},
     response::{IntoResponse, Response},
@@ -54,7 +70,7 @@ use crate::{
     game::{self, Attempt, GameError, GameState, MAX_ATTEMPTS, Status, TrackMeta},
     player,
     routes::{ApiError, AppState, daily_failed, guessed_track, no_store, store_failed},
-    store::PlayerId,
+    store::{PlayerId, Section},
 };
 
 /// How many of a player's latest songs are remembered, so that the draw can
@@ -91,11 +107,11 @@ pub struct InvalidRandom(&'static str);
 /// keeps per player; as JSON it reads
 ///
 /// ```json
-/// {"round":12,"track_id":3135556,"game":{"day":"2026-10-01","attempts":[{"kind":"skip"}],"status":"playing"},"run":2,"played":3,"won":2,"best_run":5,"recent":[916424,3135556],"active_at":1790899200}
+/// {"round":12,"track_id":3135556,"game":{"day":"2026-10-01","attempts":[{"kind":"skip"}],"status":"playing"},"run":2,"played":3,"won":2,"best_run":5,"recent":[916424,3135556],"active_at":1790899200,"pool":"rock"}
 /// ```
 ///
 /// Times are seconds since the Unix epoch, and they are the caller's: every
-/// method that plays takes `now`.
+/// method that plays takes `now`. The pool is a section's slug.
 ///
 /// Deserializing checks that the parts agree (see [`InvalidRandom`]), so the
 /// methods can rely on it. Treat a state that fails to deserialize like one
@@ -126,6 +142,15 @@ pub struct RandomGame {
     /// When the session was last played: its start, a move or a next song.
     /// The session is over [`SESSION_IDLE`] after this.
     active_at: i64,
+    /// The pool the session's next songs are drawn from: General for every
+    /// song, a genre for the songs tagged with it. It says nothing about the
+    /// song being played, which was drawn from whatever the pool was then.
+    pool: Section,
+}
+
+/// The pool of a player who has not chosen one: every song.
+fn whole_pool() -> Section {
+    Section::General
 }
 
 /// [`RandomGame`] as read from where it was stored, before its invariants
@@ -145,6 +170,11 @@ struct StoredRandom {
     /// outlasts a session is carried over from it all the same.
     #[serde(default)]
     active_at: i64,
+    /// Missing in a record stored before the pool could be chosen, when
+    /// every song was drawn from all of them. A slug that is none of the
+    /// four is no state at all, like any other field that cannot be read.
+    #[serde(default = "whole_pool")]
+    pool: Section,
 }
 
 impl TryFrom<StoredRandom> for RandomGame {
@@ -191,6 +221,7 @@ impl TryFrom<StoredRandom> for RandomGame {
             best_run: stored.best_run,
             recent: stored.recent,
             active_at: stored.active_at,
+            pool: stored.pool,
         })
     }
 }
@@ -215,7 +246,19 @@ impl RandomGame {
     /// until now, if they had one, in whatever state: its longest run and
     /// its recent songs are carried over, and the round goes on counting
     /// from it.
-    pub fn start(previous: Option<&RandomGame>, track_id: u64, day: Date, now: i64) -> Self {
+    ///
+    /// `pool` is what the session draws from, and what `track_id` was drawn
+    /// from. It is the caller's to decide, because the draw comes before the
+    /// session: the player's choice if they made one, else the pool of
+    /// `previous` ([`pool`](Self::pool)), which so carries over like the
+    /// longest run, else all of it.
+    pub fn start(
+        previous: Option<&RandomGame>,
+        track_id: u64,
+        pool: Section,
+        day: Date,
+        now: i64,
+    ) -> Self {
         Self {
             round: previous.map_or(1, |previous| previous.round.saturating_add(1)),
             track_id,
@@ -229,11 +272,14 @@ impl RandomGame {
                 track_id,
             ),
             active_at: now,
+            pool,
         }
     }
 
     /// The same session on its next song, `track_id`, drawn on `day` at
-    /// `now`. Only a song that is won or lost can be left behind.
+    /// `now`. Only a song that is won or lost can be left behind. The pool
+    /// stays what it is: a session draws from it until the player chooses
+    /// another.
     pub fn next(&self, track_id: u64, day: Date, now: i64) -> Result<Self, Unfinished> {
         if !self.game.is_finished() {
             return Err(Unfinished);
@@ -248,7 +294,20 @@ impl RandomGame {
             best_run: self.best_run,
             recent: remembering(&self.recent, track_id),
             active_at: now,
+            pool: self.pool,
         })
+    }
+
+    /// Changes the pool the songs to come are drawn from, and nothing else.
+    ///
+    /// The song being played stays, with its tries: the player asked for
+    /// other songs from here on, not for another song now, and a change of
+    /// genre that replaced the song would be the give-up shortcut random
+    /// mode does not have. The round, the score and the recent songs are
+    /// the session's, whatever it draws from. And choosing is not playing:
+    /// it takes no `now`, and the session ends when it would have ended.
+    pub fn draw_from(&mut self, pool: Section) {
+        self.pool = pool;
     }
 
     /// Whether the session has ended by `now`: it was last played
@@ -305,6 +364,11 @@ impl RandomGame {
     /// When the session was last played, in seconds since the Unix epoch.
     pub fn active_at(&self) -> i64 {
         self.active_at
+    }
+
+    /// The pool the next songs are drawn from; see the field.
+    pub fn pool(&self) -> Section {
+        self.pool
     }
 
     /// Gives up the current turn at `now`; see [`GameState::skip`]. A skip
@@ -387,6 +451,10 @@ struct RandomView<'a> {
     played: u32,
     /// Songs won in this session.
     won: u32,
+    /// The pool the session's next songs are drawn from, as a section's
+    /// slug. The player's own choice, and not necessarily where the song
+    /// being played came from, so it gives nothing of that song away.
+    pool: Section,
 }
 
 impl<'a> RandomView<'a> {
@@ -406,6 +474,7 @@ impl<'a> RandomView<'a> {
             best_run: game.best_run(),
             played: game.played(),
             won: game.won(),
+            pool: game.pool(),
         }
     }
 }
@@ -500,12 +569,67 @@ async fn audio(State(app): State<AppState>, jar: PrivateCookieJar) -> Result<Res
 
 // --- POST /api/random/start -------------------------------------------------------
 
-/// The session to play in. A player whose session is still going is given
-/// it as it stands: nothing is drawn and nothing is written, so a second
-/// browser tab joins the session instead of ending it. Otherwise a new
-/// session begins: a song is drawn, and the run and the totals start at
-/// zero; the longest run and the recent songs carry over from the session
-/// that ended. The body is not looked at.
+/// The pool a start asks to draw from: `Some(Some(pool))` for
+/// `{ "pool": "rock" }`, and `Some(None)`, no choice, for a body that is
+/// empty, `{}` or `{ "pool": null }`. `None` when the body is anything else:
+/// not a JSON object, or a `pool` that is none of the four slugs. Other
+/// fields are not looked at.
+///
+/// The content type is not looked at either: "the session to play in" is a
+/// request without a body, and a client that sends none has no reason to
+/// label it. It is read like the body of a re-roll, which names a section or
+/// none in the same way.
+fn chosen_pool(body: &[u8]) -> Option<Option<Section>> {
+    if body.trim_ascii().is_empty() {
+        return Some(None);
+    }
+    let body: serde_json::Value = serde_json::from_slice(body).ok()?;
+    match body.as_object()?.get("pool") {
+        None | Some(serde_json::Value::Null) => Some(None),
+        Some(pool) => Section::deserialize(pool).ok().map(Some),
+    }
+}
+
+/// Makes `choice` the pool `game` draws from and stores the game, when it is
+/// a choice and not the pool the game has already. To be called with the
+/// player's turn taken, on the game as it was read under the lock.
+///
+/// Nothing else of the game changes ([`RandomGame::draw_from`]): no song is
+/// drawn, and the write does not count as playing.
+async fn choose_pool(
+    app: &AppState,
+    player: &PlayerId,
+    game: &mut RandomGame,
+    choice: Option<Section>,
+) -> Result<(), ApiError> {
+    let Some(pool) = choice.filter(|pool| *pool != game.pool()) else {
+        return Ok(());
+    };
+    game.draw_from(pool);
+    app.store()
+        .save_random_game(player, game)
+        .await
+        .map_err(store_failed)
+}
+
+/// The session to play in, and the pool it draws from.
+///
+/// The body may name a pool: `{ "pool": "rock" }`, one of the four section
+/// slugs ([`chosen_pool`]). This is where the choice travels because the
+/// deployment forwards a fixed list of routes, and because choosing what to
+/// be given is part of saying where one wants to play.
+///
+/// A player whose session is still going is given it as it stands: nothing
+/// is drawn, so a second browser tab joins the session instead of ending
+/// it. Without a choice, or with the pool the session has, nothing is
+/// written either. Another pool is stored, and that is all: the song being
+/// played, its tries, the score and the time the session was last played
+/// stay, and the next song is the first to be drawn from the new pool.
+///
+/// Otherwise a new session begins: a song is drawn, and the run and the
+/// totals start at zero; the longest run and the recent songs carry over
+/// from the session that ended, and so does its pool, unless the request
+/// chooses one. A player without a record draws from all of it.
 ///
 /// This is the one route of random mode that works without a cookie: it is
 /// the first thing a new player's page sends.
@@ -513,7 +637,13 @@ async fn start(
     State(app): State<AppState>,
     jar: PrivateCookieJar,
     headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Response, ApiError> {
+    // Read before anyone is asked who is playing, like every body.
+    let choice = chosen_pool(&body).ok_or(ApiError::BadRequest(
+        "Send {\"pool\": <\"general\", \"pop\", \"rock\" or \"hip-hop\">} as JSON, or no body to keep the pool as it is.",
+    ))?;
+
     let now = app.now();
     let today = app.today().await?;
     let known = player::known_player(&jar);
@@ -526,16 +656,54 @@ async fn start(
     if let (Some(player), Some(game)) = (&known, &previous)
         && !game.is_over(now)
     {
+        // The song first, as everything slow: a song that cannot be loaded
+        // is an error before anything is written.
         let song = song_of(&app, game).await?;
-        return Ok(game_response(jar, &headers, player, game, &song));
+        if choice.is_none_or(|pool| pool == game.pool()) {
+            return Ok(game_response(jar, &headers, player, game, &song));
+        }
+
+        // Another pool for the songs to come: a write, so it takes the
+        // player's turn and is made on the game as it stands then. A move
+        // made in another tab since the look above must not be undone by
+        // storing what was read there.
+        let changed = {
+            let _turn = app.move_locks().lock(player).await;
+            match stored_game(&app, player).await? {
+                Some(mut current) if !current.is_over(now) => {
+                    choose_pool(&app, player, &mut current, choice).await?;
+                    Some(current)
+                }
+                _ => None,
+            }
+        };
+        if let Some(changed) = changed {
+            // Another tab may have moved on to the next song in between;
+            // then it is that song the view is about.
+            let song = if changed.round() == game.round() {
+                song
+            } else {
+                song_of(&app, &changed).await?
+            };
+            return Ok(game_response(jar, &headers, player, &changed, &song));
+        }
+        // The session is gone since the look above (Clear my data, a
+        // reset): what is left to do is to begin one, as below.
     }
 
+    // The pool of the new session: the one asked for, else the one the
+    // player drew from last, else all of it. It is settled here, before the
+    // draw, and the session that begins keeps it whatever the record says
+    // by then: its first song was drawn from this pool.
+    let pool = choice
+        .or(previous.as_ref().map(RandomGame::pool))
+        .unwrap_or_else(whole_pool);
     // The slow part, before the player's turn is taken: the draw loads the
     // song, which can be a download.
     let recent = previous.map_or_else(Vec::new, |game| game.recent().to_vec());
     let (track_id, song) = app
         .daily()
-        .random_song(today, &recent)
+        .random_song(today, pool, &recent)
         .await
         .map_err(daily_failed)?;
     let player = known.unwrap_or_else(PlayerId::generate);
@@ -549,9 +717,15 @@ async fn start(
         // song since the look above, and its run must not be lost.
         let current = stored_game(&app, &player).await?;
         match current {
-            Some(game) if !game.is_over(now) => Err(game),
+            Some(mut game) if !game.is_over(now) => {
+                // Joining it with a choice of one's own is what choosing in
+                // a session that is going always is: the pool of the songs
+                // to come, and the other tab's song stays.
+                choose_pool(&app, &player, &mut game, choice).await?;
+                Err(game)
+            }
             previous => {
-                let game = RandomGame::start(previous.as_ref(), track_id, today, now);
+                let game = RandomGame::start(previous.as_ref(), track_id, pool, today, now);
                 app.store()
                     .save_random_game(&player, &game)
                     .await
@@ -673,6 +847,10 @@ struct NextRequest {
 /// The next song of the session, once the current one is won or lost. The
 /// run and the totals go on, and so does the session: asking for a song is
 /// playing.
+///
+/// It is drawn from the pool the session has. When that pool has nothing to
+/// give (404 `no_song`), nothing is changed, and the player can choose
+/// another with `POST /api/random/start` and ask again.
 async fn next(
     State(app): State<AppState>,
     jar: PrivateCookieJar,
@@ -696,7 +874,7 @@ async fn next(
     // The slow part, before the player's turn is taken.
     let (track_id, song) = app
         .daily()
-        .random_song(today, planned.recent())
+        .random_song(today, planned.pool(), planned.recent())
         .await
         .map_err(daily_failed)?;
 
@@ -706,6 +884,9 @@ async fn next(
         // Two requests for the song after the same one (a double tap, two
         // tabs): the first moves on, and the second finds another round.
         same_round(&current, round)?;
+        // The pool may have been changed in another tab since the song was
+        // drawn. The song is played all the same, and the session keeps the
+        // pool it has now: the change is about the songs after this one.
         let game = current
             .next(track_id, today, now)
             .map_err(|Unfinished| ApiError::Unfinished)?;
@@ -764,7 +945,7 @@ mod tests {
 
     #[test]
     fn a_first_session_starts_at_round_one_with_nothing_on_record() {
-        let game = RandomGame::start(None, 7, DAY, NOW);
+        let game = RandomGame::start(None, 7, Section::General, DAY, NOW);
         assert_eq!(game.round(), 1);
         assert_eq!(game.track_id(), 7);
         assert_eq!(game.game(), &GameState::new(DAY));
@@ -775,7 +956,7 @@ mod tests {
 
     #[test]
     fn a_win_adds_to_the_run_and_a_loss_ends_it_but_not_the_best() {
-        let mut game = RandomGame::start(None, 1, DAY, NOW);
+        let mut game = RandomGame::start(None, 1, Section::General, DAY, NOW);
         // Misses on the way change nothing of the score.
         assert_eq!(game.skip(NOW), Ok(Status::Playing));
         assert_eq!(
@@ -816,7 +997,7 @@ mod tests {
 
     #[test]
     fn a_finished_song_takes_no_more_moves_and_is_counted_once() {
-        let mut won = RandomGame::start(None, 1, DAY, NOW);
+        let mut won = RandomGame::start(None, 1, Section::General, DAY, NOW);
         win(&mut won);
         let before = won.clone();
         assert_eq!(won.skip(NOW), Err(GameError::Finished));
@@ -826,7 +1007,7 @@ mod tests {
         );
         assert_eq!(won, before);
 
-        let mut lost = RandomGame::start(None, 1, DAY, NOW);
+        let mut lost = RandomGame::start(None, 1, Section::General, DAY, NOW);
         lose(&mut lost);
         let before = lost.clone();
         assert_eq!(lost.skip(NOW), Err(GameError::Finished));
@@ -840,7 +1021,7 @@ mod tests {
 
     #[test]
     fn the_next_song_needs_the_current_one_to_be_over() {
-        let mut game = RandomGame::start(None, 1, DAY, NOW);
+        let mut game = RandomGame::start(None, 1, Section::General, DAY, NOW);
         assert_eq!(game.next(2, DAY, NOW), Err(Unfinished));
         game.skip(NOW).unwrap();
         assert_eq!(game.next(2, DAY, NOW), Err(Unfinished));
@@ -850,7 +1031,7 @@ mod tests {
 
     #[test]
     fn a_new_session_zeroes_the_score_and_keeps_the_best_run_the_round_and_the_recent_songs() {
-        let mut game = RandomGame::start(None, 1, DAY, NOW);
+        let mut game = RandomGame::start(None, 1, Section::General, DAY, NOW);
         win(&mut game);
         let mut game = game.next(2, DAY, NOW).unwrap();
         win(&mut game);
@@ -859,7 +1040,7 @@ mod tests {
 
         // In the middle of a song: it is abandoned and counts for nothing.
         let later = date(2026, 10, 9);
-        let fresh = RandomGame::start(Some(&game), 4, later, NOW);
+        let fresh = RandomGame::start(Some(&game), 4, Section::General, later, NOW);
         assert_eq!(fresh.round(), 4);
         assert_eq!(fresh.track_id(), 4);
         assert_eq!(fresh.game(), &GameState::new(later));
@@ -870,7 +1051,7 @@ mod tests {
         // And after a finished one just the same.
         let mut over = game.clone();
         lose(&mut over);
-        let fresh = RandomGame::start(Some(&over), 4, later, NOW);
+        let fresh = RandomGame::start(Some(&over), 4, Section::General, later, NOW);
         assert_eq!((fresh.run(), fresh.played(), fresh.won()), (0, 0, 0));
         assert_eq!(fresh.best_run(), 2);
         assert_eq!(fresh.round(), 4);
@@ -878,7 +1059,7 @@ mod tests {
 
     #[test]
     fn only_so_many_recent_songs_are_kept_each_once_and_the_current_one_last() {
-        let mut game = RandomGame::start(None, 1, DAY, NOW);
+        let mut game = RandomGame::start(None, 1, Section::General, DAY, NOW);
         for track_id in 2..=RECENT_SONGS as u64 + 10 {
             lose(&mut game);
             game = game.next(track_id, DAY, NOW).unwrap();
@@ -897,16 +1078,16 @@ mod tests {
             1
         );
         // The same in a new session, the same song included.
-        let again = RandomGame::start(Some(&game), 20, DAY, NOW);
+        let again = RandomGame::start(Some(&game), 20, Section::General, DAY, NOW);
         assert_eq!(again.recent(), game.recent());
-        let other = RandomGame::start(Some(&game), 12, DAY, NOW);
+        let other = RandomGame::start(Some(&game), 12, Section::General, DAY, NOW);
         assert_eq!(other.recent().len(), RECENT_SONGS);
         assert_eq!(other.recent().last(), Some(&12));
     }
 
     #[test]
     fn a_random_game_reads_back_from_its_json_as_it_was() {
-        let mut game = RandomGame::start(None, 916_424, DAY, NOW);
+        let mut game = RandomGame::start(None, 916_424, Section::General, DAY, NOW);
         win(&mut game);
         let mut game = game.next(3_135_556, DAY, NOW).unwrap();
         game.skip(NOW).unwrap();
@@ -932,12 +1113,13 @@ mod tests {
                 "best_run": 1,
                 "recent": [916_424, 3_135_556],
                 "active_at": NOW,
+                "pool": "general",
             })
         );
         assert_eq!(serde_json::from_value::<RandomGame>(json).unwrap(), game);
 
         // Every state a session passes through reads back too.
-        let mut game = RandomGame::start(None, 1, DAY, NOW);
+        let mut game = RandomGame::start(None, 1, Section::General, DAY, NOW);
         for track_id in 2..12 {
             if track_id % 3 == 0 {
                 lose(&mut game);
@@ -947,7 +1129,7 @@ mod tests {
             let text = serde_json::to_string(&game).unwrap();
             assert_eq!(serde_json::from_str::<RandomGame>(&text).unwrap(), game);
             game = if track_id % 5 == 0 {
-                RandomGame::start(Some(&game), track_id, DAY, NOW)
+                RandomGame::start(Some(&game), track_id, Section::General, DAY, NOW)
             } else {
                 game.next(track_id, DAY, NOW).unwrap()
             };
@@ -1025,6 +1207,9 @@ mod tests {
                 ),
             ),
             ("a negative count", with("played", json!(-1))),
+            ("a pool that is no section", with("pool", json!("jazz"))),
+            ("a pool that is no slug", with("pool", json!(2))),
+            ("a pool that is nothing", with("pool", Value::Null)),
             ("a missing field", {
                 let mut state = good.clone();
                 state.as_object_mut().unwrap().remove("best_run");
@@ -1043,7 +1228,7 @@ mod tests {
 
     #[test]
     fn a_session_is_over_half_an_hour_after_it_was_last_played() {
-        let game = RandomGame::start(None, 1, DAY, NOW);
+        let game = RandomGame::start(None, 1, Section::General, DAY, NOW);
         assert_eq!(game.active_at(), NOW);
         assert!(!game.is_over(NOW));
         assert!(!game.is_over(NOW + 29 * 60));
@@ -1058,7 +1243,7 @@ mod tests {
 
     #[test]
     fn every_way_of_playing_keeps_the_session_going_and_a_refused_move_does_not() {
-        let mut game = RandomGame::start(None, 1, DAY, NOW);
+        let mut game = RandomGame::start(None, 1, Section::General, DAY, NOW);
 
         // A skip, a wrong guess, a win and the next song are all playing.
         game.skip(NOW + 100).unwrap();
@@ -1079,21 +1264,21 @@ mod tests {
         );
         assert_eq!(game, before);
         // Neither is a next song that is refused.
-        let unfinished = RandomGame::start(None, 1, DAY, NOW);
+        let unfinished = RandomGame::start(None, 1, Section::General, DAY, NOW);
         assert_eq!(unfinished.next(2, DAY, NOW + 400), Err(Unfinished));
         assert_eq!(unfinished.active_at(), NOW);
 
         let game = game.next(2, DAY, NOW + 500).unwrap();
         assert_eq!(game.active_at(), NOW + 500);
         // The session that follows is last played when it begins.
-        let fresh = RandomGame::start(Some(&game), 3, DAY, NOW + 9_000);
+        let fresh = RandomGame::start(Some(&game), 3, Section::General, DAY, NOW + 9_000);
         assert_eq!(fresh.active_at(), NOW + 9_000);
         assert!(!fresh.is_over(NOW + 9_000 + IDLE - 1));
     }
 
     #[test]
     fn a_clock_that_went_back_ends_no_session() {
-        let mut game = RandomGame::start(None, 1, DAY, NOW);
+        let mut game = RandomGame::start(None, 1, Section::General, DAY, NOW);
         // The machine's clock is corrected to before the session began.
         assert!(!game.is_over(NOW - 1));
         assert!(!game.is_over(NOW - 86_400));
@@ -1126,7 +1311,7 @@ mod tests {
         assert!(old.is_over(IDLE));
 
         // Everything that outlasts a session is still there for the next.
-        let fresh = RandomGame::start(Some(&old), 11, DAY, NOW);
+        let fresh = RandomGame::start(Some(&old), 11, Section::General, DAY, NOW);
         assert_eq!(fresh.round(), 6);
         assert_eq!(fresh.best_run(), 4);
         assert_eq!(fresh.recent(), [9, 8, 7, 11]);
@@ -1148,6 +1333,133 @@ mod tests {
         let mut bad = json;
         bad["active_at"] = json!("yesterday");
         assert!(serde_json::from_value::<RandomGame>(bad).is_err());
+    }
+
+    // --- the pool the songs are drawn from --------------------------------------------
+
+    #[test]
+    fn a_session_draws_from_the_pool_it_was_started_with_song_after_song() {
+        for pool in Section::ALL {
+            let mut game = RandomGame::start(None, 1, pool, DAY, NOW);
+            assert_eq!(game.pool(), pool);
+            // Moves, a win, a loss and every next song leave it alone.
+            game.skip(NOW).unwrap();
+            game.guess(&the_song(), &another_song(), NOW).unwrap();
+            win(&mut game);
+            assert_eq!(game.pool(), pool);
+            let mut game = game.next(2, DAY, NOW + 60).unwrap();
+            assert_eq!(game.pool(), pool);
+            lose(&mut game);
+            let game = game.next(3, DAY, NOW + 120).unwrap();
+            assert_eq!(game.pool(), pool);
+            assert_eq!(game.round(), 3);
+        }
+    }
+
+    #[test]
+    fn a_new_session_draws_from_the_pool_it_is_given_whatever_the_last_one_drew_from() {
+        let mut last = RandomGame::start(None, 1, ROCK, DAY, NOW);
+        win(&mut last);
+
+        // The caller carries the pool over, as it does the rest...
+        let carried = RandomGame::start(Some(&last), 2, last.pool(), DAY, NOW + 2 * IDLE);
+        assert_eq!(carried.pool(), ROCK);
+        // ...or replaces it with the player's choice. Either way what
+        // outlasts a session is carried over, and the score is not.
+        for pool in Section::ALL {
+            let fresh = RandomGame::start(Some(&last), 2, pool, DAY, NOW + 2 * IDLE);
+            assert_eq!(fresh.pool(), pool);
+            assert_eq!(fresh.round(), 2);
+            assert_eq!(fresh.best_run(), 1);
+            assert_eq!(fresh.recent(), [1, 2]);
+            assert_eq!((fresh.run(), fresh.played(), fresh.won()), (0, 0, 0));
+        }
+        // The record it started from is not changed by it.
+        assert_eq!(last.pool(), ROCK);
+    }
+
+    #[test]
+    fn changing_the_pool_changes_nothing_else_and_is_not_playing() {
+        let mut game = RandomGame::start(None, 1, Section::General, DAY, NOW);
+        win(&mut game);
+        let mut game = game.next(2, DAY, NOW + 60).unwrap();
+        game.skip(NOW + 120).unwrap();
+        game.guess(&the_song(), &another_song(), NOW + 180).unwrap();
+        let before = game.clone();
+
+        game.draw_from(POP);
+        assert_eq!(game.pool(), POP);
+        // The song in progress is not replaced, and none of its tries are
+        // given back: this is no way to give a song up.
+        assert_eq!(game.round(), before.round());
+        assert_eq!(game.track_id(), before.track_id());
+        assert_eq!(game.game(), before.game());
+        assert_eq!(game.game().attempts().len(), 2);
+        // The session and its score carry on across genres.
+        assert_eq!(
+            (game.run(), game.played(), game.won(), game.best_run()),
+            (1, 1, 1, 1)
+        );
+        assert_eq!(game.recent(), before.recent());
+        // It was last played when the last move was made, and ends when it
+        // would have ended.
+        assert_eq!(game.active_at(), NOW + 180);
+        assert!(!game.is_over(NOW + 180 + IDLE - 1));
+        assert!(game.is_over(NOW + 180 + IDLE));
+        // Put back, it is the game it was, to the last field.
+        game.draw_from(Section::General);
+        assert_eq!(game, before);
+
+        // A finished song can have its pool changed too, and stays finished.
+        let mut over = before.clone();
+        lose(&mut over);
+        let finished = over.clone();
+        over.draw_from(HIP_HOP);
+        assert_eq!(over.game(), finished.game());
+        assert_eq!(over.game().status(), Status::Lost);
+        assert_eq!(over.active_at(), finished.active_at());
+        // The next song is the first of the new pool's, in the same session.
+        let next = over.next(3, DAY, NOW + 600).unwrap();
+        assert_eq!(next.pool(), HIP_HOP);
+        assert_eq!((next.played(), next.won(), next.best_run()), (2, 1, 1));
+    }
+
+    #[test]
+    fn the_pool_is_stored_as_a_section_slug_and_a_record_without_one_draws_from_all_of_it() {
+        for (pool, slug) in [
+            (Section::General, "general"),
+            (POP, "pop"),
+            (ROCK, "rock"),
+            (HIP_HOP, "hip-hop"),
+        ] {
+            let mut game = RandomGame::start(None, 7, Section::General, DAY, NOW);
+            game.draw_from(pool);
+            let json = serde_json::to_value(&game).unwrap();
+            assert_eq!(json["pool"], slug);
+            assert_eq!(serde_json::from_value::<RandomGame>(json).unwrap(), game);
+        }
+
+        // What was stored before the pool could be chosen: every song was
+        // drawn from all of them, and that is how it reads.
+        let old = json!({
+            "round": 5,
+            "track_id": 7,
+            "game": { "day": "2026-10-01", "attempts": [{ "kind": "skip" }], "status": "playing" },
+            "run": 1,
+            "played": 3,
+            "won": 2,
+            "best_run": 4,
+            "recent": [9, 8, 7],
+            "active_at": NOW,
+        });
+        let old: RandomGame = serde_json::from_value(old).unwrap();
+        assert_eq!(old.pool(), Section::General);
+        // It is a session like any other: still going, and its next song is
+        // drawn from everything.
+        assert!(!old.is_over(NOW + 60));
+        assert_eq!(old.game().attempts().len(), 1);
+        // Written again, it says so.
+        assert_eq!(serde_json::to_value(&old).unwrap()["pool"], "general");
     }
 
     // --- the routes -----------------------------------------------------------------
@@ -1241,6 +1553,53 @@ mod tests {
         harness
     }
 
+    /// The pop songs and the rock songs of [`genres`]' pool.
+    const POP_SONGS: [u64; 2] = [ALPHA, BETA];
+    const ROCK_SONGS: [u64; 2] = [GAMMA, DELTA];
+
+    /// A server whose pool has two pop songs ([`POP_SONGS`]), two rock songs
+    /// ([`ROCK_SONGS`]), one song without a tag (`EPSILON`) and no hip-hop.
+    /// The day's four songs are others, which have left the pool since, so
+    /// every song of the pool can be drawn.
+    async fn genres() -> Harness {
+        genres_over(Arc::new(MemoryStore::new())).await
+    }
+
+    /// The same over a store of the test's choosing.
+    async fn genres_over(store: Arc<dyn crate::store::Store>) -> Harness {
+        let pool: [(u64, &[Genre]); 5] = [
+            (ALPHA, &[Genre::Pop]),
+            (BETA, &[Genre::Pop]),
+            (GAMMA, &[Genre::Rock]),
+            (DELTA, &[Genre::Rock]),
+            (EPSILON, &[]),
+        ];
+        let harness = Harness::over(tracks(), &pool, store).await;
+        for (section, track_id) in Section::ALL.into_iter().zip(FILLER..) {
+            let pick = Pick {
+                day: TODAY,
+                section,
+                track_id,
+            };
+            harness.store.save_pick(pick).await.unwrap();
+        }
+        harness
+    }
+
+    /// A browser that has started a session drawing from `pool`, and the
+    /// song it is on. The start's response is checked like any playing-state
+    /// response.
+    async fn started_from(harness: &Harness, pool: Section) -> (Player, u64) {
+        let mut player = harness.player();
+        let reply = player.random_start_from(pool).await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.visible());
+        assert_eq!(reply.json()["pool"], pool.slug());
+        let game = stored(harness, &player).await;
+        assert_eq!(game.pool(), pool);
+        assert_hides(&reply, game.track_id());
+        (player, game.track_id())
+    }
+
     /// The random game the store has for the browser `player`.
     async fn stored(harness: &Harness, player: &Player) -> RandomGame {
         let id = harness
@@ -1310,6 +1669,7 @@ mod tests {
                 "bestRun": 0,
                 "played": 0,
                 "won": 0,
+                "pool": "general",
             })
         );
 
@@ -1331,24 +1691,167 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_body_and_the_content_type_of_a_start_are_not_looked_at() {
+    async fn a_start_without_a_choice_keeps_the_pool_whatever_else_its_body_says() {
         let harness = start(&[ALPHA, BETA]).await;
         let mut player = harness.player();
+        // No body, an empty one, an object that names no pool or names
+        // none, and fields that are another request's: all of them are "the
+        // session to play in", under any content type.
         for (content_type, body) in [
+            ("application/json", ""),
+            ("text/plain", "  \n"),
+            ("application/json", "{}"),
+            ("text/plain", "{}"),
+            ("application/json", r#"{"pool": null}"#),
+            ("application/x-www-form-urlencoded", r#"{"pool": null}"#),
             ("application/json", r#"{"round": 9, "skip": true}"#),
-            ("text/plain", "anything at all"),
-            ("application/json", "{not json"),
+            ("application/json", r#"{"section": "rock", "Pool": "rock"}"#),
         ] {
             let reply = player
                 .post_to("/api/random/start", content_type, body)
                 .await;
-            assert_eq!(reply.status, StatusCode::OK, "{}", reply.visible());
+            assert_eq!(
+                reply.status,
+                StatusCode::OK,
+                "{body:?}: {}",
+                reply.visible()
+            );
             assert_eq!(reply.json()["status"], "playing");
+            assert_eq!(reply.json()["pool"], "general", "{body:?}");
             assert_hides(&reply, BETA);
         }
         // The first began a session and the others joined it: whatever the
         // body said, it was the same request.
-        assert_eq!(stored(&harness, &player).await.round(), 1);
+        let game = stored(&harness, &player).await;
+        assert_eq!(game.round(), 1);
+        assert_eq!(game.pool(), Section::General);
+
+        // A choice is read under any content type too, and with none.
+        let reply = player
+            .post_to("/api/random/start", "text/plain", r#"{"pool": "rock"}"#)
+            .await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.visible());
+        assert_eq!(reply.json()["pool"], "rock");
+        let request = axum::http::Request::post("/api/random/start")
+            .body(axum::body::Body::from(r#" {"pool":"pop","other":[1]} "#))
+            .unwrap();
+        let reply = player.send(request).await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.visible());
+        assert_eq!(reply.json()["pool"], "pop");
+        assert_eq!(reply.json()["round"], 1);
+        assert_hides(&reply, BETA);
+    }
+
+    /// The sentence a start that cannot be read is answered with.
+    const BAD_START: &str = "Send {\"pool\": <\"general\", \"pop\", \"rock\" or \"hip-hop\">} as JSON, or no body to keep the pool as it is.";
+
+    #[tokio::test]
+    async fn a_start_that_cannot_be_read_is_a_bad_request_and_changes_nothing() {
+        let harness = genres().await;
+        let (mut player, track_id) = started(&harness).await;
+        assert_eq!(player.random_skip(1).await.status, StatusCode::OK);
+        let before = stored(&harness, &player).await;
+        let hits = harness.deezer.api_hits();
+
+        let bodies = [
+            json!({ "pool": "jazz" }),
+            json!({ "pool": "Pop" }),
+            json!({ "pool": "hiphop" }),
+            json!({ "pool": "" }),
+            json!({ "pool": 7 }),
+            json!({ "pool": true }),
+            json!({ "pool": ["pop"] }),
+            json!({ "pool": { "slug": "pop" } }),
+            json!([]),
+            json!(["pop"]),
+            json!("pop"),
+            json!(7),
+            json!(null),
+        ];
+        for body in &bodies {
+            let reply = player.random_start_with(body.clone()).await;
+            reply.assert_error(StatusCode::BAD_REQUEST, "bad_request");
+            assert_eq!(reply.json()["message"], BAD_START, "{body}");
+            assert_hides(&reply, track_id);
+            assert!(reply.headers.get(header::SET_COOKIE).is_none());
+        }
+        for (content_type, body) in [
+            ("application/json", "{not json"),
+            ("text/plain", "anything at all"),
+            ("application/json", "pop"),
+            ("application/json", r#"{"pool": "rock"} trailing"#),
+        ] {
+            player
+                .post_to("/api/random/start", content_type, body)
+                .await
+                .assert_error(StatusCode::BAD_REQUEST, "bad_request");
+        }
+        // The session is as it was, and nothing was drawn.
+        assert_eq!(stored(&harness, &player).await, before);
+        assert_eq!(harness.deezer.api_hits(), hits);
+
+        // Nor does such a request begin a session, for a player whose last
+        // one has ended...
+        harness.clock.advance_minutes(IDLE_MINUTES);
+        for body in &bodies {
+            player
+                .random_start_with(body.clone())
+                .await
+                .assert_error(StatusCode::BAD_REQUEST, "bad_request");
+        }
+        assert_eq!(stored(&harness, &player).await, before);
+        player
+            .random()
+            .await
+            .assert_error(StatusCode::NOT_FOUND, "no_game");
+
+        // ...or for a browser the server has never seen: the request is
+        // read before anyone is asked who is playing, and no ID is issued.
+        let mut stranger = harness.player();
+        let reply = stranger.random_start_with(json!({ "pool": "jazz" })).await;
+        reply.assert_error(StatusCode::BAD_REQUEST, "bad_request");
+        assert!(reply.headers.get(header::SET_COOKIE).is_none());
+        assert!(stranger.cookie.is_none());
+        harness
+            .post("/api/random/start", Some(json!(["rock"])))
+            .await
+            .assert_error(StatusCode::BAD_REQUEST, "bad_request");
+    }
+
+    #[test]
+    fn a_start_names_one_pool_or_none() {
+        for body in [
+            "",
+            "  \n",
+            "{}",
+            r#"{"pool":null}"#,
+            r#"{"other":1}"#,
+            r#"{"section":"rock"}"#,
+        ] {
+            assert_eq!(chosen_pool(body.as_bytes()), Some(None), "{body:?}");
+        }
+        for pool in Section::ALL {
+            let body = json!({ "pool": pool, "round": 3 }).to_string();
+            assert_eq!(chosen_pool(body.as_bytes()), Some(Some(pool)), "{body}");
+        }
+        assert_eq!(
+            chosen_pool(br#"{"pool":"hip-hop"}"#),
+            Some(Some(HIP_HOP)),
+            "the slug of the section, as in its address"
+        );
+        for body in [
+            r#"{"pool":"jazz"}"#,
+            r#"{"pool":"Rock"}"#,
+            r#"{"pool":["pop"]}"#,
+            r#"{"pool":0}"#,
+            r#"["pop"]"#,
+            r#""pop""#,
+            "null",
+            "{",
+            "rock",
+        ] {
+            assert_eq!(chosen_pool(body.as_bytes()), None, "{body:?}");
+        }
     }
 
     #[tokio::test]
@@ -1765,6 +2268,551 @@ mod tests {
         assert_eq!(tab.random_start().await.json()["round"], 2);
     }
 
+    // --- the pool the songs are drawn from, on the routes --------------------------------
+
+    #[tokio::test]
+    async fn a_first_session_draws_from_the_pool_the_start_chose_and_from_all_of_it_without_one() {
+        let harness = genres().await;
+
+        // A browser the server has never seen, asking for rock: it is given
+        // an ID, a session and a rock song.
+        let mut player = harness.player();
+        let reply = player.random_start_from(ROCK).await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.visible());
+        reply.assert_no_store();
+        let game = stored(&harness, &player).await;
+        assert!(ROCK_SONGS.contains(&game.track_id()));
+        assert_eq!(game.pool(), ROCK);
+        assert_hides(&reply, game.track_id());
+        assert_eq!(
+            reply.json(),
+            json!({
+                "round": 1,
+                "ladder": [0.1, 0.3, 1.0, 3.0, 8.0, 16.0, 30.0],
+                "attempts": [],
+                "status": "playing",
+                "clipSeconds": 0.1,
+                "answer": null,
+                "run": 0,
+                "bestRun": 0,
+                "played": 0,
+                "won": 0,
+                "pool": "rock",
+            })
+        );
+        let id = harness.player_id(&player).expect("a cookie was set");
+        assert_eq!(harness.cookie_plaintext(&player), Some(id.to_string()));
+
+        // Each of the pools, for a newcomer each: the song is one of that
+        // pool's, every time.
+        for _ in 0..8 {
+            let (_, track_id) = started_from(&harness, POP).await;
+            assert!(POP_SONGS.contains(&track_id), "{track_id}");
+            let (_, track_id) = started_from(&harness, ROCK).await;
+            assert!(ROCK_SONGS.contains(&track_id), "{track_id}");
+        }
+        // All of it, when the start says so and when it says nothing: over
+        // many newcomers, the songs of every genre and of none.
+        let mut drawn = std::collections::BTreeSet::new();
+        for turn in 0..60 {
+            let (player, track_id) = if turn % 2 == 0 {
+                started_from(&harness, Section::General).await
+            } else {
+                started(&harness).await
+            };
+            assert_eq!(stored(&harness, &player).await.pool(), Section::General);
+            drawn.insert(track_id);
+        }
+        assert_eq!(
+            drawn.into_iter().collect::<Vec<_>>(),
+            [ALPHA, BETA, GAMMA, DELTA, EPSILON]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_song_a_section_plays_today_is_not_drawn_from_its_genre_either() {
+        let pool: [(u64, &[Genre]); 5] = [
+            (ALPHA, &[Genre::Pop]),
+            (BETA, &[Genre::Pop]),
+            (GAMMA, &[Genre::Rock]),
+            (DELTA, &[Genre::Rock]),
+            (EPSILON, &[]),
+        ];
+        let harness = Harness::with_pool(tracks(), &pool).await;
+        // Pop plays one of its own, and General took a rock song.
+        for (section, track_id) in [
+            (POP, ALPHA),
+            (Section::General, GAMMA),
+            (ROCK, FILLER),
+            (HIP_HOP, FILLER + 1),
+        ] {
+            let pick = Pick {
+                day: TODAY,
+                section,
+                track_id,
+            };
+            harness.store.save_pick(pick).await.unwrap();
+        }
+
+        // One pop song is left, and it is the one every time, recent or not.
+        let (mut player, first) = started_from(&harness, POP).await;
+        assert_eq!(first, BETA);
+        for round in 1..=3 {
+            let next = win_and_go_on(&harness, &mut player, round, BETA).await;
+            assert_eq!(next, BETA);
+        }
+        // The same for rock, whichever section it is that plays the other.
+        let reply = player.random_guess(4, BETA).await;
+        assert_eq!(reply.json()["status"], "won", "{}", reply.visible());
+        assert_eq!(player.random_start_from(ROCK).await.json()["pool"], "rock");
+        for round in 4..=6 {
+            let reply = player.random_next(round).await;
+            assert_eq!(reply.status, StatusCode::OK, "{}", reply.visible());
+            assert_eq!(stored(&harness, &player).await.track_id(), DELTA);
+            assert_hides(&reply, DELTA);
+            let reply = player.random_guess(round + 1, DELTA).await;
+            assert_eq!(reply.json()["status"], "won", "{}", reply.visible());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_choice_in_a_session_that_is_going_changes_the_pool_and_nothing_else() {
+        let harness = genres().await;
+        let (mut player, track_id) = started_from(&harness, POP).await;
+        let id = harness.player_id(&player).unwrap();
+        assert_eq!(player.random_skip(1).await.status, StatusCode::OK);
+        let reply = player.random_guess(1, QUEEN).await;
+        let after_the_guess = reply.json();
+        assert_eq!(after_the_guess["pool"], "pop");
+        let before = stored(&harness, &player).await;
+        let clip = player.random_audio().await.body;
+        let hits = harness.deezer.api_hits();
+
+        // Ten minutes into the song, the player asks for rock.
+        harness.clock.advance_minutes(10);
+        let reply = player.random_start_from(ROCK).await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.visible());
+        reply.assert_no_store();
+        assert_hides(&reply, track_id);
+        let cookie = reply.header(header::SET_COOKIE);
+        assert!(cookie.contains("Max-Age=34560000"), "{cookie}");
+        assert_eq!(harness.player_id(&player), Some(id.clone()));
+
+        // The view is the one of before, but for the pool: the same song
+        // with its two tries used, the same round, the same score.
+        let mut expected = after_the_guess.clone();
+        expected["pool"] = json!("rock");
+        assert_eq!(reply.json(), expected);
+        assert_eq!(reply.json()["round"], 1);
+        assert_eq!(reply.json()["attempts"].as_array().unwrap().len(), 2);
+        assert_eq!(reply.json()["clipSeconds"], 1.0);
+        // And so is the record: the pop song is still the one being played,
+        // and the session was last played when the guess was made.
+        let mut changed = before.clone();
+        changed.draw_from(ROCK);
+        let after = stored(&harness, &player).await;
+        assert_eq!(after, changed);
+        assert_eq!(after.track_id(), track_id);
+        assert_eq!(after.active_at(), before.active_at());
+        // Nothing was drawn, and the clip is the one of before.
+        assert_eq!(harness.deezer.api_hits(), hits);
+        assert_eq!(player.random_audio().await.body, clip);
+
+        // Every other route shows the new pool, in this tab and in another.
+        let mut tab = harness.player_with_id(&id);
+        for reply in [
+            player.random().await,
+            tab.random().await,
+            // A start without a choice joins the session and keeps the pool.
+            tab.random_start().await,
+            tab.random_start_with(json!({})).await,
+            // And so does one that asks for the pool it has.
+            tab.random_start_from(ROCK).await,
+        ] {
+            assert_eq!(reply.status, StatusCode::OK, "{}", reply.visible());
+            assert_eq!(reply.json(), expected);
+            assert_hides(&reply, track_id);
+        }
+        assert_eq!(stored(&harness, &player).await, changed);
+        assert_eq!(harness.deezer.api_hits(), hits);
+
+        // Choosing is not playing: the half hour runs from the guess. A
+        // minute before it is up the session is still there, and a choice
+        // made then does not put the end off either.
+        harness.clock.advance_minutes(IDLE_MINUTES - 11);
+        assert_eq!(player.random().await.status, StatusCode::OK);
+        let reply = tab.random_start_from(Section::General).await;
+        assert_eq!(reply.json()["pool"], "general", "{}", reply.visible());
+        assert_eq!(reply.json()["round"], 1);
+        assert_eq!(
+            stored(&harness, &player).await.active_at(),
+            before.active_at()
+        );
+        harness.clock.advance_minutes(1);
+        for reply in [
+            player.random().await,
+            player.random_audio().await,
+            player.random_skip(1).await,
+        ] {
+            reply.assert_error(StatusCode::NOT_FOUND, "no_game");
+        }
+    }
+
+    #[tokio::test]
+    async fn after_a_change_the_song_stays_and_the_next_one_is_the_first_of_the_new_pool() {
+        let harness = genres().await;
+        let (mut player, first) = started_from(&harness, POP).await;
+        assert!(POP_SONGS.contains(&first));
+        let reply = player.random_skip(1).await;
+        assert_eq!(reply.json()["pool"], "pop");
+        assert_hides(&reply, first);
+
+        // Rock, in the middle of the pop song: it is no way out of the song.
+        // It is still there to be guessed, with the try it cost so far...
+        let reply = player.random_start_from(ROCK).await;
+        assert_eq!(reply.json()["round"], 1);
+        assert_eq!(reply.json()["status"], "playing");
+        assert_eq!(reply.json()["attempts"], json!([{ "kind": "skip" }]));
+        assert_hides(&reply, first);
+        // ...the next cannot be asked for...
+        player
+            .random_next(1)
+            .await
+            .assert_error(StatusCode::CONFLICT, "unfinished");
+        // ...and a miss costs what it always costs.
+        let reply = player.random_guess(1, QUEEN).await;
+        assert_eq!(reply.json()["attempts"].as_array().unwrap().len(), 2);
+        assert_eq!(reply.json()["pool"], "rock");
+        assert_hides(&reply, first);
+
+        // Won, it counts for the session, whose pool is rock by now.
+        let reply = player.random_guess(1, first).await;
+        let body = reply.json();
+        assert_eq!(body["status"], "won");
+        assert_eq!(body["pool"], "rock");
+        assert_eq!(body["run"], 1);
+        let title = SONGS.iter().find(|song| song.0 == first).unwrap().1;
+        assert_eq!(body["answer"]["title"], title);
+
+        // The next song is the first to be drawn from rock, and the run
+        // goes on across the genres.
+        let reply = player.random_next(1).await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.visible());
+        let second = stored(&harness, &player).await.track_id();
+        assert!(ROCK_SONGS.contains(&second), "{second}");
+        assert_hides(&reply, second);
+        let body = reply.json();
+        assert_eq!(body["round"], 2);
+        assert_eq!(body["pool"], "rock");
+        assert_eq!(body["status"], "playing");
+        assert_eq!((&body["run"], &body["played"]), (&json!(1), &json!(1)));
+
+        // Rock goes on being what is drawn: the other rock song, then the
+        // first again, the one of them played longer ago, and never the pop
+        // song or the untagged one that were not played lately.
+        let third = win_and_go_on(&harness, &mut player, 2, second).await;
+        assert_eq!(third, GAMMA + DELTA - second);
+        let fourth = win_and_go_on(&harness, &mut player, 3, third).await;
+        assert_eq!(fourth, second);
+        let reply = player.random().await;
+        assert_eq!(reply.json()["pool"], "rock");
+        assert_eq!(reply.json()["run"], 3);
+        assert_hides(&reply, fourth);
+
+        // Back to all of it, on a finished song: the song stays finished
+        // and revealed, and the one after it is one the player has not had.
+        let reply = player.random_guess(4, fourth).await;
+        assert_eq!(reply.json()["status"], "won");
+        let reply = player.random_start_from(Section::General).await;
+        let body = reply.json();
+        assert_eq!(body["round"], 4);
+        assert_eq!(body["status"], "won");
+        assert_eq!(body["pool"], "general");
+        assert_eq!(body["run"], 4);
+        let title = SONGS.iter().find(|song| song.0 == fourth).unwrap().1;
+        assert_eq!(body["answer"]["title"], title);
+        let reply = player.random_next(4).await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.visible());
+        assert_eq!(reply.json()["round"], 5);
+        assert_eq!(reply.json()["pool"], "general");
+        let fifth = stored(&harness, &player).await.track_id();
+        assert!(fifth == EPSILON || fifth == ALPHA + BETA - first, "{fifth}");
+        assert_hides(&reply, fifth);
+        let game = stored(&harness, &player).await;
+        assert_eq!(game.pool(), Section::General);
+        assert_eq!((game.run(), game.played(), game.won()), (4, 4, 4));
+        assert_eq!(game.best_run(), 4);
+    }
+
+    #[tokio::test]
+    async fn the_pool_carries_over_to_the_next_session_unless_the_start_chooses_another() {
+        let harness = genres().await;
+        let (mut player, first) = started_from(&harness, ROCK).await;
+        assert!(ROCK_SONGS.contains(&first));
+
+        // Half an hour away, and a start that says nothing: a new session,
+        // and rock again, like the longest run.
+        harness.clock.advance_minutes(IDLE_MINUTES);
+        let reply = player.random_start().await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.visible());
+        assert_eq!(reply.json()["round"], 2);
+        assert_eq!(reply.json()["pool"], "rock");
+        let second = stored(&harness, &player).await.track_id();
+        assert_eq!(second, GAMMA + DELTA - first);
+        assert_hides(&reply, second);
+
+        // A start that chooses begins the next session in that pool.
+        harness.clock.advance_minutes(IDLE_MINUTES);
+        let reply = player.random_start_from(POP).await;
+        assert_eq!(reply.json()["round"], 3, "{}", reply.visible());
+        assert_eq!(reply.json()["pool"], "pop");
+        assert_eq!(reply.json()["attempts"], json!([]));
+        let third = stored(&harness, &player).await.track_id();
+        assert!(POP_SONGS.contains(&third), "{third}");
+        assert_hides(&reply, third);
+
+        // Which is then the one that carries over, for a body that names no
+        // pool as for no body.
+        harness.clock.advance_minutes(IDLE_MINUTES);
+        let reply = player.random_start_with(json!({ "pool": null })).await;
+        assert_eq!(reply.json()["round"], 4, "{}", reply.visible());
+        assert_eq!(reply.json()["pool"], "pop");
+        let game = stored(&harness, &player).await;
+        assert_eq!(game.track_id(), ALPHA + BETA - third);
+        assert_eq!(game.pool(), POP);
+
+        // And all of it can be chosen as any other pool can.
+        harness.clock.advance_minutes(IDLE_MINUTES);
+        let reply = player.random_start_from(Section::General).await;
+        assert_eq!(reply.json()["round"], 5, "{}", reply.visible());
+        assert_eq!(reply.json()["pool"], "general");
+        // The one song not played lately, which has no genre.
+        let game = stored(&harness, &player).await;
+        assert_eq!(game.track_id(), EPSILON);
+        assert_eq!(game.pool(), Section::General);
+        assert_hides(&reply, EPSILON);
+    }
+
+    #[tokio::test]
+    async fn a_record_from_before_the_pool_could_be_chosen_draws_from_all_of_it() {
+        let harness = genres().await;
+        let mut player = harness.player();
+        assert_eq!(player.get("/api/today").await.status, StatusCode::OK);
+        let id = harness.player_id(&player).unwrap();
+        // A session stored by the server as it was before, still going: it
+        // has no pool.
+        let old: RandomGame = serde_json::from_value(json!({
+            "round": 3,
+            "track_id": ALPHA,
+            "game": { "day": "2026-10-01", "attempts": [{ "kind": "skip" }], "status": "playing" },
+            "run": 2,
+            "played": 2,
+            "won": 2,
+            "best_run": 2,
+            "recent": [BETA, GAMMA, DELTA, ALPHA],
+            "active_at": harness.clock.now().as_second(),
+        }))
+        .unwrap();
+        harness.store.save_random_game(&id, &old).await.unwrap();
+
+        for reply in [player.random().await, player.random_start().await] {
+            assert_eq!(reply.status, StatusCode::OK, "{}", reply.visible());
+            assert_eq!(reply.json()["pool"], "general");
+            assert_eq!(reply.json()["round"], 3);
+            assert_hides(&reply, ALPHA);
+        }
+        // Its next song is drawn from everything: the one song not played
+        // lately has no genre at all.
+        let next = win_and_go_on(&harness, &mut player, 3, ALPHA).await;
+        assert_eq!(next, EPSILON);
+        assert_eq!(player.random().await.json()["pool"], "general");
+
+        // And when it has ended, the session after it does the same.
+        harness.clock.advance_minutes(IDLE_MINUTES);
+        harness.store.save_random_game(&id, &old).await.unwrap();
+        let reply = player.random_start().await;
+        assert_eq!(reply.json()["round"], 4, "{}", reply.visible());
+        assert_eq!(reply.json()["pool"], "general");
+        assert_eq!(stored(&harness, &player).await.track_id(), EPSILON);
+    }
+
+    #[tokio::test]
+    async fn a_genre_without_songs_has_no_song_and_the_record_is_left_alone() {
+        let harness = genres().await;
+
+        // A newcomer who asks for hip-hop, of which there is none: no song,
+        // no session and no cookie.
+        let mut newcomer = harness.player();
+        let reply = newcomer.random_start_from(HIP_HOP).await;
+        reply.assert_error(StatusCode::NOT_FOUND, "no_song");
+        assert!(reply.headers.get(header::SET_COOKIE).is_none());
+        assert!(newcomer.cookie.is_none());
+        // The other pools are there for them.
+        assert_eq!(newcomer.random_start_from(POP).await.status, StatusCode::OK);
+
+        // A player whose rock session has ended: the record stays as it is,
+        // pool and all, and the session is still over.
+        let (mut player, first) = started_from(&harness, ROCK).await;
+        assert_eq!(player.random_guess(1, first).await.json()["status"], "won");
+        harness.clock.advance_minutes(IDLE_MINUTES);
+        let before = stored(&harness, &player).await;
+        let reply = player.random_start_from(HIP_HOP).await;
+        reply.assert_error(StatusCode::NOT_FOUND, "no_song");
+        assert_hides_all(&reply);
+        assert_eq!(stored(&harness, &player).await, before);
+        player
+            .random()
+            .await
+            .assert_error(StatusCode::NOT_FOUND, "no_game");
+        // So a start without a choice is in rock, as the last session was.
+        let reply = player.random_start().await;
+        assert_eq!(reply.json()["round"], 2, "{}", reply.visible());
+        assert_eq!(reply.json()["pool"], "rock");
+        assert_eq!(reply.json()["bestRun"], 1);
+        let second = stored(&harness, &player).await.track_id();
+        assert_eq!(second, GAMMA + DELTA - first);
+
+        // In a session that is going, the choice is taken: nothing is drawn
+        // for it, so there is nothing to refuse yet.
+        let reply = player.random_start_from(HIP_HOP).await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.visible());
+        assert_eq!(reply.json()["pool"], "hip-hop");
+        assert_eq!(reply.json()["round"], 2);
+        assert_hides(&reply, second);
+        let reply = player.random_guess(2, second).await;
+        assert_eq!(reply.json()["status"], "won");
+        assert_eq!(reply.json()["pool"], "hip-hop");
+
+        // It is the next song that cannot be had. The finished song, the
+        // score and the pool stay as they are...
+        let before = stored(&harness, &player).await;
+        for _ in 0..2 {
+            let reply = player.random_next(2).await;
+            reply.assert_error(StatusCode::NOT_FOUND, "no_song");
+            assert_eq!(stored(&harness, &player).await, before);
+        }
+        let reply = player.random().await;
+        assert_eq!(reply.json()["status"], "won");
+        assert_eq!(reply.json()["pool"], "hip-hop");
+        // ...until the player chooses a pool that has songs, and asks again.
+        let reply = player.random_start_from(POP).await;
+        let body = reply.json();
+        assert_eq!(body["round"], 2);
+        assert_eq!(body["status"], "won");
+        assert_eq!(body["pool"], "pop");
+        let reply = player.random_next(2).await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.visible());
+        let body = reply.json();
+        assert_eq!(body["round"], 3);
+        assert_eq!(body["pool"], "pop");
+        assert_eq!(body["run"], 1);
+        let third = stored(&harness, &player).await.track_id();
+        assert!(POP_SONGS.contains(&third), "{third}");
+        assert_hides(&reply, third);
+    }
+
+    /// The anti-leak rule for a response that is about no song in
+    /// particular: it names none of the pool's.
+    fn assert_hides_all(reply: &Reply) {
+        for (track_id, ..) in SONGS {
+            assert_hides(reply, track_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_change_of_pool_sent_with_moves_loses_neither() {
+        let store = Arc::new(Unhurried(MemoryStore::new()));
+        let harness = genres_over(store).await;
+        let (player, track_id) = started_from(&harness, POP).await;
+        let id = harness.player_id(&player).unwrap();
+
+        // Three skips and two changes of pool, all read before any is
+        // written if nothing keeps them apart: a change that stored the
+        // game it had read would take a skip back, and a skip would do the
+        // same to the change.
+        let mut requests = Vec::new();
+        for turn in 0..5 {
+            let mut tab = harness.player_with_id(&id);
+            requests.push(tokio::spawn(async move {
+                if turn % 2 == 0 {
+                    tab.random_skip(1).await
+                } else {
+                    tab.random_start_from(ROCK).await
+                }
+            }));
+        }
+        for request in requests {
+            let reply = request.await.unwrap();
+            assert_eq!(reply.status, StatusCode::OK, "{}", reply.visible());
+            assert_eq!(reply.json()["round"], 1);
+            assert_hides(&reply, track_id);
+        }
+
+        let game = stored(&harness, &player).await;
+        assert_eq!(game.game().attempts().len(), 3);
+        assert_eq!(game.pool(), ROCK);
+        assert_eq!(game.track_id(), track_id);
+    }
+
+    #[tokio::test]
+    async fn starts_sent_at_once_with_different_choices_end_up_in_one_session() {
+        let store = Arc::new(Unhurried(MemoryStore::new()));
+        let harness = genres_over(store).await;
+        let (mut player, first) = started_from(&harness, POP).await;
+        let id = harness.player_id(&player).unwrap();
+        assert_eq!(player.random_guess(1, first).await.json()["status"], "won");
+        harness.clock.advance_minutes(IDLE_MINUTES);
+
+        // Five tabs come back at the same moment, each finds the session
+        // over and draws a song, three of them with a pool of their own in
+        // mind. One of them begins the session; the others join it, and a
+        // choice that came with a joining start is made in that session.
+        let choices = [Some(ROCK), None, Some(Section::General), None, Some(ROCK)];
+        let requests: Vec<_> = choices
+            .into_iter()
+            .map(|choice| {
+                let mut tab = harness.player_with_id(&id);
+                tokio::spawn(async move {
+                    let reply = match choice {
+                        Some(pool) => tab.random_start_from(pool).await,
+                        None => tab.random_start().await,
+                    };
+                    (choice, reply)
+                })
+            })
+            .collect();
+        let mut replies = Vec::new();
+        for request in requests {
+            replies.push(request.await.unwrap());
+        }
+
+        // One session was begun, on one song.
+        let game = stored(&harness, &player).await;
+        assert_eq!(game.round(), 2);
+        assert_eq!((game.run(), game.played(), game.won()), (0, 0, 0));
+        assert_eq!(game.best_run(), 1);
+        assert_eq!(game.recent(), [first, game.track_id()]);
+        for (choice, reply) in &replies {
+            assert_eq!(reply.status, StatusCode::OK, "{}", reply.visible());
+            assert_hides(reply, game.track_id());
+            let body = reply.json();
+            assert_eq!(body["round"], 2);
+            assert_eq!(body["attempts"], json!([]));
+            // Whoever chose was answered with the pool they chose, whether
+            // they began the session or joined it.
+            if let Some(pool) = choice {
+                assert_eq!(body["pool"], pool.slug(), "{}", reply.visible());
+            }
+        }
+        // The pool it is left with is one of those asked for, or the one
+        // that carried over, and every tab sees the same from here.
+        assert!([ROCK, Section::General, POP].contains(&game.pool()));
+        let mut tab = harness.player_with_id(&id);
+        let reply = tab.random_start().await;
+        assert_eq!(reply.json()["round"], 2);
+        assert_eq!(reply.json()["pool"], game.pool().slug());
+    }
+
     // --- GET /api/random ------------------------------------------------------------
 
     #[tokio::test]
@@ -2015,6 +3063,7 @@ mod tests {
                 "bestRun": 1,
                 "played": 1,
                 "won": 1,
+                "pool": "general",
             })
         );
     }
@@ -2428,11 +3477,13 @@ mod tests {
             player.random().await,
             player.random_audio().await,
             player.random_start().await,
+            player.random_start_from(POP).await,
             player.random_skip(1).await,
             player.random_guess(1, QUEEN).await,
             player.random_next(1).await,
             // A new player's first request, too.
             harness.player().random_start().await,
+            harness.player().random_start_from(ROCK).await,
         ] {
             reply.assert_error(StatusCode::INTERNAL_SERVER_ERROR, "internal");
             reply.assert_lacks(&["fire", "needledrop.db", "pretending"]);

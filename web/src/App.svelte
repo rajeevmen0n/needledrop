@@ -8,6 +8,7 @@
   import ClearData from './lib/components/ClearData.svelte'
   import GuessInput from './lib/components/GuessInput.svelte'
   import Play from './lib/components/Play.svelte'
+  import PoolPicker from './lib/components/PoolPicker.svelte'
   import Record from './lib/components/Record.svelte'
   import Reveal from './lib/components/Reveal.svelte'
   import Score from './lib/components/Score.svelte'
@@ -15,7 +16,8 @@
   import Skip from './lib/components/Skip.svelte'
   import Stats from './lib/components/Stats.svelte'
   import { game } from './lib/game.svelte'
-  import { songLine } from './lib/random'
+  import { POOL_NOTE, emptyLine, songLine } from './lib/random'
+  import type { Pool } from './lib/random'
   import {
     pageTitle,
     routeFor,
@@ -50,7 +52,11 @@
     ),
   )
   // One sentence at a time for a screen reader: news the player did not cause, else what the last move did.
-  const spoken = $derived(game.info ?? (game.finished ? '' : game.notice))
+  // How a section's game ended is the reveal's to say. A random song that is over can still have news:
+  // the genre chosen for the next one.
+  const spoken = $derived(
+    game.info ?? (game.finished && !game.random ? '' : game.notice),
+  )
 
   /** Clear my data. Resolves to `null` when it is done, or to why it failed. */
   async function clear(): Promise<string | null> {
@@ -74,16 +80,31 @@
     game.select(next)
   }
 
-  /** Random mode: on to the next song. */
-  async function next() {
-    if (!(await game.next())) return
+  /** Random mode: another song has taken the place of what was on screen. */
+  async function arrived() {
     gameRegion.scrollTop = 0
-    // The button that was pressed is gone, and the keyboard focus with it.
+    // The control that was pressed may be gone, and the keyboard focus with it.
     // Playing continues at the play button, once the new clip can be played.
     await game.clipSettled()
     await tick()
     const lost = document.activeElement === null || document.activeElement === document.body
     if (game.random && lost) play?.focus()
+  }
+
+  /** Random mode: on to the next song. */
+  async function next() {
+    if (await game.next()) await arrived()
+  }
+
+  /**
+   * Random mode: the genre the next songs come from. The song on screen stays;
+   * only where there was none to play (or its session had ended) does the
+   * choice bring another.
+   */
+  async function choosePool(pool: Pool) {
+    const round = game.song?.round
+    await game.choosePool(pool)
+    if (game.song && game.song.round !== round) await arrived()
   }
 
   onMount(() => {
@@ -179,10 +200,7 @@
           <div class="empty">
             {#if game.random}
               <h2>No song to play</h2>
-              <p>
-                Random has nothing it can play right now. Check again in a
-                moment, or play today's sections.
-              </p>
+              <p>{emptyLine(game.pool)}</p>
             {:else}
               <h2>No song today</h2>
               <p>
@@ -193,6 +211,16 @@
             {#if game.loadError ?? game.moveError}<p class="error" role="alert">
                 {game.loadError ?? game.moveError}
               </p>{/if}
+            {#if game.random}
+              <!-- Another genre is the way out of a pool with nothing to draw. -->
+              <div class="choice">
+                <PoolPicker
+                  pool={game.pool}
+                  disabled={game.loading || game.submitting}
+                  onchoose={choosePool}
+                />
+              </div>
+            {/if}
             <button
               class="button outline"
               type="button"
@@ -214,6 +242,13 @@
                   disabled={game.submitting}
                   >{game.drawing ? 'Finding…' : 'Next song'}</button
                 >
+                {#snippet choice()}
+                  <PoolPicker
+                    pool={game.pool}
+                    disabled={game.submitting}
+                    onchoose={choosePool}
+                  />
+                {/snippet}
               </Reveal>
               {#if game.moveError}<p class="error" role="alert">
                   {game.moveError}
@@ -263,6 +298,15 @@
               </p>{/if}
           {/if}
           <Attempts {game} />
+          {#if game.random && !game.finished}
+            <!-- Below everything about this song: the choice is for the ones after it. -->
+            <PoolPicker
+              pool={game.pool}
+              note={POOL_NOTE}
+              disabled={game.submitting}
+              onchoose={choosePool}
+            />
+          {/if}
           <p class="rules">
             {#if !game.finished}
               Each skip or wrong guess unlocks a longer clip.
@@ -525,6 +569,11 @@
     max-width: 25rem;
     color: var(--muted);
     font-size: 0.875rem;
+  }
+  /* Random mode's genre, across the column like the game's own controls. */
+  .empty .choice {
+    justify-self: stretch;
+    min-width: 0;
   }
   .empty .button {
     min-height: var(--target);

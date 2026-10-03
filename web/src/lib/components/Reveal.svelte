@@ -6,12 +6,14 @@
   // What it is given as children is the way on, random mode's "Next song". It
   // comes straight after the song, so that on a phone it is reached without
   // scrolling past the cover; in the side layout it sits beside the play button.
+  // `choice` is what the way on depends on, random mode's genre: it follows
+  // the way on in reading order, under it in every layout.
   import { onMount } from 'svelte'
   import type { Snippet } from 'svelte'
   import type { Game } from '../game.svelte'
   import Play from './Play.svelte'
 
-  let { game, children }: { game: Game; children?: Snippet } = $props()
+  let { game, children, choice }: { game: Game; children?: Snippet; choice?: Snippet } = $props()
 
   /** Titles longer than this are set a size down, so they do not fill the screen. */
   const LONG_TITLE = 22
@@ -62,6 +64,9 @@
   {/if}
   {#if children}
     <div class="onward print">{@render children()}</div>
+  {/if}
+  {#if choice}
+    <div class="choice print">{@render choice()}</div>
   {/if}
   {#if game.answer}
     {@const answer = game.answer}
@@ -187,6 +192,12 @@
     display: flex;
   }
 
+  /* The choice belongs to the way on above it, so it sits closer to it than to what follows. */
+  .choice {
+    min-width: 0;
+    margin-top: calc(var(--space-2) * -1);
+  }
+
   /* Beside the record there is room: the way on moves down, next to listening again. */
   @media (min-width: 40rem) and (min-aspect-ratio: 6/5) {
     .onwards {
@@ -207,6 +218,12 @@
       grid-row: 4;
       align-self: center;
     }
+
+    /* Under the row the way on is in. */
+    .onwards > .choice {
+      grid-row: 5;
+      margin-top: 0;
+    }
   }
 
   /* The reveal is uncovered in sequence as the artwork arrives on the label. */
@@ -224,7 +241,8 @@
   }
 
   /* The way on follows the song it comes after, so it can be pressed without waiting for the rest. */
-  .fresh .onward {
+  .fresh .onward,
+  .fresh .choice {
     animation-delay: calc(var(--reveal-step) * 8);
   }
 

@@ -54,6 +54,12 @@ export interface RandomSong extends GameView, RandomScore {
    * left behind is refused instead of landing on the next song.
    */
   round: number
+  /**
+   * The pool the session's next songs are drawn from: `general` is the whole
+   * pool, the rest one genre. It says nothing about the song being played,
+   * which may have been drawn before the choice was made.
+   */
+  pool: Section
 }
 
 /** Whether a game on screen is random mode's and not a section's. */
@@ -89,7 +95,7 @@ export type Move = { trackId: number } | { skip: true }
 /**
  * A failed request. `code` is the server's `error` field (`bad_request`,
  * `unknown_track`, `not_found`, `no_song`, `no_game`, `finished`, `unfinished`,
- * `changed`, `upstream`, `internal`) or one made up here: `network` when nothing answered,
+ * `changed`, `upstream`, `internal`, or the proxy's `rate_limited`) or one made up here: `network` when nothing answered,
  * `bad_response` when the answer was not the expected JSON. `message` is a
  * sentence fit to show the player.
  */
@@ -211,9 +217,14 @@ export function getRandom(): Promise<RandomSong> {
  * (another browser tab began it), that one, as it stands. Otherwise a new
  * one: the run and the totals are back to zero and a song is drawn, which can
  * take as long as a download.
+ *
+ * With a `pool` it is also the player's choice of what the next songs are
+ * drawn from. A session that is going keeps its song, its tries and its score
+ * and only takes the choice; a new session draws its first song from that
+ * pool. Without one the server keeps the player's last choice.
  */
-export function startRandom(): Promise<RandomSong> {
-  return post<RandomSong>('/api/random/start')
+export function startRandom(pool?: Section): Promise<RandomSong> {
+  return post<RandomSong>('/api/random/start', pool ? { pool } : undefined)
 }
 
 /** Skip or guess on the random song of `round`. Resolves with the song after the move. */

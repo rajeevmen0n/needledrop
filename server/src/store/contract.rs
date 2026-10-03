@@ -1175,10 +1175,11 @@ const NOW: i64 = 1_790_000_000;
 
 /// A random game in its `songs`th song of a first session, every earlier one
 /// won on the first try and the current one skipped once. The tracks are
-/// 1000, 1001, …
+/// 1000, 1001, … and the session draws from rock, so that a store which
+/// forgot the pool would be found out.
 fn random_game(songs: u64) -> RandomGame {
     let song = TrackMeta::new("The Song", "", "Someone");
-    let mut game = RandomGame::start(None, 1000, DAY, NOW);
+    let mut game = RandomGame::start(None, 1000, ROCK, DAY, NOW);
     for track_id in 1001..1000 + songs {
         game.guess(&song, &song, NOW).unwrap();
         game = game.next(track_id, DAY, NOW).unwrap();
@@ -1210,6 +1211,7 @@ pub async fn a_saved_random_game_is_loaded_as_it_was_saved_and_replaced_by_the_n
     assert_eq!((loaded.run(), loaded.played(), loaded.won()), (2, 2, 2));
     assert_eq!(loaded.best_run(), 2);
     assert_eq!(loaded.recent(), [1000, 1001, 1002]);
+    assert_eq!(loaded.pool(), ROCK);
     assert_eq!(loaded.active_at(), NOW);
 
     // A player has one random game: a save replaces it, whole.
@@ -1217,12 +1219,25 @@ pub async fn a_saved_random_game_is_loaded_as_it_was_saved_and_replaced_by_the_n
     game.guess(&TrackMeta::new("The Song", "", "Someone"), &wrong, NOW + 60)
         .unwrap();
     store.save_random_game(&player, &game).await.unwrap();
-    assert_eq!(store.random_game(&player).await.unwrap(), Some(game));
+    assert_eq!(
+        store.random_game(&player).await.unwrap(),
+        Some(game.clone())
+    );
+
+    // So does a change of the pool it draws from, which is all that changes.
+    for pool in Section::ALL {
+        game.draw_from(pool);
+        store.save_random_game(&player, &game).await.unwrap();
+        let loaded = store.random_game(&player).await.unwrap().unwrap();
+        assert_eq!(loaded.pool(), pool);
+        assert_eq!(loaded, game);
+    }
 
     // A new session over it is a replacement like any other.
     let again = RandomGame::start(
         store.random_game(&player).await.unwrap().as_ref(),
         7,
+        POP,
         DAY,
         NOW + 3_600,
     );
@@ -1232,6 +1247,7 @@ pub async fn a_saved_random_game_is_loaded_as_it_was_saved_and_replaced_by_the_n
     assert_eq!(loaded.round(), 4);
     assert_eq!(loaded.best_run(), 2);
     assert_eq!((loaded.run(), loaded.played(), loaded.won()), (0, 0, 0));
+    assert_eq!(loaded.pool(), POP);
 }
 
 pub async fn random_games_are_kept_apart_by_player(store: &dyn Store) {

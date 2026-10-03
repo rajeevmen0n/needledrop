@@ -14,7 +14,9 @@
 // session, which is the player's and the server's to keep: every browser tab
 // of the player is in the same one, and the server ends it after half an hour
 // without playing. A song is followed by the next one for as long as the
-// player likes.
+// player likes. Which songs can follow is the player's choice of pool (all of
+// them, or one genre), kept by the server with the session; choosing never
+// replaces the song being played.
 
 import {
   ApiError,
@@ -46,7 +48,7 @@ import type {
 import { ClipPlayer } from './audio'
 import type { ClipProgress } from './audio'
 import { clipLabel } from './clip'
-import { remedyFor } from './random'
+import { emptyLine, poolNews, poolOf, remedyFor, sameSession } from './random'
 import { RANDOM, SECTIONS, TABS, isSection, tabState } from './sections'
 import type { Tab, TabInfo, TabState } from './sections'
 
@@ -147,6 +149,13 @@ export class Game {
     'hip-hop': null,
   })
   private current = $derived(this.games[this.tab])
+  /**
+   * The pool whose draw last found nothing while no random song is on screen
+   * to say which one the session has. A start asks for it again, and a song
+   * that arrives takes its place. `null`: there is a song, or the page does
+   * not know which pool the server tried.
+   */
+  private wanted = $state<Section | null>(null)
 
   /** The five tabs, in order. Random mode's never changes: it has no game of the day. */
   tabs: TabMark[] = $derived(
@@ -183,6 +192,12 @@ export class Game {
   song: RandomSong | null = $derived(this.view && isRandomSong(this.view) ? this.view : null)
   /** The random session's score; `null` on a section's tab. */
   score: RandomScore | null = $derived(this.song)
+  /**
+   * The pool random mode's next songs are drawn from, as the page shows it:
+   * the one the random song names; without a song, the one whose draw found
+   * nothing here; else the whole pool. It is the same on every tab.
+   */
+  pool: Section = $derived(poolOf(this.games.random.view?.pool ?? this.wanted))
   /**
    * Which game is on screen: a section on a day, or one random song. When it
    * changes, what is shown next is another game and not this one moving on.
@@ -283,9 +298,11 @@ export class Game {
     if (this.current.loading) return
     void this.fetchToday()
     const random = this.games.random
-    // The draw after a finished song found nothing: asking again is that draw again.
-    if (this.tab === RANDOM && random.noSong && random.view) {
-      await this.next()
+    if (this.tab === RANDOM && random.noSong) {
+      // The draw after a finished song found nothing: asking again is that draw again.
+      if (random.view) await this.next()
+      // No session could be begun: asking again is for the pool the page shows as chosen.
+      else await this.fetchRandom(false, this.pool)
       return
     }
     await this.fetchTab(this.tab)
@@ -415,7 +432,8 @@ export class Game {
     try {
       const after = await postRandomGuess(song.round, move)
       this.receiveRandom(after)
-      game.notice = describeMove(after)
+      // How a song ended is the reveal's to say; the status line is kept for what follows it.
+      game.notice = after.status === 'playing' ? describeMove(after) : ''
       if (after.status !== 'playing' && this.tab === RANDOM) this.fresh = true
       return true
     } catch (err) {
@@ -454,6 +472,71 @@ export class Game {
     }
     await this.randomRefused(failure)
     return false
+  }
+
+  /**
+   * Random mode: chooses the pool the next songs are drawn from. It is a
+   * start that names the pool, so it follows a start's rules (one at a time,
+   * after the page's first requests, and Clear my data waits for it), and it
+   * is never a way out of a song: a session that is going keeps its song, its
+   * tries and its score, and the choice waits for the next draw. Where the
+   * last draw found nothing, that draw is asked for again. Resolves to whether
+   * the choice stands.
+   */
+  async choosePool(pool: Section): Promise<boolean> {
+    const game = this.games.random
+    if (game.submitting || game.loading || this.clearing) return false
+    const before = game.view
+    const empty = game.noSong
+    // The session draws from it already, and nothing is waiting for another try.
+    if (before && !empty && this.pool === pool) return true
+    const id = ++game.request
+    const epoch = this.randomEpoch
+    game.submitting = true
+    // Where there is no song, the choice is also the next attempt to find one.
+    game.loading = empty
+    game.moveError = null
+    game.loadError = null
+    game.info = null
+    let song: RandomSong
+    try {
+      // As in `startSession`: a new browser's first answers each bring a player.
+      await Promise.allSettled([...this.asking])
+      if (epoch !== this.randomEpoch) return false
+      song = await startRandom(pool)
+      if (epoch !== this.randomEpoch) return false
+    } catch (err) {
+      if (epoch !== this.randomEpoch) return false
+      if (remedyFor(codeOf(err)) === 'empty') {
+        // No session was going (the one on screen, if any, had ended), and
+        // that pool has nothing for a new one.
+        this.nothingToDraw(pool)
+        game.notice = emptyLine(pool)
+      } else if (game.view) {
+        // The choice was not made: the page goes on showing the pool that stands.
+        game.moveError = describe(err)
+      } else game.loadError = describe(err)
+      return false
+    } finally {
+      game.submitting = false
+      if (id === game.request) game.loading = false
+    }
+    // The session on screen had ended while the page was open: this start began another.
+    const ended = before !== null && !sameSession(before, song)
+    this.receiveRandom(song)
+    if (ended) game.info = SESSION_ENDED
+    const open = song.status === 'playing'
+    game.notice =
+      open && before?.round !== song.round
+        ? `${poolNews(this.pool, false)} You can play ${clipLabel(song.clipSeconds)}.`
+        : poolNews(this.pool, open)
+    if (empty && !open) {
+      // The finished song is still there, and so is the draw that found nothing: again, from this pool.
+      game.noSong = true
+      await this.next()
+      if (game.noSong) game.notice = emptyLine(this.pool)
+    }
+    return true
   }
 
   /** The server refused a random move or draw: does what that calls for (see `remedyFor`). */
@@ -556,9 +639,10 @@ export class Game {
    * Asks for the session the player is in, whichever browser tab began it.
    * When the server has none (they never played, or it ended while they were
    * away), one is started: without a word when nothing was on screen, and
-   * saying so when a game was. `quiet` as in `fetchGame`.
+   * saying so when a game was. `quiet` as in `fetchGame`; `pool` is the one
+   * to name if a session has to be started.
    */
-  private async fetchRandom(quiet = false): Promise<void> {
+  private async fetchRandom(quiet = false, pool?: Section): Promise<void> {
     const game = this.games.random
     const id = ++game.request
     const epoch = this.randomEpoch
@@ -578,7 +662,7 @@ export class Game {
       if (remedyFor(codeOf(err)) === 'restart') {
         // What is on screen, if anything, is a session that has ended.
         if (game.view) game.info = SESSION_ENDED
-        void this.startSession()
+        void this.startSession(pool)
       } else if (quiet) return // Stale but usable.
       else if (game.view) game.moveError = describe(err)
       else game.loadError = describe(err)
@@ -591,12 +675,17 @@ export class Game {
    * Asks for the session to play in: a new one, with a first song and the run
    * and the totals at zero, or the one another browser tab has begun in the
    * meantime. One request at a time, so a tab opened twice in a hurry asks once.
+   *
+   * It names a pool only when the page has one to name that the server may
+   * not have: `pool`, or the one whose draw found nothing here. Otherwise the
+   * server goes on with the player's last choice.
    */
-  private async startSession(): Promise<void> {
+  private async startSession(pool?: Section): Promise<void> {
     const game = this.games.random
     if (game.submitting) return
     const id = ++game.request
     const epoch = this.randomEpoch
+    const asked = pool ?? this.wanted ?? undefined
     // A start is a move as far as Clear my data is concerned: its answer sets the player cookie.
     game.submitting = true
     game.loading = true
@@ -608,22 +697,34 @@ export class Game {
       // Once those are answered, every request names the same player.
       await Promise.allSettled([...this.asking])
       if (epoch !== this.randomEpoch) return
-      const song = await startRandom()
+      const song = await startRandom(asked)
       if (epoch !== this.randomEpoch) return
       this.receiveRandom(song)
     } catch (err) {
       if (epoch !== this.randomEpoch) return
       if (remedyFor(codeOf(err)) === 'empty') {
-        game.view = null
-        game.version++
-        game.noSong = true
-        if (this.tab === RANDOM) this.dropClip()
+        // Unnamed, it was the pool of the session that ended, if one was on screen.
+        this.nothingToDraw(asked ?? (game.view ? this.pool : null))
       } else if (game.view) game.moveError = describe(err)
       else game.loadError = describe(err)
     } finally {
       game.submitting = false
       if (id === game.request) game.loading = false
     }
+  }
+
+  /**
+   * A new session found nothing to draw, so there is no random song: the page
+   * says so. `pool` is the one that had nothing, when the page knows it; it is
+   * shown as the choice and asked for again by the next start.
+   */
+  private nothingToDraw(pool: Section | null): void {
+    const game = this.games.random
+    game.view = null
+    game.version++
+    game.noSong = true
+    this.wanted = pool
+    if (this.tab === RANDOM) this.dropClip()
   }
 
   /** Notes a request as being on its way until it is answered. */
@@ -697,6 +798,10 @@ export class Game {
     game.version++
     game.noSong = false
     game.loadError = null
+    // The song says which pool the session has; nothing is left to ask for.
+    this.wanted = null
+    // What the last move did is old news once the song has moved on; a caller with news says it after this.
+    if (!previous || audioUrl(previous) !== audioUrl(song)) game.notice = ''
     if (this.tab !== RANDOM) return
     // Another song: whatever ended the last one is not news about this one.
     if (previous?.round !== song.round) this.fresh = false
@@ -744,6 +849,7 @@ export class Game {
       this.fresh = false
     }
     this.games.random.forget()
+    this.wanted = null
   }
 
   /** The server says the section has no song today. */

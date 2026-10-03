@@ -3,15 +3,23 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import {
+  POOLS,
+  POOL_LEGEND,
+  POOL_NOTE,
+  emptyLine,
+  poolName,
+  poolNews,
+  poolOf,
   remedyFor,
   runCount,
   runLine,
+  sameSession,
   scoreFigures,
   songLine,
   songNumber,
   winPercent,
 } from '../src/lib/random.ts'
-import type { RandomScore } from '../src/lib/random.ts'
+import type { Pool, RandomScore } from '../src/lib/random.ts'
 
 const NONE: RandomScore = { run: 0, bestRun: 0, played: 0, won: 0 }
 const SOME: RandomScore = { run: 3, bestRun: 7, played: 8, won: 6 }
@@ -132,7 +140,105 @@ test('nothing to draw shows that there is no song', () => {
 })
 
 test('every other failure is reported and changes nothing', () => {
-  for (const code of ['upstream', 'internal', 'bad_request', 'unknown_track', 'network', 'bad_response', '']) {
+  for (const code of ['upstream', 'internal', 'rate_limited', 'bad_request', 'unknown_track', 'network', 'bad_response', '']) {
     assert.equal(remedyFor(code), 'report', code)
   }
+})
+
+// --- one session or another --------------------------------------------------------
+
+test('the same song is the same session, whatever happened to it', () => {
+  const playing = { round: 12, status: 'playing', played: 3 }
+  assert.equal(sameSession(playing, playing), true)
+  // Won since: it is counted now, and still the fourth song.
+  assert.equal(sameSession(playing, { round: 12, status: 'won', played: 4 }), true)
+})
+
+test('a later song of the session is as many songs on as rounds', () => {
+  const before = { round: 12, status: 'playing', played: 3 }
+  assert.equal(sameSession(before, { round: 13, status: 'playing', played: 4 }), true)
+  assert.equal(sameSession(before, { round: 15, status: 'lost', played: 7 }), true)
+  // From a finished song to the next one.
+  assert.equal(sameSession({ round: 12, status: 'won', played: 4 }, { round: 13, status: 'playing', played: 4 }), true)
+})
+
+test('a new session counts its songs from one while the rounds go on', () => {
+  const before = { round: 12, status: 'playing', played: 3 }
+  assert.equal(sameSession(before, { round: 13, status: 'playing', played: 0 }), false)
+  assert.equal(sameSession(before, { round: 14, status: 'won', played: 2 }), false)
+  // Even from the first song of a session: the next round would be its second song.
+  assert.equal(
+    sameSession({ round: 5, status: 'playing', played: 0 }, { round: 6, status: 'playing', played: 0 }),
+    false,
+  )
+  assert.equal(
+    sameSession({ round: 5, status: 'lost', played: 1 }, { round: 6, status: 'playing', played: 0 }),
+    false,
+  )
+})
+
+test('rounds that went back are another player\'s session', () => {
+  // The data was cleared, or everything was reset: the rounds start again.
+  assert.equal(sameSession({ round: 5, status: 'playing', played: 4 }, { round: 1, status: 'playing', played: 0 }), false)
+})
+
+// --- the pool the songs are drawn from -----------------------------------------------
+
+test('the pools are everything first, then the three genres in tab order', () => {
+  assert.deepEqual(POOLS, ['general', 'pop', 'rock', 'hip-hop'])
+})
+
+test('the whole pool is called All, a genre by its name', () => {
+  assert.deepEqual(POOLS.map(poolName), ['All', 'Pop', 'Rock', 'Hip-hop'])
+})
+
+test('the choice has a short label and a note for a song still being played', () => {
+  assert.equal(POOL_LEGEND, 'Genre')
+  assert.equal(POOL_NOTE, 'Applies from the next song')
+})
+
+test('a pool the page does not know is the whole pool', () => {
+  assert.equal(poolOf('rock'), 'rock')
+  assert.equal(poolOf('hip-hop'), 'hip-hop')
+  assert.equal(poolOf('general'), 'general')
+  // An older server names none; nothing asked for yet is `null`.
+  assert.equal(poolOf(undefined), 'general')
+  assert.equal(poolOf(null), 'general')
+  assert.equal(poolOf('jazz'), 'general')
+  assert.equal(poolOf('Rock'), 'general')
+  assert.equal(poolOf(3), 'general')
+  assert.equal(poolName('jazz' as Pool), 'All')
+})
+
+test('a choice made during a song says that the song stays', () => {
+  assert.equal(poolNews('rock', true), 'Genre set to Rock. It applies from the next song.')
+  assert.equal(poolNews('general', true), 'Genre set to All. It applies from the next song.')
+})
+
+test('a choice made after a song only says what was chosen', () => {
+  assert.equal(poolNews('hip-hop', false), 'Genre set to Hip-hop.')
+  assert.equal(poolNews('general', false), 'Genre set to All.')
+})
+
+test('choosing twice in a row never says the same sentence, so each is announced', () => {
+  const said = POOLS.map((pool) => poolNews(pool, true))
+  assert.equal(new Set(said).size, POOLS.length)
+})
+
+test('an empty genre points at the other genres', () => {
+  assert.equal(
+    emptyLine('rock'),
+    'Rock has nothing Random can play right now. Choose another genre, or check again in a moment.',
+  )
+  assert.equal(
+    emptyLine('hip-hop'),
+    'Hip-hop has nothing Random can play right now. Choose another genre, or check again in a moment.',
+  )
+})
+
+test('the whole pool being empty points at the day\'s sections', () => {
+  assert.equal(
+    emptyLine('general'),
+    "Random has nothing it can play right now. Check again in a moment, or play today's sections.",
+  )
 })

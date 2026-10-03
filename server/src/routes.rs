@@ -198,9 +198,10 @@ pub enum ApiError {
     /// 404: the section has no song to play today. The client shows it as
     /// "No song today"; it is not a failure that a retry would mend.
     NoSong,
-    /// 404, with the same code: random mode has nothing to draw. Its pool is
-    /// empty, or everything in it plays in a section today or failed the
-    /// preview check today.
+    /// 404, with the same code: random mode has nothing to draw. The pool
+    /// the player draws from (all of it, or one genre) is empty, or
+    /// everything in it plays in a section today or failed the preview
+    /// check today.
     NothingToDraw,
     /// 404: the player has no random game: none was ever started under
     /// their ID, or it was cleared since.

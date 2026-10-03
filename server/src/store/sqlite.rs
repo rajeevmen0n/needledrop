@@ -1445,10 +1445,11 @@ mod tests {
     // --- random games ---------------------------------------------------------------
 
     /// A random game on its second song: the first won on the first try, the
-    /// second skipped once.
+    /// second skipped once. It draws from rock.
     fn random_game() -> RandomGame {
         let song = crate::game::TrackMeta::new("The Song", "", "Someone");
-        let mut game = RandomGame::start(None, 916_424, date(2026, 10, 1), 1_790_899_200);
+        let rock = Section::Genre(Genre::Rock);
+        let mut game = RandomGame::start(None, 916_424, rock, date(2026, 10, 1), 1_790_899_200);
         game.guess(&song, &song, 1_790_899_260).unwrap();
         let mut game = game
             .next(3_135_556, date(2026, 10, 1), 1_790_899_270)
@@ -1482,7 +1483,7 @@ mod tests {
         store
             .save_random_game(
                 &player,
-                &RandomGame::start(None, 7, date(2026, 10, 1), 1_790_899_200),
+                &RandomGame::start(None, 7, Section::General, date(2026, 10, 1), 1_790_899_200),
             )
             .await
             .unwrap();
@@ -1496,7 +1497,7 @@ mod tests {
                 concat!(
                     r#"{"round":2,"track_id":3135556,"#,
                     r#""game":{"day":"2026-10-01","attempts":[{"kind":"skip"}],"status":"playing"},"#,
-                    r#""run":1,"played":1,"won":1,"best_run":1,"recent":[916424,3135556],"active_at":1790899300}"#
+                    r#""run":1,"played":1,"won":1,"best_run":1,"recent":[916424,3135556],"active_at":1790899300,"pool":"rock"}"#
                 )
                 .to_owned()
             )]
@@ -1505,6 +1506,21 @@ mod tests {
         // A restart: the same file, a new connection.
         let reopened = SqliteStore::open(&path).unwrap();
         assert_eq!(reopened.random_game(&player).await.unwrap(), Some(game));
+
+        // A row written before the pool could be chosen has no `pool`, and
+        // reads as a game that draws from all of it.
+        let earlier = PlayerId::generate();
+        execute(
+            &path,
+            &format!(
+                r#"INSERT INTO random_games (player, state) VALUES
+                     ('{earlier}', '{{"round":2,"track_id":7,"game":{{"day":"2026-10-01","attempts":[],"status":"playing"}},"run":1,"played":1,"won":1,"best_run":1,"recent":[8,7],"active_at":1790899300}}');"#
+            ),
+        );
+        let read = reopened.random_game(&earlier).await.unwrap().unwrap();
+        assert_eq!(read.pool(), Section::General);
+        assert_eq!(read.round(), 2);
+        assert_eq!(read.active_at(), 1_790_899_300);
     }
 
     #[tokio::test]
